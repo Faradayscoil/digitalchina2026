@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 
 DATA_DIR = r'./wind_split'
 MODEL_DIR = r'./wind_results/patchtst'
-TRAIN_FILE_GLOBS = ('*/wind_train.csv', 'wind_train_*.csv')
+TRAIN_FILE_PATTERN = 'wind_train_*.csv'
 
 seed = 2026
 TIME_FREQ = '15min'
@@ -61,18 +61,12 @@ def set_global_seed(value):
 
 
 def discover_train_files(data_dir=DATA_DIR):
-    """兼容 wind_split/<farm_id>/wind_train.csv 和 wind_split/wind_train_<farm_id>.csv。"""
-    for pattern in TRAIN_FILE_GLOBS:
-        files = sorted(glob.glob(os.path.join(data_dir, pattern)))
-        if files:
-            return files
-    return []
+    """只读取 wind_split 根目录下人工重命名好的 wind_train_<farm_id>.csv。"""
+    return sorted(glob.glob(os.path.join(data_dir, TRAIN_FILE_PATTERN)))
 
 
 def get_farm_id(path):
     basename = os.path.basename(path)
-    if basename == 'wind_train.csv':
-        return os.path.basename(os.path.dirname(path))
     match = re.search(r'wind_train_(\d+)\.csv$', basename)
     if match:
         return match.group(1)
