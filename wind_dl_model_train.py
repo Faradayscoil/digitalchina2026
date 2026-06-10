@@ -3,6 +3,7 @@ import os
 import random
 import re
 import warnings
+from datetime import datetime
 
 import joblib
 import numpy as np
@@ -18,6 +19,8 @@ warnings.filterwarnings('ignore')
 
 DATA_DIR = r'./wind_split'
 MODEL_DIR = r'./wind_results/patchtst'
+TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
+HISTORY_DIR = os.path.join(MODEL_DIR, 'history')
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
 
 seed = 2026
@@ -440,6 +443,70 @@ def evaluate_model(model, val_ds, scaler_y, capacity=None):
     return mae, rmse
 
 
+def save_history_artifacts(history, farm_id):
+    history_df = pd.DataFrame(history.history)
+    history_df.index = np.arange(1, len(history_df) + 1)
+    history_df.index.name = 'epoch'
+
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    history_path = os.path.join(HISTORY_DIR, f'patchtst_history_farm_{farm_id}.csv')
+    history_df.to_csv(history_path, encoding='utf-8-sig')
+
+    plot_path = os.path.join(HISTORY_DIR, f'patchtst_history_farm_{farm_id}.png')
+    try:
+        cache_dir = os.path.join(MODEL_DIR, 'matplotlib_cache')
+        os.environ['MPLCONFIGDIR'] = cache_dir
+        os.environ['XDG_CACHE_HOME'] = cache_dir
+        os.makedirs(os.environ['MPLCONFIGDIR'], exist_ok=True)
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        metric_names = [
+            key for key in history_df.columns
+            if not key.startswith('val_') and f'val_{key}' in history_df.columns
+        ]
+        single_names = [
+            key for key in history_df.columns
+            if not key.startswith('val_') and f'val_{key}' not in history_df.columns
+        ]
+        n_axes = max(1, len(metric_names) + len(single_names))
+        fig, axes = plt.subplots(n_axes, 1, figsize=(10, max(3, 2.8 * n_axes)), sharex=True)
+        if n_axes == 1:
+            axes = [axes]
+
+        axis_idx = 0
+        for metric in metric_names:
+            ax = axes[axis_idx]
+            ax.plot(history_df.index, history_df[metric], label=f'train_{metric}')
+            ax.plot(history_df.index, history_df[f'val_{metric}'], label=f'val_{metric}')
+            ax.set_title(metric)
+            ax.set_ylabel(metric)
+            ax.grid(alpha=0.3)
+            ax.legend()
+            axis_idx += 1
+
+        for metric in single_names:
+            ax = axes[axis_idx]
+            ax.plot(history_df.index, history_df[metric], label=metric)
+            ax.set_title(metric)
+            ax.set_ylabel(metric)
+            ax.grid(alpha=0.3)
+            ax.legend()
+            axis_idx += 1
+
+        axes[-1].set_xlabel('epoch')
+        fig.suptitle(f'Wind PatchTST Training History - Farm {farm_id}', y=1.0)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    except Exception as exc:
+        plot_path = None
+        print(f'训练曲线图片保存失败: {exc}')
+
+    return history_path, plot_path
+
+
 def train_one_farm(train_file):
     farm_id = get_farm_id(train_file)
     print(f'\n===== 训练风电场 {farm_id} =====')
@@ -458,7 +525,19 @@ def train_one_farm(train_file):
     model.summary()
 
     model_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}.keras')
+    tensorboard_log_dir = os.path.join(
+        TENSORBOARD_LOG_DIR,
+        f'farm_{farm_id}',
+        datetime.now().strftime('%Y%m%d-%H%M%S'),
+    )
     callbacks = [
+        keras.callbacks.TensorBoard(
+            log_dir=tensorboard_log_dir,
+            histogram_freq=0,
+            write_graph=True,
+            update_freq='epoch',
+            profile_batch=0,
+        ),
         keras.callbacks.EarlyStopping(
             monitor='val_loss',
             patience=10,
@@ -488,8 +567,13 @@ def train_one_farm(train_file):
         verbose=1,
     )
 
+    history_path, history_plot_path = save_history_artifacts(history, farm_id)
     mae, rmse = evaluate_model(model, val_ds, scaler_y, capacity)
     print(f'验证集反归一化 MAE: {mae:.4f}, RMSE: {rmse:.4f}')
+    print(f'TensorBoard日志: {tensorboard_log_dir}')
+    print(f'训练历史CSV: {history_path}')
+    if history_plot_path:
+        print(f'训练曲线图片: {history_plot_path}')
 
     artifact = {
         'farm_id': farm_id,
@@ -506,6 +590,9 @@ def train_one_farm(train_file):
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
         'model_path': model_path,
+        'tensorboard_log_dir': tensorboard_log_dir,
+        'history_path': history_path,
+        'history_plot_path': history_plot_path,
         'val_mae': mae,
         'val_rmse': rmse,
     }
@@ -520,6 +607,9 @@ def train_one_farm(train_file):
         'model_path': model_path,
         'artifact_path': artifact_path,
         'tail_path': tail_path,
+        'tensorboard_log_dir': tensorboard_log_dir,
+        'history_path': history_path,
+        'history_plot_path': history_plot_path,
         'history': history.history,
         'val_mae': mae,
         'val_rmse': rmse,
@@ -529,6 +619,8 @@ def train_one_farm(train_file):
 if __name__ == '__main__':
     set_global_seed(seed)
     os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
 
     train_files = discover_train_files(DATA_DIR)
     if not train_files:
@@ -546,9 +638,13 @@ if __name__ == '__main__':
             'val_rmse': item['val_rmse'],
             'model_path': item['model_path'],
             'artifact_path': item['artifact_path'],
+            'tensorboard_log_dir': item['tensorboard_log_dir'],
+            'history_path': item['history_path'],
+            'history_plot_path': item['history_plot_path'],
         }
         for item in results
     ])
     metrics_path = os.path.join(MODEL_DIR, 'patchtst_training_metrics.csv')
     metrics.to_csv(metrics_path, index=False, encoding='utf-8-sig')
     print(f'\n训练完成，指标已保存至 {metrics_path}')
+    print(f'启动TensorBoard查看训练/验证曲线: tensorboard --logdir {TENSORBOARD_LOG_DIR}')
