@@ -525,7 +525,9 @@ def train_one_farm(train_file):
     model = build_patchtst_model(len(input_cols), target_index)
     model.summary()
 
-    checkpoint_model_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_best.keras')
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(SAVED_MODEL_DIR, exist_ok=True)
+    best_weights_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_best.weights.h5')
     model_path = os.path.join(SAVED_MODEL_DIR, f'patchtst_farm_{farm_id}.keras')
     tensorboard_log_dir = os.path.join(
         TENSORBOARD_LOG_DIR,
@@ -554,9 +556,10 @@ def train_one_farm(train_file):
             verbose=1,
         ),
         keras.callbacks.ModelCheckpoint(
-            checkpoint_model_path,
+            best_weights_path,
             monitor='val_loss',
             save_best_only=True,
+            save_weights_only=True,
             verbose=1,
         ),
     ]
@@ -569,14 +572,15 @@ def train_one_farm(train_file):
         verbose=1,
     )
 
-    os.makedirs(SAVED_MODEL_DIR, exist_ok=True)
+    if os.path.exists(best_weights_path):
+        model.load_weights(best_weights_path)
     model.save(model_path)
 
     history_path, history_plot_path = save_history_artifacts(history, farm_id)
     mae, rmse = evaluate_model(model, val_ds, scaler_y, capacity)
     print(f'验证集反归一化 MAE: {mae:.4f}, RMSE: {rmse:.4f}')
     print(f'最终PatchTST模型: {model_path}')
-    print(f'最佳checkpoint模型: {checkpoint_model_path}')
+    print(f'最佳checkpoint权重: {best_weights_path}')
     print(f'TensorBoard日志: {tensorboard_log_dir}')
     print(f'训练历史CSV: {history_path}')
     if history_plot_path:
@@ -597,7 +601,7 @@ def train_one_farm(train_file):
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
         'model_path': model_path,
-        'checkpoint_model_path': checkpoint_model_path,
+        'best_weights_path': best_weights_path,
         'tensorboard_log_dir': tensorboard_log_dir,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
@@ -613,7 +617,7 @@ def train_one_farm(train_file):
     return {
         'farm_id': farm_id,
         'model_path': model_path,
-        'checkpoint_model_path': checkpoint_model_path,
+        'best_weights_path': best_weights_path,
         'artifact_path': artifact_path,
         'tail_path': tail_path,
         'tensorboard_log_dir': tensorboard_log_dir,
@@ -647,7 +651,7 @@ if __name__ == '__main__':
             'val_mae': item['val_mae'],
             'val_rmse': item['val_rmse'],
             'model_path': item['model_path'],
-            'checkpoint_model_path': item['checkpoint_model_path'],
+            'best_weights_path': item['best_weights_path'],
             'artifact_path': item['artifact_path'],
             'tensorboard_log_dir': item['tensorboard_log_dir'],
             'history_path': item['history_path'],
