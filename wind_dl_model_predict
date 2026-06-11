@@ -1,0 +1,400 @@
+import glob
+import os
+import re
+import warnings
+
+import joblib
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tensorflow import keras
+
+from wind_dl_model_train import (
+    BATCH_SIZE,
+    DATA_DIR,
+    FORECAST_LEN,
+    HISTORY_LEN,
+    MODEL_DIR,
+    SAVED_MODEL_DIR,
+    TARGET_COL,
+    TIME_FREQ,
+    LearnablePositionEmbedding,
+    MergeChannels,
+    PatchExtract,
+    RestoreChannels,
+    TakeChannel,
+    build_patchtst_model,
+    load_and_preprocess,
+)
+
+warnings.filterwarnings('ignore')
+
+
+TEST_FILE_PATTERN = 'wind_test_*.csv'
+OUTPUT_DIR = os.path.join(MODEL_DIR, 'testdata_predict_output')
+PREDICTION_DIR = os.path.join(OUTPUT_DIR, 'predictions')
+FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
+SEGMENT_DIR = os.path.join(OUTPUT_DIR, 'comparison_segments')
+PRED_BATCH_SIZE = max(256, BATCH_SIZE)
+VISUAL_DAYS = 2
+
+
+def discover_test_files(data_dir=DATA_DIR):
+    return sorted(glob.glob(os.path.join(data_dir, TEST_FILE_PATTERN)))
+
+
+def get_farm_id(path):
+    basename = os.path.basename(path)
+    match = re.search(r'wind_test_(\d+)\.csv$', basename)
+    if match:
+        return match.group(1)
+    return os.path.splitext(basename)[0]
+
+
+def ensure_output_dirs():
+    for path in [OUTPUT_DIR, PREDICTION_DIR, FIGURE_DIR, SEGMENT_DIR]:
+        os.makedirs(path, exist_ok=True)
+
+
+def load_artifact(farm_id):
+    artifact_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_preprocess.pkl')
+    if not os.path.exists(artifact_path):
+        raise FileNotFoundError(f'未找到场站 {farm_id} 的预处理文件: {artifact_path}')
+    artifact = joblib.load(artifact_path)
+    artifact['artifact_path'] = artifact_path
+    return artifact
+
+
+def load_patchtst_model(farm_id, artifact):
+    custom_objects = {
+        'PatchExtract': PatchExtract,
+        'WindPatchTST>PatchExtract': PatchExtract,
+        'MergeChannels': MergeChannels,
+        'WindPatchTST>MergeChannels': MergeChannels,
+        'RestoreChannels': RestoreChannels,
+        'WindPatchTST>RestoreChannels': RestoreChannels,
+        'LearnablePositionEmbedding': LearnablePositionEmbedding,
+        'WindPatchTST>LearnablePositionEmbedding': LearnablePositionEmbedding,
+        'TakeChannel': TakeChannel,
+        'WindPatchTST>TakeChannel': TakeChannel,
+    }
+
+    model_path = artifact.get('model_path') or os.path.join(
+        SAVED_MODEL_DIR, f'patchtst_farm_{farm_id}.keras')
+    if os.path.exists(model_path):
+        return keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+            compile=False,
+        ), model_path
+
+    best_weights_path = artifact.get('best_weights_path') or os.path.join(
+        MODEL_DIR, f'patchtst_farm_{farm_id}_best.weights.h5')
+    if not os.path.exists(best_weights_path):
+        raise FileNotFoundError(
+            f'未找到场站 {farm_id} 的完整模型或最佳权重: {model_path}, {best_weights_path}')
+
+    model = build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+    model.load_weights(best_weights_path)
+    return model, best_weights_path
+
+
+def load_actual_power_series(data_path, index, capacity=None):
+    raw_df = pd.read_csv(data_path, parse_dates=['时间'], usecols=['时间', TARGET_COL])
+    raw_df = raw_df.sort_values('时间').drop_duplicates('时间')
+    raw_df.set_index('时间', inplace=True)
+    raw_df[TARGET_COL] = pd.to_numeric(raw_df[TARGET_COL], errors='coerce')
+    actual = raw_df[TARGET_COL].reindex(index).astype(float)
+    actual = actual.clip(lower=0)
+    if capacity is not None:
+        actual = actual.clip(upper=capacity)
+    return actual
+
+
+def prepare_prediction_arrays(test_file, artifact):
+    df, _, file_capacity = load_and_preprocess(test_file, is_train=False)
+    capacity = artifact.get('capacity') or file_capacity
+    actual_power = load_actual_power_series(test_file, df.index, capacity)
+
+    # 预测输入只能看到历史功率。未来真实功率保留在 actual_power 中，仅用于评价和可视化。
+    historical_power = actual_power.ffill().fillna(0)
+    df[TARGET_COL] = historical_power.astype(np.float32)
+
+    input_cols = artifact['input_cols']
+    missing_cols = [col for col in input_cols if col not in df.columns]
+    if missing_cols:
+        for col in missing_cols:
+            df[col] = 0.0
+        print(f'警告：测试集缺少 {missing_cols}，已用0补齐')
+
+    features = artifact['scaler_x'].transform(df[input_cols].values).astype(np.float32)
+    return df, features, actual_power.values.astype(float), capacity
+
+
+def make_prediction_dataset(features, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN):
+    n_samples = len(features) - history_len - forecast_len + 1
+    if n_samples <= 0:
+        raise ValueError('测试集长度不足，无法构造完整历史窗口和预测窗口')
+
+    # 只切到 n_samples + history_len - 1，保证每个输入窗口止于预测起点之前。
+    data_slice = features[:n_samples + history_len - 1]
+    ds = keras.utils.timeseries_dataset_from_array(
+        data=data_slice,
+        targets=None,
+        sequence_length=history_len,
+        sequence_stride=1,
+        shuffle=False,
+        batch_size=PRED_BATCH_SIZE,
+    )
+    return ds.prefetch(tf.data.AUTOTUNE), n_samples
+
+
+def inverse_power(scaler_y, values):
+    values = np.asarray(values).reshape(-1, 1)
+    return scaler_y.inverse_transform(values).reshape(-1)
+
+
+def build_truth_windows(actual_power, n_samples,
+                        history_len=HISTORY_LEN, forecast_len=FORECAST_LEN):
+    rows = []
+    for sample_idx in range(n_samples):
+        start = sample_idx + history_len
+        rows.append(actual_power[start:start + forecast_len])
+    return np.asarray(rows, dtype=float)
+
+
+def build_prediction_frame(df, farm_id, y_pred, y_true,
+                           history_len=HISTORY_LEN, forecast_len=FORECAST_LEN):
+    n_samples = y_pred.shape[0]
+    origin_times = df.index[history_len - 1:history_len - 1 + n_samples]
+    forecast_start_times = df.index[history_len:history_len + n_samples]
+    rows = []
+
+    for horizon_idx in range(forecast_len):
+        target_times = df.index[
+            history_len + horizon_idx:history_len + horizon_idx + n_samples]
+        rows.append(pd.DataFrame({
+            'farm_id': farm_id,
+            'sample_id': np.arange(n_samples),
+            'forecast_origin_time': origin_times,
+            'forecast_start_time': forecast_start_times,
+            'target_time': target_times,
+            'horizon_step': horizon_idx + 1,
+            'horizon_minutes': (horizon_idx + 1) * 15,
+            'pred_power': y_pred[:, horizon_idx],
+            'actual_power': y_true[:, horizon_idx],
+        }))
+
+    pred_df = pd.concat(rows, ignore_index=True)
+    pred_df['error'] = pred_df['pred_power'] - pred_df['actual_power']
+    pred_df['abs_error'] = pred_df['error'].abs()
+    pred_df['squared_error'] = pred_df['error'] ** 2
+    pred_df['valid_actual'] = np.isfinite(pred_df['actual_power'])
+    return pred_df
+
+
+def calculate_metrics(y_true, y_pred, capacity=None):
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    valid_count = int(valid_mask.sum())
+    if valid_count == 0:
+        return {
+            'valid_count': 0,
+            'mae': np.nan,
+            'mse': np.nan,
+            'rmse': np.nan,
+            'mape': np.nan,
+            'smape': np.nan,
+            'r2': np.nan,
+            'capacity_normalized_mae': np.nan,
+            'capacity_normalized_rmse': np.nan,
+        }
+
+    yt = y_true[valid_mask]
+    yp = y_pred[valid_mask]
+    mae = mean_absolute_error(yt, yp)
+    mse = mean_squared_error(yt, yp)
+    rmse = float(np.sqrt(mse))
+
+    nonzero_mask = np.abs(yt) > 1e-6
+    mape = np.nan
+    if nonzero_mask.any():
+        mape = float(np.mean(np.abs((yt[nonzero_mask] - yp[nonzero_mask]) / yt[nonzero_mask])) * 100)
+
+    denominator = np.abs(yt) + np.abs(yp)
+    smape_mask = denominator > 1e-6
+    smape = np.nan
+    if smape_mask.any():
+        smape = float(np.mean(2 * np.abs(yp[smape_mask] - yt[smape_mask]) / denominator[smape_mask]) * 100)
+
+    r2 = np.nan
+    if valid_count > 1 and np.nanstd(yt) > 1e-6:
+        r2 = r2_score(yt, yp)
+
+    norm_mae = np.nan
+    norm_rmse = np.nan
+    if capacity is not None and capacity > 0:
+        norm_mae = float(mae / capacity)
+        norm_rmse = float(rmse / capacity)
+
+    return {
+        'valid_count': valid_count,
+        'mae': float(mae),
+        'mse': float(mse),
+        'rmse': rmse,
+        'mape': mape,
+        'smape': smape,
+        'r2': r2,
+        'capacity_normalized_mae': norm_mae,
+        'capacity_normalized_rmse': norm_rmse,
+    }
+
+
+def metrics_by_horizon(farm_id, y_true, y_pred, capacity=None, forecast_len=FORECAST_LEN):
+    rows = []
+    all_metrics = calculate_metrics(y_true, y_pred, capacity)
+    all_metrics.update({'farm_id': farm_id, 'horizon_step': 'all', 'horizon_minutes': 'all'})
+    rows.append(all_metrics)
+
+    for horizon_idx in range(forecast_len):
+        metrics = calculate_metrics(y_true[:, horizon_idx], y_pred[:, horizon_idx], capacity)
+        metrics.update({
+            'farm_id': farm_id,
+            'horizon_step': horizon_idx + 1,
+            'horizon_minutes': (horizon_idx + 1) * 15,
+        })
+        rows.append(metrics)
+
+    return pd.DataFrame(rows)
+
+
+def save_comparison_plot(pred_df, farm_id):
+    valid_df = pred_df[pred_df['valid_actual']].copy()
+    if valid_df.empty:
+        return None, None
+
+    timeline = valid_df.groupby('target_time', as_index=False).agg(
+        actual_power=('actual_power', 'mean'),
+        pred_power=('pred_power', 'mean'),
+    )
+    timeline = timeline.sort_values('target_time')
+
+    points = min(len(timeline), VISUAL_DAYS * 96)
+    start = max(0, len(timeline) // 2 - points // 2)
+    segment = timeline.iloc[start:start + points].copy()
+
+    segment_path = os.path.join(SEGMENT_DIR, f'comparison_segment_farm_{farm_id}.csv')
+    segment.to_csv(segment_path, index=False, encoding='utf-8-sig')
+
+    figure_path = os.path.join(FIGURE_DIR, f'comparison_farm_{farm_id}.png')
+    try:
+        cache_dir = os.path.join(OUTPUT_DIR, 'matplotlib_cache')
+        os.environ['MPLCONFIGDIR'] = cache_dir
+        os.environ['XDG_CACHE_HOME'] = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(segment['target_time'], segment['actual_power'],
+                label='Actual power', linewidth=1.6)
+        ax.plot(segment['target_time'], segment['pred_power'],
+                label='PatchTST prediction', linewidth=1.4)
+        ax.set_title(f'Farm {farm_id} PatchTST Prediction vs Actual')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Power')
+        ax.grid(alpha=0.3)
+        ax.legend()
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(figure_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    except Exception as exc:
+        print(f'场站 {farm_id} 可视化保存失败: {exc}')
+        figure_path = None
+
+    return segment_path, figure_path
+
+
+def predict_one_farm(test_file):
+    farm_id = get_farm_id(test_file)
+    print(f'\n===== 预测风电场 {farm_id} =====')
+
+    artifact = load_artifact(farm_id)
+    model, loaded_model_path = load_patchtst_model(farm_id, artifact)
+    df, features, actual_power, capacity = prepare_prediction_arrays(test_file, artifact)
+    history_len = artifact.get('history_len', HISTORY_LEN)
+    forecast_len = artifact.get('forecast_len', FORECAST_LEN)
+    pred_ds, n_samples = make_prediction_dataset(
+        features,
+        history_len,
+        forecast_len,
+    )
+
+    y_pred_scaled = model.predict(pred_ds, verbose=1)
+    y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
+    if capacity is not None:
+        y_pred = np.clip(y_pred, 0, capacity)
+    else:
+        y_pred = np.clip(y_pred, 0, None)
+
+    y_true = build_truth_windows(
+        actual_power,
+        n_samples,
+        history_len,
+        forecast_len,
+    )
+    pred_df = build_prediction_frame(df, farm_id, y_pred, y_true, history_len, forecast_len)
+
+    pred_path = os.path.join(PREDICTION_DIR, f'patchtst_predictions_farm_{farm_id}.csv')
+    pred_df.to_csv(pred_path, index=False, encoding='utf-8-sig')
+
+    metric_df = metrics_by_horizon(farm_id, y_true, y_pred, capacity, forecast_len)
+    horizon_metric_path = os.path.join(
+        OUTPUT_DIR, f'patchtst_metrics_by_horizon_farm_{farm_id}.csv')
+    metric_df.to_csv(horizon_metric_path, index=False, encoding='utf-8-sig')
+
+    segment_path, figure_path = save_comparison_plot(pred_df, farm_id)
+
+    all_metrics = metric_df[metric_df['horizon_step'] == 'all'].iloc[0].to_dict()
+    all_metrics.update({
+        'loaded_model_path': loaded_model_path,
+        'artifact_path': artifact['artifact_path'],
+        'prediction_path': pred_path,
+        'horizon_metric_path': horizon_metric_path,
+        'comparison_segment_path': segment_path,
+        'comparison_figure_path': figure_path,
+    })
+    print(f"MAE={all_metrics['mae']:.4f}, RMSE={all_metrics['rmse']:.4f}, 输出={pred_path}")
+    return all_metrics, metric_df
+
+
+if __name__ == '__main__':
+    ensure_output_dirs()
+
+    test_files = discover_test_files(DATA_DIR)
+    if not test_files:
+        raise FileNotFoundError(f'未在 {DATA_DIR} 找到 {TEST_FILE_PATTERN}')
+
+    summary_rows = []
+    horizon_metric_frames = []
+    for file_path in test_files:
+        metrics, horizon_metrics = predict_one_farm(file_path)
+        summary_rows.append(metrics)
+        horizon_metric_frames.append(horizon_metrics)
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(OUTPUT_DIR, 'patchtst_test_metrics_summary.csv')
+    summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+
+    all_horizon_metrics = pd.concat(horizon_metric_frames, ignore_index=True)
+    all_horizon_path = os.path.join(OUTPUT_DIR, 'patchtst_test_metrics_by_horizon_all.csv')
+    all_horizon_metrics.to_csv(all_horizon_path, index=False, encoding='utf-8-sig')
+
+    print(f'\n测试集预测完成，汇总指标已保存至 {summary_path}')
+    print(f'分horizon指标已保存至 {all_horizon_path}')
+    print(f'预测明细、对比图片已保存至 {OUTPUT_DIR}')
