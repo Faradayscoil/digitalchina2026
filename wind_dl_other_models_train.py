@@ -53,6 +53,17 @@ D_FF = 128
 DROPOUT = 0.15
 HEAD_DROPOUT = 0.2
 L2_REG = 1e-4
+INFORMER_FACTOR = 5
+TIME_FEATURE_COLS = [
+    'minute_sin',
+    'minute_cos',
+    'dow_sin',
+    'dow_cos',
+    'doy_sin',
+    'doy_cos',
+    'month_sin',
+    'month_cos',
+]
 
 
 def set_global_seed(value):
@@ -236,6 +247,217 @@ def dense_forecast_head(x, forecast_len=FORECAST_LEN, name='forecast'):
     return layers.Dense(forecast_len, name=f'{name}_power')(x)
 
 
+@keras.utils.register_keras_serializable(package='WindInformer')
+class FixedPositionEmbedding(layers.Layer):
+    def __init__(self, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+
+    def call(self, inputs):
+        seq_len = tf.shape(inputs)[1]
+        position = tf.cast(tf.range(seq_len)[:, None], tf.float32)
+        dims = tf.cast(tf.range(self.d_model)[None, :], tf.float32)
+        angle_rates = tf.pow(
+            10000.0,
+            -2.0 * tf.floor(dims / 2.0) / tf.cast(self.d_model, tf.float32),
+        )
+        angles = position * angle_rates
+        even_dims = tf.equal(tf.math.mod(tf.range(self.d_model), 2), 0)
+        position_encoding = tf.where(even_dims[None, :], tf.sin(angles), tf.cos(angles))
+        return position_encoding[None, :, :]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'d_model': self.d_model})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindInformer')
+class CircularTokenEmbedding(layers.Layer):
+    def __init__(self, d_model, kernel_size=3, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+        self.token_conv = layers.Conv1D(
+            d_model,
+            kernel_size,
+            padding='valid',
+            kernel_initializer=keras.initializers.HeNormal(),
+            name='token_conv',
+        )
+
+    def call(self, inputs):
+        if self.pad == 0:
+            return self.token_conv(inputs)
+        padded = tf.concat([inputs[:, -self.pad:, :], inputs, inputs[:, :self.pad, :]], axis=1)
+        return self.token_conv(padded)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'d_model': self.d_model, 'kernel_size': self.kernel_size})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindInformer')
+class InformerDataEmbedding(layers.Layer):
+    def __init__(self, d_model, time_feature_indices=None, dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.time_feature_indices = list(time_feature_indices or [])
+        self.dropout_rate = dropout
+        self.value_embedding = CircularTokenEmbedding(d_model, kernel_size=3, name='value_embedding')
+        self.position_embedding = FixedPositionEmbedding(d_model, name='position_embedding')
+        self.temporal_embedding = layers.Dense(d_model, name='temporal_embedding')
+        self.dropout = layers.Dropout(dropout)
+
+    def call(self, inputs, training=None):
+        value = self.value_embedding(inputs)
+        position = self.position_embedding(inputs)
+        if self.time_feature_indices:
+            time_features = tf.gather(inputs, self.time_feature_indices, axis=-1)
+            temporal = self.temporal_embedding(time_features)
+        else:
+            temporal = 0.0
+        return self.dropout(value + position + temporal, training=training)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'time_feature_indices': self.time_feature_indices,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindInformer')
+class ProbSparseSelfAttention(layers.Layer):
+    def __init__(self, d_model, n_heads, factor=INFORMER_FACTOR,
+                 dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        if d_model % n_heads != 0:
+            raise ValueError('d_model 必须能被 n_heads 整除')
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.factor = factor
+        self.dropout_rate = dropout
+        self.head_dim = d_model // n_heads
+        self.query_projection = layers.Dense(d_model, name='query_projection')
+        self.key_projection = layers.Dense(d_model, name='key_projection')
+        self.value_projection = layers.Dense(d_model, name='value_projection')
+        self.out_projection = layers.Dense(d_model, name='out_projection')
+        self.attn_dropout = layers.Dropout(dropout)
+
+    def _reshape_heads(self, x):
+        batch_size = tf.shape(x)[0]
+        seq_len = tf.shape(x)[1]
+        x = tf.reshape(x, [batch_size, seq_len, self.n_heads, self.head_dim])
+        return tf.transpose(x, [0, 2, 1, 3])
+
+    def _sample_size(self, length):
+        length_float = tf.cast(length, tf.float32)
+        sample_size = tf.cast(tf.math.ceil(tf.math.log(length_float + 1.0)) * self.factor, tf.int32)
+        sample_size = tf.maximum(sample_size, 1)
+        return tf.minimum(sample_size, tf.cast(length, tf.int32))
+
+    def call(self, inputs, training=None):
+        queries = self._reshape_heads(self.query_projection(inputs))
+        keys = self._reshape_heads(self.key_projection(inputs))
+        values = self._reshape_heads(self.value_projection(inputs))
+
+        batch_size = tf.shape(inputs)[0]
+        seq_q = tf.shape(queries)[2]
+        seq_k = tf.shape(keys)[2]
+        sample_k = self._sample_size(seq_k)
+        n_top = self._sample_size(seq_q)
+
+        sampled_key_indices = tf.random.uniform(
+            shape=[seq_q, sample_k],
+            minval=0,
+            maxval=seq_k,
+            dtype=tf.int32,
+        )
+        sampled_keys = tf.gather(keys, sampled_key_indices, axis=2)
+        sampled_scores = tf.reduce_sum(
+            queries[:, :, :, None, :] * sampled_keys,
+            axis=-1,
+        )
+
+        sparsity = tf.reduce_max(sampled_scores, axis=-1) - tf.reduce_mean(sampled_scores, axis=-1)
+        top_query_indices = tf.math.top_k(sparsity, k=n_top, sorted=False).indices
+        top_queries = tf.gather(queries, top_query_indices, axis=2, batch_dims=2)
+
+        scale = tf.math.rsqrt(tf.cast(self.head_dim, tf.float32))
+        scores_top = tf.einsum('bhud,bhld->bhul', top_queries, keys) * scale
+        attention_top = tf.nn.softmax(scores_top, axis=-1)
+        attention_top = self.attn_dropout(attention_top, training=training)
+        context_top = tf.einsum('bhul,bhld->bhud', attention_top, values)
+
+        value_mean = tf.reduce_mean(values, axis=2, keepdims=True)
+        context = tf.tile(value_mean, [1, 1, seq_q, 1])
+
+        batch_indices = tf.broadcast_to(
+            tf.reshape(tf.range(batch_size), [batch_size, 1, 1]),
+            [batch_size, self.n_heads, n_top],
+        )
+        head_indices = tf.broadcast_to(
+            tf.reshape(tf.range(self.n_heads), [1, self.n_heads, 1]),
+            [batch_size, self.n_heads, n_top],
+        )
+        scatter_indices = tf.stack([batch_indices, head_indices, top_query_indices], axis=-1)
+        context = tf.tensor_scatter_nd_update(
+            context,
+            tf.reshape(scatter_indices, [-1, 3]),
+            tf.reshape(context_top, [-1, self.head_dim]),
+        )
+
+        context = tf.transpose(context, [0, 2, 1, 3])
+        context = tf.reshape(context, [batch_size, seq_q, self.d_model])
+        return self.out_projection(context)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'factor': self.factor,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+def informer_encoder_block(x, d_model=D_MODEL, n_heads=N_HEADS,
+                           d_ff=D_FF, dropout=DROPOUT, name='informer_encoder'):
+    attn = ProbSparseSelfAttention(
+        d_model=d_model,
+        n_heads=n_heads,
+        factor=INFORMER_FACTOR,
+        dropout=dropout,
+        name=f'{name}_probsparse_attention',
+    )(x)
+    x = layers.Add(name=f'{name}_attn_add')([x, layers.Dropout(dropout)(attn)])
+    x = layers.LayerNormalization(epsilon=1e-6, name=f'{name}_attn_norm')(x)
+
+    ff = layers.Conv1D(d_ff, 1, activation='gelu', name=f'{name}_ff1')(x)
+    ff = layers.Dropout(dropout, name=f'{name}_ff_dropout')(ff)
+    ff = layers.Conv1D(d_model, 1, name=f'{name}_ff2')(ff)
+    x = layers.Add(name=f'{name}_ff_add')([x, layers.Dropout(dropout)(ff)])
+    return layers.LayerNormalization(epsilon=1e-6, name=f'{name}_ff_norm')(x)
+
+
+def informer_distil_layer(x, name='informer_distil'):
+    x = CircularTokenEmbedding(D_MODEL, kernel_size=3, name=f'{name}_circular_conv')(x)
+    x = layers.BatchNormalization(name=f'{name}_batch_norm')(x)
+    x = layers.ELU(name=f'{name}_elu')(x)
+    return layers.MaxPooling1D(
+        pool_size=3,
+        strides=2,
+        padding='same',
+        name=f'{name}_max_pool',
+    )(x)
+
+
 def transformer_encoder_block(x, d_model=D_MODEL, n_heads=N_HEADS,
                               d_ff=D_FF, dropout=DROPOUT, name='encoder'):
     attn = layers.MultiHeadAttention(
@@ -367,25 +589,27 @@ def build_transformer_model(input_shape):
     return compile_forecast_model(keras.Model(inputs, outputs, name='WindTransformer'))
 
 
-def build_informer_model(input_shape):
+def get_time_feature_indices(input_cols):
+    return [idx for idx, col in enumerate(input_cols) if col in TIME_FEATURE_COLS]
+
+
+def build_informer_model(input_shape, input_cols=None):
     """
-    Informer-inspired Keras implementation:
-    encoder embedding + attention encoder + convolutional distilling + direct multi-step head.
+    Informer-style Keras implementation:
+    TokenEmbedding + Positional/TemporalEmbedding + ProbSparse Attention encoder + distilling.
     """
+    time_feature_indices = get_time_feature_indices(input_cols or [])
     inputs = keras.Input(shape=input_shape, name='history_features')
-    x = layers.Dense(D_MODEL, name='informer_data_embedding')(inputs)
+    x = InformerDataEmbedding(
+        D_MODEL,
+        time_feature_indices=time_feature_indices,
+        dropout=DROPOUT,
+        name='informer_data_embedding',
+    )(inputs)
     for idx in range(N_LAYERS):
-        x = transformer_encoder_block(x, name=f'informer_encoder_{idx + 1}')
+        x = informer_encoder_block(x, name=f'informer_encoder_{idx + 1}')
         if idx < N_LAYERS - 1:
-            x = layers.Conv1D(
-                D_MODEL,
-                3,
-                padding='same',
-                activation='gelu',
-                name=f'informer_distil_conv_{idx + 1}',
-            )(x)
-            x = layers.MaxPooling1D(pool_size=2, strides=2, padding='same',
-                                    name=f'informer_distil_pool_{idx + 1}')(x)
+            x = informer_distil_layer(x, name=f'informer_distil_{idx + 1}')
     outputs = dense_forecast_head(x, name='informer_forecast')
     return compile_forecast_model(keras.Model(inputs, outputs, name='WindInformer'))
 
@@ -452,7 +676,10 @@ def train_one_model_for_farm(model_name, train_file):
     print(f'输入通道数: {len(input_cols)}，样本数: {total_samples}，训练/验证: {train_samples}/{total_samples - train_samples}')
 
     builder = MODEL_BUILDERS[model_name]
-    model = builder((HISTORY_LEN, len(input_cols)))
+    if model_name == 'informer':
+        model = builder((HISTORY_LEN, len(input_cols)), input_cols=input_cols)
+    else:
+        model = builder((HISTORY_LEN, len(input_cols)))
     model.summary()
 
     model_path = os.path.join(dirs['models'], f'{model_name}_farm_{farm_id}.keras')
@@ -519,6 +746,7 @@ def train_one_model_for_farm(model_name, train_file):
         'input_cols': input_cols,
         'target_col': TARGET_COL,
         'target_index': target_index,
+        'time_feature_indices': get_time_feature_indices(input_cols),
         'scaler_x': scaler_x,
         'scaler_y': scaler_y,
         'capacity': capacity,
