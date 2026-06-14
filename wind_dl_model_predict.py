@@ -11,14 +11,13 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow import keras
 
 from wind_dl_model_train import (
-    BATCH_SIZE,
+    BATCH_SIZE as PATCHTST_BATCH_SIZE,
     DATA_DIR,
     FORECAST_LEN,
     HISTORY_LEN,
-    MODEL_DIR,
+    MODEL_DIR as PATCHTST_MODEL_DIR,
     SAVED_MODEL_DIR,
     TARGET_COL,
-    TIME_FREQ,
     LearnablePositionEmbedding,
     MergeChannels,
     PatchExtract,
@@ -27,18 +26,38 @@ from wind_dl_model_train import (
     build_patchtst_model,
     load_and_preprocess,
 )
+from wind_dl_other_models_train import (
+    BASE_RESULT_DIR,
+    BATCH_SIZE as OTHER_BATCH_SIZE,
+    DEFAULT_MODEL_NAMES as OTHER_MODEL_NAMES,
+    MODEL_BUILDERS,
+    AutoformerDataEmbedding,
+    AutoformerDecoderInitializer,
+    AutoformerDecoderLayer,
+    AutoformerEncoderLayer,
+    AutoformerLayerNorm,
+    CircularTokenEmbedding,
+    FixedPositionEmbedding,
+    InformerDataEmbedding,
+    MovingAverage,
+    ProbSparseSelfAttention,
+    SeriesDecomposition,
+    SeriesWiseAutoCorrelation,
+    seed,
+    set_global_seed,
+)
 
 warnings.filterwarnings('ignore')
 
 
 TEST_FILE_PATTERN = 'wind_test_*.csv'
-OUTPUT_DIR = os.path.join(MODEL_DIR, 'testdata_predict_output')
-PREDICTION_DIR = os.path.join(OUTPUT_DIR, 'predictions')
-FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
-SINGLE_WINDOW_DIR = os.path.join(OUTPUT_DIR, 'single_window_comparisons')
-WEIGHTED_CURVE_DIR = os.path.join(OUTPUT_DIR, 'weighted_curves')
-PRED_BATCH_SIZE = max(256, BATCH_SIZE)
+TIME_COL = '时间'
+PATCHTST_MODEL_NAME = 'patchtst'
+ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME] + OTHER_MODEL_NAMES
+OUTPUT_SUBDIR = 'testdata_predict_output'
+PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
 EXP_WEIGHT_HALFLIFE_STEPS = 4.0
+PREDICT_VERBOSE = int(os.getenv('WIND_DL_PREDICT_VERBOSE', '1'))
 
 
 def discover_test_files(data_dir=DATA_DIR):
@@ -53,22 +72,38 @@ def get_farm_id(path):
     return os.path.splitext(basename)[0]
 
 
-def ensure_output_dirs():
-    for path in [OUTPUT_DIR, PREDICTION_DIR, FIGURE_DIR, SINGLE_WINDOW_DIR, WEIGHTED_CURVE_DIR]:
+def get_requested_model_names():
+    names = os.getenv('WIND_DL_MODEL_NAMES')
+    if not names:
+        return ALL_MODEL_NAMES
+
+    requested = [name.strip().lower() for name in names.split(',') if name.strip()]
+    if any(name in {'all', '*'} for name in requested):
+        return ALL_MODEL_NAMES
+
+    invalid = sorted(set(requested) - set(ALL_MODEL_NAMES))
+    if invalid:
+        raise ValueError(f'未知模型名称: {invalid}; 可选: {ALL_MODEL_NAMES}')
+    return requested
+
+
+def model_output_dirs(model_name):
+    output_dir = os.path.join(BASE_RESULT_DIR, model_name, OUTPUT_SUBDIR)
+    dirs = {
+        'root': output_dir,
+        'predictions': os.path.join(output_dir, 'predictions'),
+        'figures': os.path.join(output_dir, 'figures'),
+        'single_windows': os.path.join(output_dir, 'single_window_comparisons'),
+        'weighted_curves': os.path.join(output_dir, 'weighted_curves'),
+        'matplotlib_cache': os.path.join(output_dir, 'matplotlib_cache'),
+    }
+    for path in dirs.values():
         os.makedirs(path, exist_ok=True)
+    return dirs
 
 
-def load_artifact(farm_id):
-    artifact_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_preprocess.pkl')
-    if not os.path.exists(artifact_path):
-        raise FileNotFoundError(f'未找到场站 {farm_id} 的预处理文件: {artifact_path}')
-    artifact = joblib.load(artifact_path)
-    artifact['artifact_path'] = artifact_path
-    return artifact
-
-
-def load_patchtst_model(farm_id, artifact):
-    custom_objects = {
+def get_custom_objects():
+    return {
         'PatchExtract': PatchExtract,
         'WindPatchTST>PatchExtract': PatchExtract,
         'MergeChannels': MergeChannels,
@@ -79,33 +114,117 @@ def load_patchtst_model(farm_id, artifact):
         'WindPatchTST>LearnablePositionEmbedding': LearnablePositionEmbedding,
         'TakeChannel': TakeChannel,
         'WindPatchTST>TakeChannel': TakeChannel,
+        'FixedPositionEmbedding': FixedPositionEmbedding,
+        'WindInformer>FixedPositionEmbedding': FixedPositionEmbedding,
+        'CircularTokenEmbedding': CircularTokenEmbedding,
+        'WindInformer>CircularTokenEmbedding': CircularTokenEmbedding,
+        'InformerDataEmbedding': InformerDataEmbedding,
+        'WindInformer>InformerDataEmbedding': InformerDataEmbedding,
+        'ProbSparseSelfAttention': ProbSparseSelfAttention,
+        'WindInformer>ProbSparseSelfAttention': ProbSparseSelfAttention,
+        'MovingAverage': MovingAverage,
+        'WindAutoformer>MovingAverage': MovingAverage,
+        'SeriesDecomposition': SeriesDecomposition,
+        'WindAutoformer>SeriesDecomposition': SeriesDecomposition,
+        'AutoformerLayerNorm': AutoformerLayerNorm,
+        'WindAutoformer>AutoformerLayerNorm': AutoformerLayerNorm,
+        'AutoformerDataEmbedding': AutoformerDataEmbedding,
+        'WindAutoformer>AutoformerDataEmbedding': AutoformerDataEmbedding,
+        'AutoformerDecoderInitializer': AutoformerDecoderInitializer,
+        'WindAutoformer>AutoformerDecoderInitializer': AutoformerDecoderInitializer,
+        'SeriesWiseAutoCorrelation': SeriesWiseAutoCorrelation,
+        'WindAutoformer>SeriesWiseAutoCorrelation': SeriesWiseAutoCorrelation,
+        'AutoformerEncoderLayer': AutoformerEncoderLayer,
+        'WindAutoformer>AutoformerEncoderLayer': AutoformerEncoderLayer,
+        'AutoformerDecoderLayer': AutoformerDecoderLayer,
+        'WindAutoformer>AutoformerDecoderLayer': AutoformerDecoderLayer,
     }
 
-    model_path = artifact.get('model_path') or os.path.join(
-        SAVED_MODEL_DIR, f'patchtst_farm_{farm_id}.keras')
-    if os.path.exists(model_path):
-        return keras.models.load_model(
-            model_path,
-            custom_objects=custom_objects,
-            compile=False,
-        ), model_path
 
-    best_weights_path = artifact.get('best_weights_path') or os.path.join(
-        MODEL_DIR, f'patchtst_farm_{farm_id}_best.weights.h5')
+def load_artifact(model_name, farm_id):
+    if model_name == PATCHTST_MODEL_NAME:
+        artifact_path = os.path.join(
+            PATCHTST_MODEL_DIR,
+            f'patchtst_farm_{farm_id}_preprocess.pkl',
+        )
+    else:
+        artifact_path = os.path.join(
+            BASE_RESULT_DIR,
+            model_name,
+            'preprocess',
+            f'{model_name}_farm_{farm_id}_preprocess.pkl',
+        )
+
+    if not os.path.exists(artifact_path):
+        raise FileNotFoundError(
+            f'未找到 {model_name} 场站 {farm_id} 的预处理文件: {artifact_path}')
+    artifact = joblib.load(artifact_path)
+    artifact['artifact_path'] = artifact_path
+    return artifact
+
+
+def build_model_from_weights(model_name, artifact):
+    if model_name == PATCHTST_MODEL_NAME:
+        return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+
+    input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
+    builder = MODEL_BUILDERS[model_name]
+    if model_name in {'informer', 'autoformer'}:
+        return builder(input_shape, input_cols=artifact['input_cols'])
+    return builder(input_shape)
+
+
+def load_trained_model(model_name, farm_id, artifact):
+    if model_name == PATCHTST_MODEL_NAME:
+        model_path = artifact.get('model_path') or os.path.join(
+            SAVED_MODEL_DIR,
+            f'patchtst_farm_{farm_id}.keras',
+        )
+        best_weights_path = artifact.get('best_weights_path') or os.path.join(
+            PATCHTST_MODEL_DIR,
+            f'patchtst_farm_{farm_id}_best.weights.h5',
+        )
+    else:
+        model_path = artifact.get('model_path') or os.path.join(
+            BASE_RESULT_DIR,
+            model_name,
+            'models',
+            f'{model_name}_farm_{farm_id}.keras',
+        )
+        best_weights_path = artifact.get('best_weights_path') or os.path.join(
+            BASE_RESULT_DIR,
+            model_name,
+            'weights',
+            f'{model_name}_farm_{farm_id}_best.weights.h5',
+        )
+
+    if os.path.exists(model_path):
+        model = keras.models.load_model(
+            model_path,
+            custom_objects=get_custom_objects(),
+            compile=False,
+        )
+        return model, model_path
+
     if not os.path.exists(best_weights_path):
         raise FileNotFoundError(
-            f'未找到场站 {farm_id} 的完整模型或最佳权重: {model_path}, {best_weights_path}')
+            f'未找到 {model_name} 场站 {farm_id} 的完整模型或最佳权重: '
+            f'{model_path}, {best_weights_path}')
 
-    model = build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+    model = build_model_from_weights(model_name, artifact)
     model.load_weights(best_weights_path)
     return model, best_weights_path
 
 
 def load_actual_power_series(data_path, index, capacity=None):
-    raw_df = pd.read_csv(data_path, parse_dates=['时间'], usecols=['时间', TARGET_COL])
-    raw_df = raw_df.sort_values('时间').drop_duplicates('时间')
-    raw_df.set_index('时间', inplace=True)
+    raw_df = pd.read_csv(data_path, parse_dates=[TIME_COL])
+    if TIME_COL not in raw_df.columns or TARGET_COL not in raw_df.columns:
+        return pd.Series(np.nan, index=index, dtype=float)
+
+    raw_df = raw_df[[TIME_COL, TARGET_COL]].sort_values(TIME_COL).drop_duplicates(TIME_COL)
+    raw_df.set_index(TIME_COL, inplace=True)
     raw_df[TARGET_COL] = pd.to_numeric(raw_df[TARGET_COL], errors='coerce')
+
     actual = raw_df[TARGET_COL].reindex(index).astype(float)
     actual = actual.clip(lower=0)
     if capacity is not None:
@@ -118,7 +237,8 @@ def prepare_prediction_arrays(test_file, artifact):
     capacity = artifact.get('capacity') or file_capacity
     actual_power = load_actual_power_series(test_file, df.index, capacity)
 
-    # 预测输入只能看到历史功率。未来真实功率保留在 actual_power 中，仅用于评价和可视化。
+    # Only already-observed historical power is used by model input windows.
+    # Future real power stays outside inputs and is used only for metrics/plots.
     historical_power = actual_power.ffill().fillna(0)
     df[TARGET_COL] = historical_power.astype(np.float32)
 
@@ -138,7 +258,6 @@ def make_prediction_dataset(features, history_len=HISTORY_LEN, forecast_len=FORE
     if n_samples <= 0:
         raise ValueError('测试集长度不足，无法构造完整历史窗口和预测窗口')
 
-    # 只切到 n_samples + history_len - 1，保证每个输入窗口止于预测起点之前。
     data_slice = features[:n_samples + history_len - 1]
     ds = keras.utils.timeseries_dataset_from_array(
         data=data_slice,
@@ -165,7 +284,7 @@ def build_truth_windows(actual_power, n_samples,
     return np.asarray(rows, dtype=float)
 
 
-def build_prediction_frame(df, farm_id, y_pred, y_true,
+def build_prediction_frame(model_name, df, farm_id, y_pred, y_true,
                            history_len=HISTORY_LEN, forecast_len=FORECAST_LEN):
     n_samples = y_pred.shape[0]
     origin_times = df.index[history_len - 1:history_len - 1 + n_samples]
@@ -176,6 +295,7 @@ def build_prediction_frame(df, farm_id, y_pred, y_true,
         target_times = df.index[
             history_len + horizon_idx:history_len + horizon_idx + n_samples]
         rows.append(pd.DataFrame({
+            'model_name': model_name,
             'farm_id': farm_id,
             'sample_id': np.arange(n_samples),
             'forecast_origin_time': origin_times,
@@ -222,13 +342,15 @@ def calculate_metrics(y_true, y_pred, capacity=None):
     nonzero_mask = np.abs(yt) > 1e-6
     mape = np.nan
     if nonzero_mask.any():
-        mape = float(np.mean(np.abs((yt[nonzero_mask] - yp[nonzero_mask]) / yt[nonzero_mask])) * 100)
+        mape = float(np.mean(
+            np.abs((yt[nonzero_mask] - yp[nonzero_mask]) / yt[nonzero_mask])) * 100)
 
     denominator = np.abs(yt) + np.abs(yp)
     smape_mask = denominator > 1e-6
     smape = np.nan
     if smape_mask.any():
-        smape = float(np.mean(2 * np.abs(yp[smape_mask] - yt[smape_mask]) / denominator[smape_mask]) * 100)
+        smape = float(np.mean(
+            2 * np.abs(yp[smape_mask] - yt[smape_mask]) / denominator[smape_mask]) * 100)
 
     r2 = np.nan
     if valid_count > 1 and np.nanstd(yt) > 1e-6:
@@ -253,15 +375,22 @@ def calculate_metrics(y_true, y_pred, capacity=None):
     }
 
 
-def metrics_by_horizon(farm_id, y_true, y_pred, capacity=None, forecast_len=FORECAST_LEN):
+def metrics_by_horizon(model_name, farm_id, y_true, y_pred,
+                       capacity=None, forecast_len=FORECAST_LEN):
     rows = []
     all_metrics = calculate_metrics(y_true, y_pred, capacity)
-    all_metrics.update({'farm_id': farm_id, 'horizon_step': 'all', 'horizon_minutes': 'all'})
+    all_metrics.update({
+        'model_name': model_name,
+        'farm_id': farm_id,
+        'horizon_step': 'all',
+        'horizon_minutes': 'all',
+    })
     rows.append(all_metrics)
 
     for horizon_idx in range(forecast_len):
         metrics = calculate_metrics(y_true[:, horizon_idx], y_pred[:, horizon_idx], capacity)
         metrics.update({
+            'model_name': model_name,
             'farm_id': farm_id,
             'horizon_step': horizon_idx + 1,
             'horizon_minutes': (horizon_idx + 1) * 15,
@@ -271,8 +400,8 @@ def metrics_by_horizon(farm_id, y_true, y_pred, capacity=None, forecast_len=FORE
     return pd.DataFrame(rows)
 
 
-def setup_matplotlib():
-    cache_dir = os.path.join(OUTPUT_DIR, 'matplotlib_cache')
+def setup_matplotlib(dirs):
+    cache_dir = dirs['matplotlib_cache']
     os.environ['MPLCONFIGDIR'] = cache_dir
     os.environ['XDG_CACHE_HOME'] = cache_dir
     os.makedirs(cache_dir, exist_ok=True)
@@ -283,7 +412,7 @@ def setup_matplotlib():
     return plt
 
 
-def save_single_window_plot(pred_df, farm_id, forecast_len=FORECAST_LEN):
+def save_single_window_plot(pred_df, model_name, farm_id, dirs, forecast_len=FORECAST_LEN):
     valid_df = pred_df[pred_df['valid_actual']].copy()
     if valid_df.empty:
         return None, None
@@ -297,12 +426,18 @@ def save_single_window_plot(pred_df, farm_id, forecast_len=FORECAST_LEN):
         sample_id = partial_windows[len(partial_windows) // 2]
 
     window_df = pred_df[pred_df['sample_id'] == sample_id].sort_values('horizon_step').copy()
-    window_path = os.path.join(SINGLE_WINDOW_DIR, f'single_4h_window_farm_{farm_id}.csv')
+    window_path = os.path.join(
+        dirs['single_windows'],
+        f'{model_name}_single_4h_window_farm_{farm_id}.csv',
+    )
     window_df.to_csv(window_path, index=False, encoding='utf-8-sig')
 
-    figure_path = os.path.join(FIGURE_DIR, f'single_4h_window_farm_{farm_id}.png')
+    figure_path = os.path.join(
+        dirs['figures'],
+        f'{model_name}_single_4h_window_farm_{farm_id}.png',
+    )
     try:
-        plt = setup_matplotlib()
+        plt = setup_matplotlib(dirs)
         origin_time = window_df['forecast_origin_time'].iloc[0]
         start_time = window_df['forecast_start_time'].iloc[0]
 
@@ -310,9 +445,9 @@ def save_single_window_plot(pred_df, farm_id, forecast_len=FORECAST_LEN):
         ax.plot(window_df['target_time'], window_df['actual_power'],
                 marker='o', label='Actual power', linewidth=1.6)
         ax.plot(window_df['target_time'], window_df['pred_power'],
-                marker='s', label='PatchTST 4h window prediction', linewidth=1.4)
+                marker='s', label=f'{model_name} 4h window prediction', linewidth=1.4)
         ax.set_title(
-            f'Farm {farm_id} Single 4h Forecast Window\n'
+            f'{model_name} Farm {farm_id} Single 4h Forecast Window\n'
             f'origin={origin_time}, forecast_start={start_time}'
         )
         ax.set_xlabel('Target time')
@@ -324,7 +459,7 @@ def save_single_window_plot(pred_df, farm_id, forecast_len=FORECAST_LEN):
         fig.savefig(figure_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
     except Exception as exc:
-        print(f'场站 {farm_id} 单窗口可视化保存失败: {exc}')
+        print(f'{model_name} 场站 {farm_id} 单窗口可视化保存失败: {exc}')
         figure_path = None
 
     return window_path, figure_path
@@ -361,25 +496,31 @@ def build_exponential_weighted_timeline(pred_df):
     ]]
 
 
-def save_weighted_full_test_plot(pred_df, farm_id, capacity=None):
+def save_weighted_full_test_plot(pred_df, model_name, farm_id, dirs, capacity=None):
     timeline = build_exponential_weighted_timeline(pred_df)
     if timeline.empty:
         return None, None, {}
 
-    weighted_curve_path = os.path.join(WEIGHTED_CURVE_DIR, f'weighted_curve_farm_{farm_id}.csv')
+    weighted_curve_path = os.path.join(
+        dirs['weighted_curves'],
+        f'{model_name}_weighted_curve_farm_{farm_id}.csv',
+    )
     timeline.to_csv(weighted_curve_path, index=False, encoding='utf-8-sig')
 
-    figure_path = os.path.join(FIGURE_DIR, f'weighted_full_test_farm_{farm_id}.png')
+    figure_path = os.path.join(
+        dirs['figures'],
+        f'{model_name}_weighted_full_test_farm_{farm_id}.png',
+    )
     try:
-        plt = setup_matplotlib()
+        plt = setup_matplotlib(dirs)
 
         fig, ax = plt.subplots(figsize=(16, 5))
         ax.plot(timeline['target_time'], timeline['actual_power'],
                 label='Actual power', linewidth=1.6)
         ax.plot(timeline['target_time'], timeline['pred_power'],
-                label='PatchTST exponential weighted prediction', linewidth=1.3)
+                label=f'{model_name} exponential weighted prediction', linewidth=1.3)
         ax.set_title(
-            f'Farm {farm_id} Full Test Prediction vs Actual\n'
+            f'{model_name} Farm {farm_id} Full Test Prediction vs Actual\n'
             f'exponential weight half-life={EXP_WEIGHT_HALFLIFE_STEPS:g} horizon steps'
         )
         ax.set_xlabel('Time')
@@ -391,7 +532,7 @@ def save_weighted_full_test_plot(pred_df, farm_id, capacity=None):
         fig.savefig(figure_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
     except Exception as exc:
-        print(f'场站 {farm_id} 全测试集指数加权可视化保存失败: {exc}')
+        print(f'{model_name} 场站 {farm_id} 全测试集指数加权可视化保存失败: {exc}')
         figure_path = None
 
     weighted_metrics = calculate_metrics(
@@ -402,52 +543,65 @@ def save_weighted_full_test_plot(pred_df, farm_id, capacity=None):
     return weighted_curve_path, figure_path, weighted_metrics
 
 
-def predict_one_farm(test_file):
+def predict_one_farm(model_name, test_file):
     farm_id = get_farm_id(test_file)
-    print(f'\n===== 预测风电场 {farm_id} =====')
+    dirs = model_output_dirs(model_name)
+    print(f'\n===== 预测 {model_name} / 风电场 {farm_id} =====')
 
-    artifact = load_artifact(farm_id)
-    model, loaded_model_path = load_patchtst_model(farm_id, artifact)
+    artifact = load_artifact(model_name, farm_id)
+    model, loaded_model_path = load_trained_model(model_name, farm_id, artifact)
     df, features, actual_power, capacity = prepare_prediction_arrays(test_file, artifact)
     history_len = artifact.get('history_len', HISTORY_LEN)
     forecast_len = artifact.get('forecast_len', FORECAST_LEN)
-    pred_ds, n_samples = make_prediction_dataset(
-        features,
-        history_len,
-        forecast_len,
-    )
 
-    y_pred_scaled = model.predict(pred_ds, verbose=1)
+    pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
+    y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)
     y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
+    if y_pred.shape[0] != n_samples:
+        raise ValueError(
+            f'{model_name} 场站 {farm_id} 预测样本数不一致: {y_pred.shape[0]} vs {n_samples}')
+
     if capacity is not None:
         y_pred = np.clip(y_pred, 0, capacity)
     else:
         y_pred = np.clip(y_pred, 0, None)
 
-    y_true = build_truth_windows(
-        actual_power,
-        n_samples,
+    y_true = build_truth_windows(actual_power, n_samples, history_len, forecast_len)
+    pred_df = build_prediction_frame(
+        model_name,
+        df,
+        farm_id,
+        y_pred,
+        y_true,
         history_len,
         forecast_len,
     )
-    pred_df = build_prediction_frame(df, farm_id, y_pred, y_true, history_len, forecast_len)
 
-    pred_path = os.path.join(PREDICTION_DIR, f'patchtst_predictions_farm_{farm_id}.csv')
+    pred_path = os.path.join(
+        dirs['predictions'],
+        f'{model_name}_predictions_farm_{farm_id}.csv',
+    )
     pred_df.to_csv(pred_path, index=False, encoding='utf-8-sig')
 
-    metric_df = metrics_by_horizon(farm_id, y_true, y_pred, capacity, forecast_len)
+    metric_df = metrics_by_horizon(model_name, farm_id, y_true, y_pred, capacity, forecast_len)
     horizon_metric_path = os.path.join(
-        OUTPUT_DIR, f'patchtst_metrics_by_horizon_farm_{farm_id}.csv')
+        dirs['root'],
+        f'{model_name}_metrics_by_horizon_farm_{farm_id}.csv',
+    )
     metric_df.to_csv(horizon_metric_path, index=False, encoding='utf-8-sig')
 
     single_window_path, single_window_figure_path = save_single_window_plot(
         pred_df,
+        model_name,
         farm_id,
+        dirs,
         forecast_len,
     )
     weighted_curve_path, weighted_curve_figure_path, weighted_metrics = save_weighted_full_test_plot(
         pred_df,
+        model_name,
         farm_id,
+        dirs,
         capacity,
     )
 
@@ -467,32 +621,85 @@ def predict_one_farm(test_file):
         'weighted_curve_figure_path': weighted_curve_figure_path,
         **weighted_metric_fields,
     })
-    print(f"MAE={all_metrics['mae']:.4f}, RMSE={all_metrics['rmse']:.4f}, 输出={pred_path}")
+    print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "
+          f"RMSE={all_metrics['rmse']:.4f}")
+
+    del model
+    keras.backend.clear_session()
     return all_metrics, metric_df
 
 
-if __name__ == '__main__':
-    ensure_output_dirs()
+def predict_model_family(model_name, test_files):
+    dirs = model_output_dirs(model_name)
+    summary_rows = []
+    horizon_metric_frames = []
+
+    for test_file in test_files:
+        try:
+            metrics, horizon_metrics = predict_one_farm(model_name, test_file)
+        except FileNotFoundError as exc:
+            print(f'跳过 {model_name} {os.path.basename(test_file)}: {exc}')
+            continue
+        summary_rows.append(metrics)
+        horizon_metric_frames.append(horizon_metrics)
+
+    if not summary_rows:
+        print(f'{model_name} 没有生成预测结果')
+        return pd.DataFrame(), pd.DataFrame()
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(dirs['root'], f'{model_name}_test_metrics_summary.csv')
+    summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+
+    all_horizon_metrics = pd.concat(horizon_metric_frames, ignore_index=True)
+    all_horizon_path = os.path.join(dirs['root'], f'{model_name}_test_metrics_by_horizon_all.csv')
+    all_horizon_metrics.to_csv(all_horizon_path, index=False, encoding='utf-8-sig')
+
+    print(f'{model_name} 汇总指标已保存: {summary_path}')
+    print(f'{model_name} 分horizon指标已保存: {all_horizon_path}')
+    return summary_df, all_horizon_metrics
+
+
+def main():
+    set_global_seed(seed)
 
     test_files = discover_test_files(DATA_DIR)
     if not test_files:
         raise FileNotFoundError(f'未在 {DATA_DIR} 找到 {TEST_FILE_PATTERN}')
 
-    summary_rows = []
-    horizon_metric_frames = []
-    for file_path in test_files:
-        metrics, horizon_metrics = predict_one_farm(file_path)
-        summary_rows.append(metrics)
-        horizon_metric_frames.append(horizon_metrics)
+    requested_model_names = get_requested_model_names()
+    print(f'发现 {len(test_files)} 个风电测试文件')
+    print(f'将预测模型: {requested_model_names}')
 
-    summary_df = pd.DataFrame(summary_rows)
-    summary_path = os.path.join(OUTPUT_DIR, 'patchtst_test_metrics_summary.csv')
-    summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+    all_summary = []
+    all_horizon = []
+    for model_name in requested_model_names:
+        summary_df, horizon_df = predict_model_family(model_name, test_files)
+        if not summary_df.empty:
+            all_summary.append(summary_df)
+        if not horizon_df.empty:
+            all_horizon.append(horizon_df)
 
-    all_horizon_metrics = pd.concat(horizon_metric_frames, ignore_index=True)
-    all_horizon_path = os.path.join(OUTPUT_DIR, 'patchtst_test_metrics_by_horizon_all.csv')
-    all_horizon_metrics.to_csv(all_horizon_path, index=False, encoding='utf-8-sig')
+    if all_summary:
+        global_summary = pd.concat(all_summary, ignore_index=True)
+        global_summary_path = os.path.join(
+            BASE_RESULT_DIR,
+            'wind_dl_all_models_test_metrics_summary.csv',
+        )
+        global_summary.to_csv(global_summary_path, index=False, encoding='utf-8-sig')
+        print(f'全部模型汇总指标已保存: {global_summary_path}')
 
-    print(f'\n测试集预测完成，汇总指标已保存至 {summary_path}')
-    print(f'分horizon指标已保存至 {all_horizon_path}')
-    print(f'预测明细、对比图片已保存至 {OUTPUT_DIR}')
+    if all_horizon:
+        global_horizon = pd.concat(all_horizon, ignore_index=True)
+        global_horizon_path = os.path.join(
+            BASE_RESULT_DIR,
+            'wind_dl_all_models_test_metrics_by_horizon_all.csv',
+        )
+        global_horizon.to_csv(global_horizon_path, index=False, encoding='utf-8-sig')
+        print(f'全部模型分horizon指标已保存: {global_horizon_path}')
+
+    print('全部深度学习模型测试集预测完成')
+
+
+if __name__ == '__main__':
+    main()
