@@ -54,6 +54,9 @@ DROPOUT = 0.15
 HEAD_DROPOUT = 0.2
 L2_REG = 1e-4
 INFORMER_FACTOR = 5
+AUTOFORMER_FACTOR = 3
+AUTOFORMER_MOVING_AVG = 25
+AUTOFORMER_LABEL_LEN = min(48, HISTORY_LEN)
 TIME_FEATURE_COLS = [
     'minute_sin',
     'minute_cos',
@@ -458,6 +461,344 @@ def informer_distil_layer(x, name='informer_distil'):
     )(x)
 
 
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class MovingAverage(layers.Layer):
+    def __init__(self, kernel_size=AUTOFORMER_MOVING_AVG, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.pad = (kernel_size - 1) // 2
+        self.avg_pool = layers.AveragePooling1D(
+            pool_size=kernel_size,
+            strides=1,
+            padding='valid',
+        )
+
+    def call(self, inputs):
+        if self.pad == 0:
+            return inputs
+        front = tf.repeat(inputs[:, :1, :], repeats=self.pad, axis=1)
+        end = tf.repeat(inputs[:, -1:, :], repeats=self.pad, axis=1)
+        padded = tf.concat([front, inputs, end], axis=1)
+        return self.avg_pool(padded)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'kernel_size': self.kernel_size})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class SeriesDecomposition(layers.Layer):
+    def __init__(self, kernel_size=AUTOFORMER_MOVING_AVG, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.moving_average = MovingAverage(kernel_size, name='moving_average')
+
+    def call(self, inputs):
+        trend = self.moving_average(inputs)
+        seasonal = inputs - trend
+        return seasonal, trend
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'kernel_size': self.kernel_size})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class AutoformerLayerNorm(layers.Layer):
+    def __init__(self, epsilon=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.layer_norm = layers.LayerNormalization(epsilon=epsilon)
+
+    def call(self, inputs):
+        normalized = self.layer_norm(inputs)
+        bias = tf.reduce_mean(normalized, axis=1, keepdims=True)
+        return normalized - bias
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'epsilon': self.epsilon})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class AutoformerDataEmbedding(layers.Layer):
+    def __init__(self, d_model, time_feature_indices=None, dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.time_feature_indices = list(time_feature_indices or [])
+        self.dropout_rate = dropout
+        self.value_embedding = CircularTokenEmbedding(d_model, kernel_size=3, name='value_embedding')
+        self.temporal_embedding = layers.Dense(d_model, use_bias=False, name='temporal_embedding')
+        self.dropout = layers.Dropout(dropout)
+
+    def call(self, inputs, training=None):
+        value = self.value_embedding(inputs)
+        if self.time_feature_indices:
+            time_features = tf.gather(inputs, self.time_feature_indices, axis=-1)
+            temporal = self.temporal_embedding(time_features)
+        else:
+            temporal = 0.0
+        return self.dropout(value + temporal, training=training)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'time_feature_indices': self.time_feature_indices,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class AutoformerDecoderInitializer(layers.Layer):
+    def __init__(self, label_len=AUTOFORMER_LABEL_LEN, pred_len=FORECAST_LEN, **kwargs):
+        super().__init__(**kwargs)
+        self.label_len = label_len
+        self.pred_len = pred_len
+
+    def call(self, inputs):
+        seasonal_init, trend_init, encoded_values = inputs
+        future_mean = tf.reduce_mean(encoded_values, axis=1, keepdims=True)
+        future_mean = tf.repeat(future_mean, repeats=self.pred_len, axis=1)
+        future_zeros = tf.zeros_like(future_mean)
+        trend = tf.concat([trend_init[:, -self.label_len:, :], future_mean], axis=1)
+        seasonal = tf.concat([seasonal_init[:, -self.label_len:, :], future_zeros], axis=1)
+        return seasonal, trend
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'label_len': self.label_len,
+            'pred_len': self.pred_len,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class SeriesWiseAutoCorrelation(layers.Layer):
+    def __init__(self, d_model, n_heads, factor=AUTOFORMER_FACTOR,
+                 dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        if d_model % n_heads != 0:
+            raise ValueError('d_model 必须能被 n_heads 整除')
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.factor = factor
+        self.dropout_rate = dropout
+        self.head_dim = d_model // n_heads
+        self.query_projection = layers.Dense(d_model, name='query_projection')
+        self.key_projection = layers.Dense(d_model, name='key_projection')
+        self.value_projection = layers.Dense(d_model, name='value_projection')
+        self.out_projection = layers.Dense(d_model, name='out_projection')
+        self.dropout = layers.Dropout(dropout)
+
+    def _reshape_heads(self, x):
+        batch_size = tf.shape(x)[0]
+        seq_len = tf.shape(x)[1]
+        x = tf.reshape(x, [batch_size, seq_len, self.n_heads, self.head_dim])
+        return tf.transpose(x, [0, 2, 1, 3])
+
+    def _align_length(self, x, target_len):
+        current_len = tf.shape(x)[2]
+
+        def pad_to_target():
+            pad_len = target_len - current_len
+            paddings = tf.stack([
+                tf.constant([0, 0], dtype=tf.int32),
+                tf.constant([0, 0], dtype=tf.int32),
+                tf.stack([tf.constant(0, dtype=tf.int32), pad_len]),
+                tf.constant([0, 0], dtype=tf.int32),
+            ])
+            return tf.pad(x, paddings)
+
+        def slice_to_target():
+            return x[:, :, :target_len, :]
+
+        return tf.cond(current_len < target_len, pad_to_target, slice_to_target)
+
+    def _top_k(self, length):
+        length_float = tf.cast(length, tf.float32)
+        top_k = tf.cast(tf.math.ceil(tf.math.log(length_float + 1.0)) * self.factor, tf.int32)
+        top_k = tf.maximum(top_k, 1)
+        return tf.minimum(top_k, tf.cast(length, tf.int32))
+
+    def call(self, inputs, training=None):
+        queries, keys, values = inputs
+        queries = self._reshape_heads(self.query_projection(queries))
+        keys = self._reshape_heads(self.key_projection(keys))
+        values = self._reshape_heads(self.value_projection(values))
+
+        seq_len = tf.shape(queries)[2]
+        keys = self._align_length(keys, seq_len)
+        values = self._align_length(values, seq_len)
+
+        queries_fft = tf.signal.rfft(
+            tf.transpose(queries, [0, 1, 3, 2]),
+            fft_length=tf.reshape(seq_len, [1]),
+        )
+        keys_fft = tf.signal.rfft(
+            tf.transpose(keys, [0, 1, 3, 2]),
+            fft_length=tf.reshape(seq_len, [1]),
+        )
+        corr = tf.signal.irfft(
+            queries_fft * tf.math.conj(keys_fft),
+            fft_length=tf.reshape(seq_len, [1]),
+        )
+
+        values_time = tf.transpose(values, [0, 1, 3, 2])
+        mean_corr = tf.reduce_mean(corr, axis=[1, 2])
+        top_k = self._top_k(seq_len)
+        weights, delays = tf.math.top_k(mean_corr, k=top_k, sorted=False)
+        weights = tf.nn.softmax(weights, axis=-1)
+        weights = self.dropout(weights, training=training)
+
+        values_twice = tf.concat([values_time, values_time], axis=-1)
+        batch_size = tf.shape(values_time)[0]
+        base_index = tf.range(seq_len, dtype=tf.int32)
+        base_index = tf.reshape(base_index, [1, 1, 1, seq_len, 1])
+        delays = tf.reshape(delays, [batch_size, 1, 1, 1, top_k])
+        gather_index = base_index + delays
+        gather_index = tf.broadcast_to(
+            gather_index,
+            [batch_size, self.n_heads, self.head_dim, seq_len, top_k],
+        )
+        delayed_values = tf.gather(values_twice, gather_index, axis=-1, batch_dims=3)
+        weights = tf.reshape(weights, [batch_size, 1, 1, 1, top_k])
+        aggregated = tf.reduce_sum(delayed_values * weights, axis=-1)
+
+        aggregated = tf.transpose(aggregated, [0, 3, 1, 2])
+        aggregated = tf.reshape(aggregated, [batch_size, seq_len, self.d_model])
+        return self.out_projection(aggregated)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'factor': self.factor,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class AutoformerEncoderLayer(layers.Layer):
+    def __init__(self, d_model=D_MODEL, n_heads=N_HEADS, d_ff=D_FF,
+                 moving_avg=AUTOFORMER_MOVING_AVG, dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.moving_avg = moving_avg
+        self.dropout_rate = dropout
+        self.auto_correlation = SeriesWiseAutoCorrelation(
+            d_model,
+            n_heads,
+            factor=AUTOFORMER_FACTOR,
+            dropout=dropout,
+            name='auto_correlation',
+        )
+        self.dropout = layers.Dropout(dropout)
+        self.decomp1 = SeriesDecomposition(moving_avg, name='decomp1')
+        self.decomp2 = SeriesDecomposition(moving_avg, name='decomp2')
+        self.conv1 = layers.Conv1D(d_ff, 1, activation='gelu', name='ff_conv1')
+        self.conv2 = layers.Conv1D(d_model, 1, name='ff_conv2')
+
+    def call(self, inputs, training=None):
+        attn = self.auto_correlation([inputs, inputs, inputs], training=training)
+        x = inputs + self.dropout(attn, training=training)
+        x, _ = self.decomp1(x)
+        y = self.conv1(x)
+        y = self.dropout(y, training=training)
+        y = self.conv2(y)
+        y = self.dropout(y, training=training)
+        seasonal, _ = self.decomp2(x + y)
+        return seasonal
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'd_ff': self.d_ff,
+            'moving_avg': self.moving_avg,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindAutoformer')
+class AutoformerDecoderLayer(layers.Layer):
+    def __init__(self, d_model=D_MODEL, n_heads=N_HEADS, d_ff=D_FF,
+                 moving_avg=AUTOFORMER_MOVING_AVG, dropout=DROPOUT, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.moving_avg = moving_avg
+        self.dropout_rate = dropout
+        self.self_correlation = SeriesWiseAutoCorrelation(
+            d_model,
+            n_heads,
+            factor=AUTOFORMER_FACTOR,
+            dropout=dropout,
+            name='self_correlation',
+        )
+        self.cross_correlation = SeriesWiseAutoCorrelation(
+            d_model,
+            n_heads,
+            factor=AUTOFORMER_FACTOR,
+            dropout=dropout,
+            name='cross_correlation',
+        )
+        self.dropout = layers.Dropout(dropout)
+        self.decomp1 = SeriesDecomposition(moving_avg, name='decomp1')
+        self.decomp2 = SeriesDecomposition(moving_avg, name='decomp2')
+        self.decomp3 = SeriesDecomposition(moving_avg, name='decomp3')
+        self.conv1 = layers.Conv1D(d_ff, 1, activation='gelu', name='ff_conv1')
+        self.conv2 = layers.Conv1D(d_model, 1, name='ff_conv2')
+        self.trend_projection = layers.Conv1D(
+            d_model,
+            3,
+            padding='same',
+            name='trend_projection',
+        )
+
+    def call(self, inputs, training=None):
+        x, cross = inputs
+        self_attn = self.self_correlation([x, x, x], training=training)
+        x = x + self.dropout(self_attn, training=training)
+        x, trend1 = self.decomp1(x)
+
+        cross_attn = self.cross_correlation([x, cross, cross], training=training)
+        x = x + self.dropout(cross_attn, training=training)
+        x, trend2 = self.decomp2(x)
+
+        y = self.conv1(x)
+        y = self.dropout(y, training=training)
+        y = self.conv2(y)
+        y = self.dropout(y, training=training)
+        x, trend3 = self.decomp3(x + y)
+
+        residual_trend = self.trend_projection(trend1 + trend2 + trend3)
+        return x, residual_trend
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'd_ff': self.d_ff,
+            'moving_avg': self.moving_avg,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
 def transformer_encoder_block(x, d_model=D_MODEL, n_heads=N_HEADS,
                               d_ff=D_FF, dropout=DROPOUT, name='encoder'):
     attn = layers.MultiHeadAttention(
@@ -614,33 +955,69 @@ def build_informer_model(input_shape, input_cols=None):
     return compile_forecast_model(keras.Model(inputs, outputs, name='WindInformer'))
 
 
-def build_autoformer_model(input_shape):
+def build_autoformer_model(input_shape, input_cols=None):
     """
-    Autoformer-inspired Keras implementation:
-    moving-average series decomposition + seasonal attention branch + trend branch.
+    Autoformer-style Keras implementation:
+    DataEmbedding_wo_pos + deep decomposition + series-wise autocorrelation decoder.
     """
+    time_feature_indices = get_time_feature_indices(input_cols or [])
     inputs = keras.Input(shape=input_shape, name='history_features')
-    x = layers.Dense(D_MODEL, name='autoformer_input_projection')(inputs)
-
-    trend = layers.AveragePooling1D(
-        pool_size=25,
-        strides=1,
-        padding='same',
-        name='autoformer_moving_average',
+    x = AutoformerDataEmbedding(
+        D_MODEL,
+        time_feature_indices=time_feature_indices,
+        dropout=DROPOUT,
+        name='autoformer_data_embedding',
+    )(inputs)
+    seasonal_init, trend_init = SeriesDecomposition(
+        AUTOFORMER_MOVING_AVG,
+        name='autoformer_initial_decomp',
     )(x)
-    seasonal = layers.Subtract(name='autoformer_seasonal_part')([x, trend])
 
-    seasonal_x = seasonal
+    enc_out = x
     for idx in range(N_LAYERS):
-        seasonal_x = transformer_encoder_block(
-            seasonal_x,
-            name=f'autoformer_autocorr_like_encoder_{idx + 1}',
-        )
+        enc_out = AutoformerEncoderLayer(
+            D_MODEL,
+            N_HEADS,
+            D_FF,
+            moving_avg=AUTOFORMER_MOVING_AVG,
+            dropout=DROPOUT,
+            name=f'autoformer_encoder_{idx + 1}',
+        )(enc_out)
+    enc_out = AutoformerLayerNorm(name='autoformer_encoder_norm')(enc_out)
 
-    trend_x = layers.Conv1D(D_MODEL, 3, padding='same', activation='gelu',
-                            name='autoformer_trend_conv')(trend)
-    merged = layers.Add(name='autoformer_trend_seasonal_add')([seasonal_x, trend_x])
-    outputs = dense_forecast_head(merged, name='autoformer_forecast')
+    seasonal_dec, trend_dec = AutoformerDecoderInitializer(
+        AUTOFORMER_LABEL_LEN,
+        FORECAST_LEN,
+        name='autoformer_decoder_init',
+    )([seasonal_init, trend_init, x])
+    dec_out = AutoformerDataEmbedding(
+        D_MODEL,
+        time_feature_indices=[],
+        dropout=DROPOUT,
+        name='autoformer_decoder_embedding',
+    )(seasonal_dec)
+
+    for idx in range(N_LAYERS):
+        dec_out, residual_trend = AutoformerDecoderLayer(
+            D_MODEL,
+            N_HEADS,
+            D_FF,
+            moving_avg=AUTOFORMER_MOVING_AVG,
+            dropout=DROPOUT,
+            name=f'autoformer_decoder_{idx + 1}',
+        )([dec_out, enc_out])
+        trend_dec = layers.Add(name=f'autoformer_decoder_trend_add_{idx + 1}')(
+            [trend_dec, residual_trend])
+
+    seasonal_part = AutoformerLayerNorm(name='autoformer_decoder_norm')(dec_out)
+    dec_out = layers.Add(name='autoformer_seasonal_trend_add')(
+        [seasonal_part, trend_dec])
+    forecast_seq = layers.Cropping1D(
+        cropping=(AUTOFORMER_LABEL_LEN, 0),
+        name='autoformer_forecast_slice',
+    )(dec_out)
+    forecast_seq = layers.Dense(1, name='autoformer_power_projection')(forecast_seq)
+    outputs = layers.Flatten(name='autoformer_forecast_power')(forecast_seq)
     return compile_forecast_model(keras.Model(inputs, outputs, name='WindAutoformer'))
 
 
@@ -676,7 +1053,7 @@ def train_one_model_for_farm(model_name, train_file):
     print(f'输入通道数: {len(input_cols)}，样本数: {total_samples}，训练/验证: {train_samples}/{total_samples - train_samples}')
 
     builder = MODEL_BUILDERS[model_name]
-    if model_name == 'informer':
+    if model_name in {'informer', 'autoformer'}:
         model = builder((HISTORY_LEN, len(input_cols)), input_cols=input_cols)
     else:
         model = builder((HISTORY_LEN, len(input_cols)))
@@ -753,6 +1130,9 @@ def train_one_model_for_farm(model_name, train_file):
         'history_len': HISTORY_LEN,
         'forecast_len': FORECAST_LEN,
         'time_freq': TIME_FREQ,
+        'autoformer_label_len': AUTOFORMER_LABEL_LEN if model_name == 'autoformer' else None,
+        'autoformer_moving_avg': AUTOFORMER_MOVING_AVG if model_name == 'autoformer' else None,
+        'autoformer_factor': AUTOFORMER_FACTOR if model_name == 'autoformer' else None,
         'model_path': model_path,
         'best_weights_path': best_weights_path,
         'tensorboard_log_dir': tensorboard_log_dir,
