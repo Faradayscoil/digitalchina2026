@@ -36,6 +36,7 @@ from wind_dl_model_train import (
     PatchExtract,
     RestoreChannels,
     TakeChannel,
+    HorizonGatedForecast,
     build_scaled_arrays,
     compute_patch_num,
     load_and_preprocess,
@@ -67,9 +68,11 @@ WEIGHT_DECAY = float(os.getenv('WIND_TUNED_WEIGHT_DECAY', '1e-4'))
 
 DISTILL_ALPHA = float(os.getenv('WIND_TUNED_DISTILL_ALPHA', '0.35'))
 TEACHER_KEEP_RATIO = float(os.getenv('WIND_TUNED_TEACHER_KEEP_RATIO', '0.70'))
-HORIZON_DECAY = float(os.getenv('WIND_TUNED_HORIZON_DECAY', '0.93'))
+HORIZON_DECAY = float(os.getenv('WIND_TUNED_HORIZON_DECAY', '0.98'))
 PHYSICAL_PENALTY_WEIGHT = float(os.getenv('WIND_TUNED_PHYSICAL_WEIGHT', '0.02'))
 SMOOTHNESS_WEIGHT = float(os.getenv('WIND_TUNED_SMOOTHNESS_WEIGHT', '0.005'))
+LONG_HORIZON_WEIGHT = float(os.getenv('WIND_TUNED_LONG_HORIZON_WEIGHT', '0.25'))
+RAMP_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_RAMP_LOSS_WEIGHT', '0.12'))
 HUBER_DELTA = float(os.getenv('WIND_TUNED_HUBER_DELTA', '1.0'))
 
 INPUT_NOISE_STD = float(os.getenv('WIND_TUNED_INPUT_NOISE_STD', '0.01'))
@@ -145,9 +148,17 @@ def combine_targets(y_true, teacher_pred=None, confidence=None):
         teacher_pred = np.asarray(teacher_pred, dtype=np.float32)
 
     if confidence is None:
-        confidence = np.zeros((len(y_true), 1), dtype=np.float32)
+        confidence = np.zeros_like(y_true, dtype=np.float32)
     else:
-        confidence = np.asarray(confidence, dtype=np.float32).reshape(-1, 1)
+        confidence = np.asarray(confidence, dtype=np.float32)
+        if confidence.ndim == 1:
+            confidence = confidence.reshape(-1, 1)
+        if confidence.shape[1] == 1:
+            confidence = np.repeat(confidence, y_true.shape[1], axis=1)
+        if confidence.shape != y_true.shape:
+            raise ValueError(
+                f'confidence形状应为 {y_true.shape} 或 (n, 1)，当前为 {confidence.shape}'
+            )
 
     return np.concatenate([y_true, teacher_pred, confidence], axis=1).astype(np.float32)
 
@@ -216,21 +227,26 @@ class TunedPatchTSTLoss(keras.losses.Loss):
     def __init__(self, forecast_len=FORECAST_LEN, horizon_weight_values=None,
                  distill_alpha=DISTILL_ALPHA, zero_scaled=0.0, capacity_scaled=None,
                  physical_penalty_weight=PHYSICAL_PENALTY_WEIGHT,
-                 smoothness_weight=SMOOTHNESS_WEIGHT, delta=HUBER_DELTA,
+                 smoothness_weight=SMOOTHNESS_WEIGHT,
+                 long_horizon_weight=LONG_HORIZON_WEIGHT,
+                 ramp_loss_weight=RAMP_LOSS_WEIGHT,
+                 delta=HUBER_DELTA,
                  name='tuned_patchtst_loss'):
         super().__init__(name=name)
         self.forecast_len = forecast_len
         self.horizon_weight_values = (
-            list(horizon_weight_values)
+            [float(value) for value in horizon_weight_values]
             if horizon_weight_values is not None
-            else list(horizon_weights(forecast_len))
+            else [float(value) for value in horizon_weights(forecast_len)]
         )
         self.distill_alpha = distill_alpha
         self.zero_scaled = float(zero_scaled)
         self.capacity_scaled = None if capacity_scaled is None else float(capacity_scaled)
-        self.physical_penalty_weight = physical_penalty_weight
-        self.smoothness_weight = smoothness_weight
-        self.delta = delta
+        self.physical_penalty_weight = float(physical_penalty_weight)
+        self.smoothness_weight = float(smoothness_weight)
+        self.long_horizon_weight = float(long_horizon_weight)
+        self.ramp_loss_weight = float(ramp_loss_weight)
+        self.delta = float(delta)
 
     def _huber(self, error):
         abs_error = tf.abs(error)
@@ -241,14 +257,25 @@ class TunedPatchTSTLoss(keras.losses.Loss):
     def call(self, y_true, y_pred):
         actual = y_true[:, :self.forecast_len]
         teacher = y_true[:, self.forecast_len:2 * self.forecast_len]
-        confidence = y_true[:, 2 * self.forecast_len:2 * self.forecast_len + 1]
+        confidence = y_true[:, 2 * self.forecast_len:3 * self.forecast_len]
         weights = tf.constant(self.horizon_weight_values, dtype=y_pred.dtype)
         weights = tf.reshape(weights, [1, self.forecast_len])
 
         supervised = tf.reduce_mean(weights * self._huber(actual - y_pred), axis=1)
-        distill = tf.reduce_mean(weights * self._huber(teacher - y_pred), axis=1)
-        loss = supervised + self.distill_alpha * tf.squeeze(confidence, axis=-1) * distill
+        distill = tf.reduce_mean(weights * confidence * self._huber(teacher - y_pred), axis=1)
+        loss = supervised + self.distill_alpha * distill
         loss = tf.reduce_mean(loss)
+
+        long_loss = 0.0
+        if self.forecast_len > 2:
+            split = self.forecast_len // 2
+            long_loss = tf.reduce_mean(self._huber(actual[:, split:] - y_pred[:, split:]))
+
+        ramp_loss = 0.0
+        if self.forecast_len > 1:
+            true_ramp = actual[:, 1:] - actual[:, :-1]
+            pred_ramp = y_pred[:, 1:] - y_pred[:, :-1]
+            ramp_loss = tf.reduce_mean(self._huber(true_ramp - pred_ramp))
 
         lower_penalty = tf.reduce_mean(tf.square(tf.nn.relu(self.zero_scaled - y_pred)))
         physical_penalty = lower_penalty
@@ -263,6 +290,8 @@ class TunedPatchTSTLoss(keras.losses.Loss):
 
         return (
             loss
+            + self.long_horizon_weight * long_loss
+            + self.ramp_loss_weight * ramp_loss
             + self.physical_penalty_weight * physical_penalty
             + self.smoothness_weight * smoothness_penalty
         )
@@ -277,6 +306,8 @@ class TunedPatchTSTLoss(keras.losses.Loss):
             'capacity_scaled': self.capacity_scaled,
             'physical_penalty_weight': self.physical_penalty_weight,
             'smoothness_weight': self.smoothness_weight,
+            'long_horizon_weight': self.long_horizon_weight,
+            'ramp_loss_weight': self.ramp_loss_weight,
             'delta': self.delta,
         })
         return config
@@ -344,8 +375,36 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
     patch_num = compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)
     inputs = keras.Input(shape=(HISTORY_LEN, input_dim), name='history_features')
 
-    x_input = layers.GaussianNoise(INPUT_NOISE_STD, name='input_noise')(inputs)
+    cnn_stem = layers.Conv1D(
+        input_dim,
+        kernel_size=3,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-5),
+        name='local_cnn_stem',
+    )(inputs)
+    cnn_stem = layers.Dropout(CHANNEL_DROPOUT, name='local_cnn_stem_dropout')(cnn_stem)
+    x_input = layers.Add(name='history_plus_local_stem')([inputs, cnn_stem])
+    x_input = layers.GaussianNoise(INPUT_NOISE_STD, name='input_noise')(x_input)
     x_input = layers.SpatialDropout1D(CHANNEL_DROPOUT, name='channel_dropout')(x_input)
+
+    local_context = layers.Conv1D(
+        D_MODEL,
+        kernel_size=3,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-5),
+        name='local_context_conv3',
+    )(x_input)
+    local_context = layers.Conv1D(
+        D_MODEL,
+        kernel_size=5,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-5),
+        name='local_context_conv5',
+    )(local_context)
+    local_context = layers.GlobalAveragePooling1D(name='local_context_pool')(local_context)
 
     x = PatchExtract(PATCH_LEN, PATCH_STRIDE, name='patch_extract')(x_input)
     x = layers.Dense(D_MODEL, name='patch_projection')(x)
@@ -361,7 +420,9 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
     target_repr = layers.Flatten(name='target_flatten')(target_repr)
     global_context = layers.GlobalAveragePooling2D(name='channel_context_pool')(x)
 
-    head = layers.Concatenate(name='forecast_context')([target_repr, global_context])
+    head = layers.Concatenate(name='forecast_context')(
+        [target_repr, global_context, local_context]
+    )
     head = layers.Dropout(HEAD_DROPOUT, name='head_dropout')(head)
     head = layers.Dense(
         D_FF,
@@ -370,6 +431,11 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
         name='forecast_ff',
     )(head)
     head = layers.Dropout(HEAD_DROPOUT, name='forecast_dropout')(head)
+    direct_forecast = layers.Dense(
+        FORECAST_LEN,
+        dtype='float32',
+        name='direct_forecast',
+    )(head)
     residual = layers.Dense(
         FORECAST_LEN,
         kernel_initializer='zeros',
@@ -382,7 +448,9 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
         FORECAST_LEN,
         name='persistence_baseline',
     )(inputs)
-    outputs = layers.Add(name='forecast_power')([baseline, residual])
+    outputs = HorizonGatedForecast(FORECAST_LEN, name='forecast_power')(
+        [baseline, direct_forecast, residual]
+    )
     outputs = layers.Activation('linear', dtype='float32', name='forecast_power_float32')(outputs)
     return keras.Model(inputs=inputs, outputs=outputs, name='WindTunedPatchTST')
 
@@ -416,32 +484,45 @@ def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
 
 
 def teacher_confidence(y_true, teacher_pred, keep_ratio=TEACHER_KEEP_RATIO):
-    sample_mae = np.mean(np.abs(y_true - teacher_pred), axis=1)
-    threshold = float(np.quantile(sample_mae, keep_ratio))
-    confidence = (sample_mae <= threshold).astype(np.float32)
-    return confidence, sample_mae, threshold
+    abs_error = np.abs(y_true - teacher_pred)
+    sample_mae = np.mean(abs_error, axis=1)
+    thresholds = np.quantile(abs_error, keep_ratio, axis=0).astype(np.float32)
+    confidence = (abs_error <= thresholds.reshape(1, -1)).astype(np.float32)
+    return confidence, sample_mae, thresholds
 
 
 def save_distillation_stats(farm_id, train_mae, train_conf, train_threshold,
                             val_mae, val_conf, val_threshold):
+    def _threshold_summary(threshold):
+        values = np.asarray(threshold, dtype=float).reshape(-1)
+        return {
+            'acceptance_threshold_mean_scaled': float(np.mean(values)),
+            'acceptance_threshold_min_scaled': float(np.min(values)),
+            'acceptance_threshold_max_scaled': float(np.max(values)),
+        }
+
     rows = []
     for split, mae_values, conf, threshold in [
         ('train', train_mae, train_conf, train_threshold),
         ('validation', val_mae, val_conf, val_threshold),
     ]:
-        rows.append({
+        conf = np.asarray(conf)
+        row = {
             'farm_id': farm_id,
             'split': split,
             'samples': int(len(mae_values)),
             'teacher_keep_ratio': TEACHER_KEEP_RATIO,
-            'accepted_samples': int(np.sum(conf > 0)),
-            'accepted_ratio': float(np.mean(conf > 0)),
+            'accepted_points': int(np.sum(conf > 0)),
+            'accepted_point_ratio': float(np.mean(conf > 0)),
+            'accepted_full_windows': int(np.sum(np.all(conf > 0, axis=1))),
+            'accepted_full_window_ratio': float(np.mean(np.all(conf > 0, axis=1))),
             'teacher_mae_mean_scaled': float(np.mean(mae_values)),
             'teacher_mae_median_scaled': float(np.median(mae_values)),
             'teacher_mae_p70_scaled': float(np.quantile(mae_values, 0.70)),
             'teacher_mae_p90_scaled': float(np.quantile(mae_values, 0.90)),
-            'acceptance_threshold_scaled': threshold,
-        })
+        }
+        row.update(_threshold_summary(threshold))
+        rows.append(row)
     stats_df = pd.DataFrame(rows)
     stats_path = os.path.join(DISTILL_DIR, f'tuned_patchtst_distillation_stats_farm_{farm_id}.csv')
     stats_df.to_csv(stats_path, index=False, encoding='utf-8-sig')
@@ -532,6 +613,8 @@ def save_config():
         'horizon_decay': HORIZON_DECAY,
         'physical_penalty_weight': PHYSICAL_PENALTY_WEIGHT,
         'smoothness_weight': SMOOTHNESS_WEIGHT,
+        'long_horizon_weight': LONG_HORIZON_WEIGHT,
+        'ramp_loss_weight': RAMP_LOSS_WEIGHT,
         'input_noise_std': INPUT_NOISE_STD,
         'channel_dropout': CHANNEL_DROPOUT,
         'use_mixed_precision': USE_MIXED_PRECISION,
@@ -683,8 +766,8 @@ def train_one_farm(train_file):
         val_threshold,
     )
     print(
-        f'teacher筛选: train accepted={np.mean(train_conf > 0):.3f}, '
-        f'val accepted={np.mean(val_conf > 0):.3f}'
+        f'teacher逐horizon筛选: train point accepted={np.mean(train_conf > 0):.3f}, '
+        f'val point accepted={np.mean(val_conf > 0):.3f}'
     )
 
     y_train_stage2 = combine_targets(y_train, teacher_train_pred, train_conf)
@@ -786,6 +869,10 @@ def train_one_farm(train_file):
         'distill_alpha': DISTILL_ALPHA,
         'teacher_keep_ratio': TEACHER_KEEP_RATIO,
         'horizon_decay': HORIZON_DECAY,
+        'long_horizon_weight': LONG_HORIZON_WEIGHT,
+        'ramp_loss_weight': RAMP_LOSS_WEIGHT,
+        'physical_penalty_weight': PHYSICAL_PENALTY_WEIGHT,
+        'smoothness_weight': SMOOTHNESS_WEIGHT,
         **eval_metrics,
     }
     artifact_path = os.path.join(

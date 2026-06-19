@@ -23,6 +23,9 @@ from wind_dl_model_train import (
     PatchExtract,
     RestoreChannels,
     TakeChannel,
+    RepeatLastTarget as PatchTSTRepeatLastTarget,
+    HorizonGatedForecast,
+    WindForecastLoss,
     build_patchtst_model,
     load_and_preprocess,
 )
@@ -50,7 +53,7 @@ from wind_dl_tuned_patchtst_train import (
     TUNED_MODEL_NAME,
     SAVED_MODEL_DIR as TUNED_SAVED_MODEL_DIR,
     WEIGHTS_DIR as TUNED_WEIGHTS_DIR,
-    RepeatLastTarget,
+    RepeatLastTarget as TunedRepeatLastTarget,
     TunedPatchTSTLoss,
     actual_mae,
     actual_rmse,
@@ -124,8 +127,15 @@ def get_custom_objects():
         'WindPatchTST>LearnablePositionEmbedding': LearnablePositionEmbedding,
         'TakeChannel': TakeChannel,
         'WindPatchTST>TakeChannel': TakeChannel,
-        'RepeatLastTarget': RepeatLastTarget,
-        'WindTunedPatchTST>RepeatLastTarget': RepeatLastTarget,
+        'RepeatLastTarget': TunedRepeatLastTarget,
+        'PatchTSTRepeatLastTarget': PatchTSTRepeatLastTarget,
+        'WindPatchTST>RepeatLastTarget': PatchTSTRepeatLastTarget,
+        'TunedRepeatLastTarget': TunedRepeatLastTarget,
+        'WindTunedPatchTST>RepeatLastTarget': TunedRepeatLastTarget,
+        'HorizonGatedForecast': HorizonGatedForecast,
+        'WindPatchTST>HorizonGatedForecast': HorizonGatedForecast,
+        'WindForecastLoss': WindForecastLoss,
+        'WindPatchTST>WindForecastLoss': WindForecastLoss,
         'TunedPatchTSTLoss': TunedPatchTSTLoss,
         'WindTunedPatchTST>TunedPatchTSTLoss': TunedPatchTSTLoss,
         'actual_mae': actual_mae,
@@ -183,7 +193,12 @@ def load_artifact(model_name, farm_id):
 
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
-        return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+        return build_patchtst_model(
+            len(artifact['input_cols']),
+            artifact['target_index'],
+            artifact.get('scaler_y'),
+            artifact.get('capacity'),
+        )
     if model_name == TUNED_MODEL_NAME:
         return build_tuned_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
 
