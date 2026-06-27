@@ -44,12 +44,6 @@ D_FF = 128
 DROPOUT = 0.15
 HEAD_DROPOUT = 0.2
 USE_POWER_HISTORY = True
-CNN_STEM_DROPOUT = float(os.getenv('WIND_PATCHTST_CNN_STEM_DROPOUT', '0.05'))
-HORIZON_DECAY = float(os.getenv('WIND_PATCHTST_HORIZON_DECAY', '0.98'))
-LONG_HORIZON_WEIGHT = float(os.getenv('WIND_PATCHTST_LONG_HORIZON_WEIGHT', '0.30'))
-RAMP_LOSS_WEIGHT = float(os.getenv('WIND_PATCHTST_RAMP_LOSS_WEIGHT', '0.10'))
-PHYSICAL_PENALTY_WEIGHT = float(os.getenv('WIND_PATCHTST_PHYSICAL_WEIGHT', '0.01'))
-HUBER_DELTA = float(os.getenv('WIND_PATCHTST_HUBER_DELTA', '1.0'))
 
 WIND_SPEED_COLS = ['10米风速', '30米风速', '50米风速', '70米风速', '轮毂高度风速']
 WIND_DIR_COLS = ['10米风向', '30米风向', '50米风向', '70米风向', '轮毂高度风向']
@@ -365,158 +359,6 @@ class TakeChannel(layers.Layer):
         return config
 
 
-@keras.utils.register_keras_serializable(package='WindPatchTST')
-class RepeatLastTarget(layers.Layer):
-    def __init__(self, target_channel_index, forecast_len=FORECAST_LEN, **kwargs):
-        super().__init__(**kwargs)
-        self.target_channel_index = target_channel_index
-        self.forecast_len = forecast_len
-
-    def call(self, inputs):
-        last_value = inputs[:, -1, self.target_channel_index:self.target_channel_index + 1]
-        return tf.repeat(last_value, repeats=self.forecast_len, axis=1)
-
-    def compute_output_shape(self, input_shape):
-        return input_shape[0], self.forecast_len
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'target_channel_index': self.target_channel_index,
-            'forecast_len': self.forecast_len,
-        })
-        return config
-
-
-@keras.utils.register_keras_serializable(package='WindPatchTST')
-class HorizonGatedForecast(layers.Layer):
-    def __init__(self, forecast_len=FORECAST_LEN, init_near=2.0, init_far=-2.0, **kwargs):
-        super().__init__(**kwargs)
-        self.forecast_len = forecast_len
-        self.init_near = init_near
-        self.init_far = init_far
-
-    def build(self, input_shape):
-        init_values = np.linspace(
-            self.init_near,
-            self.init_far,
-            self.forecast_len,
-            dtype=np.float32,
-        )
-        self.gate_logits = self.add_weight(
-            name='horizon_gate_logits',
-            shape=(self.forecast_len,),
-            initializer=keras.initializers.Constant(init_values),
-            trainable=True,
-        )
-
-    def call(self, inputs):
-        baseline, direct_forecast, residual = inputs
-        gate = tf.sigmoid(tf.cast(self.gate_logits, baseline.dtype))[tf.newaxis, :]
-        return gate * baseline + (1.0 - gate) * direct_forecast + residual
-
-    def compute_output_shape(self, input_shape):
-        return input_shape[0][0], self.forecast_len
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'forecast_len': self.forecast_len,
-            'init_near': self.init_near,
-            'init_far': self.init_far,
-        })
-        return config
-
-
-@keras.utils.register_keras_serializable(package='WindPatchTST')
-class WindForecastLoss(keras.losses.Loss):
-    def __init__(self, forecast_len=FORECAST_LEN, horizon_weight_values=None,
-                 long_horizon_weight=LONG_HORIZON_WEIGHT,
-                 ramp_loss_weight=RAMP_LOSS_WEIGHT,
-                 physical_penalty_weight=PHYSICAL_PENALTY_WEIGHT,
-                 zero_scaled=0.0, capacity_scaled=None, delta=HUBER_DELTA,
-                 name='wind_forecast_loss'):
-        super().__init__(name=name)
-        self.forecast_len = forecast_len
-        self.horizon_weight_values = (
-            [float(value) for value in horizon_weight_values]
-            if horizon_weight_values is not None
-            else [float(value) for value in horizon_weights(forecast_len)]
-        )
-        self.long_horizon_weight = float(long_horizon_weight)
-        self.ramp_loss_weight = float(ramp_loss_weight)
-        self.physical_penalty_weight = float(physical_penalty_weight)
-        self.zero_scaled = float(zero_scaled)
-        self.capacity_scaled = None if capacity_scaled is None else float(capacity_scaled)
-        self.delta = float(delta)
-
-    def _huber(self, error):
-        abs_error = tf.abs(error)
-        quadratic = tf.minimum(abs_error, self.delta)
-        linear = abs_error - quadratic
-        return 0.5 * tf.square(quadratic) + self.delta * linear
-
-    def call(self, y_true, y_pred):
-        weights = tf.constant(self.horizon_weight_values, dtype=y_pred.dtype)
-        weights = tf.reshape(weights, [1, self.forecast_len])
-        point_loss = tf.reduce_mean(weights * self._huber(y_true - y_pred))
-
-        long_loss = 0.0
-        if self.forecast_len > 2:
-            split = self.forecast_len // 2
-            long_loss = tf.reduce_mean(self._huber(y_true[:, split:] - y_pred[:, split:]))
-
-        ramp_loss = 0.0
-        if self.forecast_len > 1:
-            true_ramp = y_true[:, 1:] - y_true[:, :-1]
-            pred_ramp = y_pred[:, 1:] - y_pred[:, :-1]
-            ramp_loss = tf.reduce_mean(self._huber(true_ramp - pred_ramp))
-
-        lower_penalty = tf.reduce_mean(tf.square(tf.nn.relu(self.zero_scaled - y_pred)))
-        physical_penalty = lower_penalty
-        if self.capacity_scaled is not None:
-            upper_penalty = tf.reduce_mean(tf.square(tf.nn.relu(y_pred - self.capacity_scaled)))
-            physical_penalty = physical_penalty + upper_penalty
-
-        return (
-            point_loss
-            + self.long_horizon_weight * long_loss
-            + self.ramp_loss_weight * ramp_loss
-            + self.physical_penalty_weight * physical_penalty
-        )
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'forecast_len': self.forecast_len,
-            'horizon_weight_values': self.horizon_weight_values,
-            'long_horizon_weight': self.long_horizon_weight,
-            'ramp_loss_weight': self.ramp_loss_weight,
-            'physical_penalty_weight': self.physical_penalty_weight,
-            'zero_scaled': self.zero_scaled,
-            'capacity_scaled': self.capacity_scaled,
-            'delta': self.delta,
-        })
-        return config
-
-
-def horizon_weights(forecast_len=FORECAST_LEN, decay=HORIZON_DECAY):
-    weights = decay ** np.arange(forecast_len, dtype=np.float32)
-    weights = weights / np.mean(weights)
-    return weights.astype(np.float32)
-
-
-def scaled_bounds(scaler_y=None, capacity=None):
-    if scaler_y is None:
-        return 0.0, None
-
-    zero_scaled = float(scaler_y.transform([[0.0]])[0, 0])
-    capacity_scaled = None
-    if capacity is not None and capacity > 0:
-        capacity_scaled = float(scaler_y.transform([[capacity]])[0, 0])
-    return zero_scaled, capacity_scaled
-
-
 def transformer_encoder(x, d_model, n_heads, d_ff, dropout, name):
     attn = layers.MultiHeadAttention(
         num_heads=n_heads,
@@ -534,43 +376,14 @@ def transformer_encoder(x, d_model, n_heads, d_ff, dropout, name):
     return layers.LayerNormalization(epsilon=1e-6, name=f'{name}_ff_norm')(x)
 
 
-def build_patchtst_model(input_dim, target_channel_index, scaler_y=None, capacity=None):
+def build_patchtst_model(input_dim, target_channel_index):
     if target_channel_index is None:
         raise ValueError("PatchTST短期风电模型需要将历史功率作为输入通道")
 
     patch_num = compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)
     inputs = keras.Input(shape=(HISTORY_LEN, input_dim), name='history_features')
 
-    cnn_stem = layers.Conv1D(
-        input_dim,
-        kernel_size=3,
-        padding='same',
-        activation='gelu',
-        kernel_regularizer=regularizers.l2(1e-5),
-        name='local_cnn_stem',
-    )(inputs)
-    cnn_stem = layers.Dropout(CNN_STEM_DROPOUT, name='local_cnn_stem_dropout')(cnn_stem)
-    x_input = layers.Add(name='history_plus_local_stem')([inputs, cnn_stem])
-
-    local_context = layers.Conv1D(
-        D_MODEL,
-        kernel_size=3,
-        padding='same',
-        activation='gelu',
-        kernel_regularizer=regularizers.l2(1e-5),
-        name='local_context_conv3',
-    )(x_input)
-    local_context = layers.Conv1D(
-        D_MODEL,
-        kernel_size=5,
-        padding='same',
-        activation='gelu',
-        kernel_regularizer=regularizers.l2(1e-5),
-        name='local_context_conv5',
-    )(local_context)
-    local_context = layers.GlobalAveragePooling1D(name='local_context_pool')(local_context)
-
-    x = PatchExtract(PATCH_LEN, PATCH_STRIDE, name='patch_extract')(x_input)
+    x = PatchExtract(PATCH_LEN, PATCH_STRIDE, name='patch_extract')(inputs)
     x = layers.Dense(D_MODEL, name='patch_projection')(x)
     x = MergeChannels(name='merge_channels')(x)
     x = LearnablePositionEmbedding(patch_num, D_MODEL, name='position_embedding')(x)
@@ -584,9 +397,7 @@ def build_patchtst_model(input_dim, target_channel_index, scaler_y=None, capacit
     target_repr = layers.Flatten(name='target_flatten')(target_repr)
     global_context = layers.GlobalAveragePooling2D(name='channel_context_pool')(x)
 
-    head = layers.Concatenate(name='forecast_context')(
-        [target_repr, global_context, local_context]
-    )
+    head = layers.Concatenate(name='forecast_context')([target_repr, global_context])
     head = layers.Dropout(HEAD_DROPOUT, name='head_dropout')(head)
     head = layers.Dense(
         D_FF,
@@ -595,32 +406,12 @@ def build_patchtst_model(input_dim, target_channel_index, scaler_y=None, capacit
         name='forecast_ff',
     )(head)
     head = layers.Dropout(HEAD_DROPOUT, name='forecast_dropout')(head)
-    direct_forecast = layers.Dense(FORECAST_LEN, name='direct_forecast')(head)
-    residual = layers.Dense(
-        FORECAST_LEN,
-        kernel_initializer='zeros',
-        bias_initializer='zeros',
-        name='forecast_residual',
-    )(head)
-    baseline = RepeatLastTarget(
-        target_channel_index,
-        FORECAST_LEN,
-        name='persistence_baseline',
-    )(inputs)
-    outputs = HorizonGatedForecast(FORECAST_LEN, name='forecast_power')(
-        [baseline, direct_forecast, residual]
-    )
+    outputs = layers.Dense(FORECAST_LEN, name='forecast_power')(head)
 
     model = keras.Model(inputs=inputs, outputs=outputs, name='WindPatchTST')
-    zero_scaled, capacity_scaled = scaled_bounds(scaler_y, capacity)
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
-        loss=WindForecastLoss(
-            forecast_len=FORECAST_LEN,
-            horizon_weight_values=horizon_weights(),
-            zero_scaled=zero_scaled,
-            capacity_scaled=capacity_scaled,
-        ),
+        loss=keras.losses.Huber(delta=1.0),
         metrics=[
             keras.metrics.MeanAbsoluteError(name='mae'),
             keras.metrics.RootMeanSquaredError(name='rmse'),
@@ -731,7 +522,7 @@ def train_one_farm(train_file):
     print(f'输入通道数: {len(input_cols)}，样本数: {total_samples}，训练/验证: {train_samples}/{total_samples - train_samples}')
     print(f'Patch设置: patch_len={PATCH_LEN}, stride={PATCH_STRIDE}, patch_num={compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)}')
 
-    model = build_patchtst_model(len(input_cols), target_index, scaler_y, capacity)
+    model = build_patchtst_model(len(input_cols), target_index)
     model.summary()
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -809,11 +600,6 @@ def train_one_farm(train_file):
         'time_freq': TIME_FREQ,
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
-        'horizon_decay': HORIZON_DECAY,
-        'long_horizon_weight': LONG_HORIZON_WEIGHT,
-        'ramp_loss_weight': RAMP_LOSS_WEIGHT,
-        'physical_penalty_weight': PHYSICAL_PENALTY_WEIGHT,
-        'cnn_stem_dropout': CNN_STEM_DROPOUT,
         'model_path': model_path,
         'best_weights_path': best_weights_path,
         'tensorboard_log_dir': tensorboard_log_dir,

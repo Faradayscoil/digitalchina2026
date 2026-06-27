@@ -23,9 +23,6 @@ from wind_dl_model_train import (
     PatchExtract,
     RestoreChannels,
     TakeChannel,
-    RepeatLastTarget as PatchTSTRepeatLastTarget,
-    HorizonGatedForecast,
-    WindForecastLoss,
     build_patchtst_model,
     load_and_preprocess,
 )
