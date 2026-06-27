@@ -63,7 +63,7 @@ warnings.filterwarnings('ignore')
 TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
-ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME] + OTHER_MODEL_NAMES
+ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME, TUNED_MODEL_NAME] + OTHER_MODEL_NAMES
 OUTPUT_SUBDIR = 'testdata_predict_output'
 PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
 EXP_WEIGHT_HALFLIFE_STEPS = 4.0
@@ -203,6 +203,15 @@ def load_trained_model(model_name, farm_id, artifact):
         best_weights_path = artifact.get('best_weights_path') or os.path.join(
             PATCHTST_MODEL_DIR,
             f'patchtst_farm_{farm_id}_best.weights.h5',
+        )
+    elif model_name == TUNED_MODEL_NAME:
+        model_path = artifact.get('model_path') or os.path.join(
+            TUNED_SAVED_MODEL_DIR,
+            f'tuned_patchtst_farm_{farm_id}.keras',
+        )
+        best_weights_path = artifact.get('best_weights_path') or os.path.join(
+            TUNED_WEIGHTS_DIR,
+            f'tuned_patchtst_farm_{farm_id}_best.weights.h5',
         )
     else:
         model_path = artifact.get('model_path') or os.path.join(
@@ -702,21 +711,31 @@ def main():
 
     if all_summary:
         global_summary = pd.concat(all_summary, ignore_index=True)
+        summary_filename = (
+            'wind_dl_all_models_test_metrics_summary.csv'
+            if requested_model_names == ALL_MODEL_NAMES
+            else 'wind_dl_selected_models_test_metrics_summary.csv'
+        )
         global_summary_path = os.path.join(
             BASE_RESULT_DIR,
-            'wind_dl_all_models_test_metrics_summary.csv',
+            summary_filename,
         )
         global_summary.to_csv(global_summary_path, index=False, encoding='utf-8-sig')
-        print(f'全部模型汇总指标已保存: {global_summary_path}')
+        print(f'模型汇总指标已保存: {global_summary_path}')
 
     if all_horizon:
         global_horizon = pd.concat(all_horizon, ignore_index=True)
+        horizon_filename = (
+            'wind_dl_all_models_test_metrics_by_horizon_all.csv'
+            if requested_model_names == ALL_MODEL_NAMES
+            else 'wind_dl_selected_models_test_metrics_by_horizon_all.csv'
+        )
         global_horizon_path = os.path.join(
             BASE_RESULT_DIR,
-            'wind_dl_all_models_test_metrics_by_horizon_all.csv',
+            horizon_filename,
         )
         global_horizon.to_csv(global_horizon_path, index=False, encoding='utf-8-sig')
-        print(f'全部模型分horizon指标已保存: {global_horizon_path}')
+        print(f'模型分horizon指标已保存: {global_horizon_path}')
 
     print('全部深度学习模型测试集预测完成')
 
