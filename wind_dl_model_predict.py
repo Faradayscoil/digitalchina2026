@@ -50,8 +50,13 @@ from wind_dl_tuned_patchtst_train import (
     TUNED_MODEL_NAME,
     SAVED_MODEL_DIR as TUNED_SAVED_MODEL_DIR,
     WEIGHTS_DIR as TUNED_WEIGHTS_DIR,
+    BalancedTunedPatchTSTLoss,
+    PowerRevIN,
+    PowerRevINDenormalize,
     RepeatLastTarget,
+    SelectInputChannels,
     TunedPatchTSTLoss,
+    ZeroInitResidualAdapter,
     actual_mae,
     actual_rmse,
     build_tuned_patchtst_model,
@@ -128,6 +133,16 @@ def get_custom_objects():
         'WindTunedPatchTST>RepeatLastTarget': RepeatLastTarget,
         'TunedPatchTSTLoss': TunedPatchTSTLoss,
         'WindTunedPatchTST>TunedPatchTSTLoss': TunedPatchTSTLoss,
+        'BalancedTunedPatchTSTLoss': BalancedTunedPatchTSTLoss,
+        'WindTunedPatchTST>BalancedTunedPatchTSTLoss': BalancedTunedPatchTSTLoss,
+        'PowerRevIN': PowerRevIN,
+        'WindTunedPatchTST>PowerRevIN': PowerRevIN,
+        'PowerRevINDenormalize': PowerRevINDenormalize,
+        'WindTunedPatchTST>PowerRevINDenormalize': PowerRevINDenormalize,
+        'SelectInputChannels': SelectInputChannels,
+        'WindTunedPatchTST>SelectInputChannels': SelectInputChannels,
+        'ZeroInitResidualAdapter': ZeroInitResidualAdapter,
+        'WindTunedPatchTST>ZeroInitResidualAdapter': ZeroInitResidualAdapter,
         'actual_mae': actual_mae,
         'WindTunedPatchTST>actual_mae': actual_mae,
         'actual_rmse': actual_rmse,
@@ -185,7 +200,13 @@ def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
     if model_name == TUNED_MODEL_NAME:
-        return build_tuned_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+        return build_tuned_patchtst_model(
+            len(artifact['input_cols']),
+            artifact['target_index'],
+            use_revin=artifact.get('use_revin', False),
+            use_cnn_adapter=artifact.get('use_cnn_adapter', False),
+            adapter_channel_indices=artifact.get('adapter_channel_indices'),
+        )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
     builder = MODEL_BUILDERS[model_name]

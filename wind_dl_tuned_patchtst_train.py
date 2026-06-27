@@ -31,6 +31,7 @@ from wind_dl_model_train import (
     TIME_FREQ,
     TRAIN_FILE_PATTERN,
     USE_POWER_HISTORY,
+    WIND_SPEED_COLS,
     LearnablePositionEmbedding,
     MergeChannels,
     PatchExtract,
@@ -55,6 +56,7 @@ HISTORY_DIR = os.path.join(MODEL_DIR, 'history')
 TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
 TAIL_DIR = os.path.join(MODEL_DIR, 'tails')
 DISTILL_DIR = os.path.join(MODEL_DIR, 'distillation')
+ABLATION_DIR = os.path.join(MODEL_DIR, 'ablation')
 
 seed = 2026
 BATCH_SIZE = int(os.getenv('WIND_TUNED_BATCH_SIZE', '192'))
@@ -75,6 +77,64 @@ HUBER_DELTA = float(os.getenv('WIND_TUNED_HUBER_DELTA', '1.0'))
 INPUT_NOISE_STD = float(os.getenv('WIND_TUNED_INPUT_NOISE_STD', '0.01'))
 CHANNEL_DROPOUT = float(os.getenv('WIND_TUNED_CHANNEL_DROPOUT', '0.05'))
 USE_MIXED_PRECISION = os.getenv('WIND_TUNED_MIXED_PRECISION', '1') == '1'
+RUN_ABLATION = os.getenv('WIND_TUNED_RUN_ABLATION', '1') == '1'
+EXP_WEIGHT_HALFLIFE_STEPS = float(
+    os.getenv('WIND_TUNED_EXP_WEIGHT_HALFLIFE_STEPS', '4.0')
+)
+
+REVIN_EPSILON = float(os.getenv('WIND_TUNED_REVIN_EPSILON', '1e-5'))
+CNN_ADAPTER_FILTERS = int(os.getenv('WIND_TUNED_ADAPTER_FILTERS', '32'))
+NEW_RAMP_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RAMP_WEIGHT', '0.03'))
+NEW_RELATIVE_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RELATIVE_WEIGHT', '0.03'))
+NEW_PHYSICAL_PENALTY_WEIGHT = float(os.getenv('WIND_TUNED_NEW_PHYSICAL_WEIGHT', '0.01'))
+RELATIVE_POWER_FLOOR = float(os.getenv('WIND_TUNED_RELATIVE_FLOOR', '0.05'))
+SWA_START_FRACTION = float(os.getenv('WIND_TUNED_SWA_START_FRACTION', '0.50'))
+MAX_ALLOWED_NRMSE_DEGRADATION = float(
+    os.getenv('WIND_TUNED_MAX_NRMSE_DEGRADATION', '0.02')
+)
+
+ABLATION_VARIANTS = [
+    {
+        'name': 'baseline',
+        'added_module': 'original_tuned_patchtst',
+        'use_revin': False,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': False,
+        'use_swa': False,
+    },
+    {
+        'name': 'revin',
+        'added_module': 'power_revin',
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': False,
+        'use_swa': False,
+    },
+    {
+        'name': 'revin_cnn_adapter',
+        'added_module': 'zero_init_cnn_adapter',
+        'use_revin': True,
+        'use_cnn_adapter': True,
+        'use_balanced_loss': False,
+        'use_swa': False,
+    },
+    {
+        'name': 'revin_cnn_adapter_balanced_loss',
+        'added_module': 'balanced_loss',
+        'use_revin': True,
+        'use_cnn_adapter': True,
+        'use_balanced_loss': True,
+        'use_swa': False,
+    },
+    {
+        'name': 'revin_cnn_adapter_balanced_loss_swa',
+        'added_module': 'swa',
+        'use_revin': True,
+        'use_cnn_adapter': True,
+        'use_balanced_loss': True,
+        'use_swa': True,
+    },
+]
 
 
 def configure_runtime():
@@ -107,6 +167,7 @@ def ensure_dirs():
         TENSORBOARD_LOG_DIR,
         TAIL_DIR,
         DISTILL_DIR,
+        ABLATION_DIR,
     ]:
         os.makedirs(path, exist_ok=True)
 
@@ -121,6 +182,45 @@ def get_farm_id(path):
     if match:
         return match.group(1)
     return os.path.splitext(basename)[0]
+
+
+def get_ablation_variants():
+    requested = os.getenv('WIND_TUNED_ABLATION_VARIANTS', '').strip()
+    if not requested:
+        return ABLATION_VARIANTS
+
+    names = [name.strip() for name in requested.split(',') if name.strip()]
+    variants = [variant for variant in ABLATION_VARIANTS if variant['name'] in names]
+    missing = sorted(set(names) - {variant['name'] for variant in variants})
+    if missing:
+        valid = [variant['name'] for variant in ABLATION_VARIANTS]
+        raise ValueError(f'未知消融variant: {missing}; 可选: {valid}')
+    return variants
+
+
+def get_adapter_channel_indices(input_cols):
+    adapter_cols = [TARGET_COL] + [
+        col for col in WIND_SPEED_COLS
+        if col in input_cols
+    ]
+    return [input_cols.index(col) for col in adapter_cols if col in input_cols]
+
+
+def make_variant_dirs(variant_name):
+    root = os.path.join(ABLATION_DIR, variant_name)
+    dirs = {
+        'root': root,
+        'models': os.path.join(root, 'models'),
+        'weights': os.path.join(root, 'weights'),
+        'teachers': os.path.join(root, 'teacher'),
+        'preprocess': os.path.join(root, 'preprocess'),
+        'history': os.path.join(root, 'history'),
+        'tensorboard': os.path.join(root, 'tensorboard'),
+        'distillation': os.path.join(root, 'distillation'),
+    }
+    for path in dirs.values():
+        os.makedirs(path, exist_ok=True)
+    return dirs
 
 
 def make_window_targets(features, target, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN,
@@ -212,6 +312,96 @@ class RepeatLastTarget(layers.Layer):
 
 
 @keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class PowerRevIN(layers.Layer):
+    def __init__(self, target_channel_index, epsilon=REVIN_EPSILON, **kwargs):
+        super().__init__(**kwargs)
+        self.target_channel_index = target_channel_index
+        self.epsilon = epsilon
+
+    def call(self, inputs):
+        target = inputs[
+            :,
+            :,
+            self.target_channel_index:self.target_channel_index + 1,
+        ]
+        center = tf.reduce_mean(target, axis=1, keepdims=True)
+        variance = tf.reduce_mean(tf.square(target - center), axis=1, keepdims=True)
+        scale = tf.sqrt(variance + self.epsilon)
+        normalized_target = (target - center) / scale
+        normalized_inputs = tf.concat(
+            [
+                inputs[:, :, :self.target_channel_index],
+                normalized_target,
+                inputs[:, :, self.target_channel_index + 1:],
+            ],
+            axis=-1,
+        )
+        return normalized_inputs, center, scale
+
+    def compute_output_shape(self, input_shape):
+        stats_shape = (input_shape[0], 1, 1)
+        return input_shape, stats_shape, stats_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'target_channel_index': self.target_channel_index,
+            'epsilon': self.epsilon,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class PowerRevINDenormalize(layers.Layer):
+    def call(self, inputs):
+        forecast, center, scale = inputs
+        center = tf.squeeze(center, axis=1)
+        scale = tf.squeeze(scale, axis=1)
+        return forecast * scale + center
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class SelectInputChannels(layers.Layer):
+    def __init__(self, channel_indices, **kwargs):
+        super().__init__(**kwargs)
+        self.channel_indices = [int(index) for index in channel_indices]
+
+    def call(self, inputs):
+        return tf.gather(inputs, self.channel_indices, axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], input_shape[1], len(self.channel_indices)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'channel_indices': self.channel_indices})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class ZeroInitResidualAdapter(layers.Layer):
+    def build(self, input_shape):
+        self.gate = self.add_weight(
+            name='adapter_gate',
+            shape=(),
+            initializer='zeros',
+            regularizer=regularizers.l2(1e-4),
+            trainable=True,
+        )
+
+    def call(self, inputs):
+        base, adapter = inputs
+        gate = tf.tanh(tf.cast(self.gate, base.dtype))
+        return base + gate * adapter
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
 class TunedPatchTSTLoss(keras.losses.Loss):
     def __init__(self, forecast_len=FORECAST_LEN, horizon_weight_values=None,
                  distill_alpha=DISTILL_ALPHA, zero_scaled=0.0, capacity_scaled=None,
@@ -283,6 +473,92 @@ class TunedPatchTSTLoss(keras.losses.Loss):
 
 
 @keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class BalancedTunedPatchTSTLoss(keras.losses.Loss):
+    def __init__(self, forecast_len=FORECAST_LEN, distill_alpha=DISTILL_ALPHA,
+                 zero_scaled=0.0, capacity_scaled=None,
+                 ramp_loss_weight=NEW_RAMP_LOSS_WEIGHT,
+                 relative_loss_weight=NEW_RELATIVE_LOSS_WEIGHT,
+                 physical_penalty_weight=NEW_PHYSICAL_PENALTY_WEIGHT,
+                 relative_power_floor=RELATIVE_POWER_FLOOR,
+                 delta=HUBER_DELTA, name='balanced_tuned_patchtst_loss'):
+        super().__init__(name=name)
+        self.forecast_len = forecast_len
+        self.distill_alpha = float(distill_alpha)
+        self.zero_scaled = float(zero_scaled)
+        self.capacity_scaled = None if capacity_scaled is None else float(capacity_scaled)
+        self.ramp_loss_weight = float(ramp_loss_weight)
+        self.relative_loss_weight = float(relative_loss_weight)
+        self.physical_penalty_weight = float(physical_penalty_weight)
+        self.relative_power_floor = float(relative_power_floor)
+        self.delta = float(delta)
+
+    def _huber(self, error):
+        abs_error = tf.abs(error)
+        quadratic = tf.minimum(abs_error, self.delta)
+        linear = abs_error - quadratic
+        return 0.5 * tf.square(quadratic) + self.delta * linear
+
+    def call(self, y_true, y_pred):
+        actual = y_true[:, :self.forecast_len]
+        teacher = y_true[:, self.forecast_len:2 * self.forecast_len]
+        confidence = y_true[:, 2 * self.forecast_len:2 * self.forecast_len + 1]
+
+        supervised = tf.reduce_mean(self._huber(actual - y_pred), axis=1)
+        distill = tf.reduce_mean(self._huber(teacher - y_pred), axis=1)
+        loss = supervised + self.distill_alpha * tf.squeeze(confidence, axis=-1) * distill
+        loss = tf.reduce_mean(loss)
+
+        if self.forecast_len > 1:
+            true_ramp = actual[:, 1:] - actual[:, :-1]
+            pred_ramp = y_pred[:, 1:] - y_pred[:, :-1]
+            ramp_loss = tf.reduce_mean(self._huber(true_ramp - pred_ramp))
+        else:
+            ramp_loss = 0.0
+
+        if self.capacity_scaled is not None:
+            capacity_span = max(self.capacity_scaled - self.zero_scaled, 1e-6)
+            actual_pu = (actual - self.zero_scaled) / capacity_span
+            pred_pu = (y_pred - self.zero_scaled) / capacity_span
+            denominator = tf.maximum(
+                tf.abs(actual_pu) + tf.abs(pred_pu),
+                self.relative_power_floor,
+            )
+            relative_loss = tf.reduce_mean(
+                2.0 * tf.abs(actual_pu - pred_pu) / denominator
+            )
+        else:
+            relative_loss = 0.0
+
+        lower_penalty = tf.reduce_mean(tf.square(tf.nn.relu(self.zero_scaled - y_pred)))
+        physical_penalty = lower_penalty
+        if self.capacity_scaled is not None:
+            upper_penalty = tf.reduce_mean(tf.square(tf.nn.relu(y_pred - self.capacity_scaled)))
+            physical_penalty = physical_penalty + upper_penalty
+
+        return (
+            loss
+            + self.ramp_loss_weight * ramp_loss
+            + self.relative_loss_weight * relative_loss
+            + self.physical_penalty_weight * physical_penalty
+        )
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'forecast_len': self.forecast_len,
+            'distill_alpha': self.distill_alpha,
+            'zero_scaled': self.zero_scaled,
+            'capacity_scaled': self.capacity_scaled,
+            'ramp_loss_weight': self.ramp_loss_weight,
+            'relative_loss_weight': self.relative_loss_weight,
+            'physical_penalty_weight': self.physical_penalty_weight,
+            'relative_power_floor': self.relative_power_floor,
+            'delta': self.delta,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
 def actual_mae(y_true, y_pred):
     actual = y_true[:, :FORECAST_LEN]
     return tf.reduce_mean(tf.abs(actual - y_pred))
@@ -300,6 +576,37 @@ def scaled_bounds(scaler_y, capacity=None):
     if capacity is not None and capacity > 0:
         capacity_scaled = float(scaler_y.transform([[capacity]])[0, 0])
     return zero_scaled, capacity_scaled
+
+
+class StochasticWeightAveraging(keras.callbacks.Callback):
+    def __init__(self, start_epoch):
+        super().__init__()
+        self.start_epoch = max(1, int(start_epoch))
+        self.average_weights = None
+        self.snapshot_count = 0
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch + 1 < self.start_epoch:
+            return
+
+        current_weights = self.model.get_weights()
+        self.snapshot_count += 1
+        if self.average_weights is None:
+            self.average_weights = [
+                np.array(weight, copy=True)
+                for weight in current_weights
+            ]
+            return
+
+        factor = 1.0 / self.snapshot_count
+        for index, current in enumerate(current_weights):
+            self.average_weights[index] += (
+                current - self.average_weights[index]
+            ) * factor
+
+    def on_train_end(self, logs=None):
+        if self.average_weights is not None:
+            self.model.set_weights(self.average_weights)
 
 
 def make_optimizer(initial_lr, steps_per_epoch, epochs):
@@ -320,15 +627,23 @@ def make_optimizer(initial_lr, steps_per_epoch, epochs):
 
 
 def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
-                        epochs, distill_alpha):
+                        epochs, distill_alpha, use_balanced_loss=False):
     zero_scaled, capacity_scaled = scaled_bounds(scaler_y, capacity)
-    loss = TunedPatchTSTLoss(
-        forecast_len=FORECAST_LEN,
-        horizon_weight_values=horizon_weights(),
-        distill_alpha=distill_alpha,
-        zero_scaled=zero_scaled,
-        capacity_scaled=capacity_scaled,
-    )
+    if use_balanced_loss:
+        loss = BalancedTunedPatchTSTLoss(
+            forecast_len=FORECAST_LEN,
+            distill_alpha=distill_alpha,
+            zero_scaled=zero_scaled,
+            capacity_scaled=capacity_scaled,
+        )
+    else:
+        loss = TunedPatchTSTLoss(
+            forecast_len=FORECAST_LEN,
+            horizon_weight_values=horizon_weights(),
+            distill_alpha=distill_alpha,
+            zero_scaled=zero_scaled,
+            capacity_scaled=capacity_scaled,
+        )
     model.compile(
         optimizer=make_optimizer(initial_lr, steps_per_epoch, epochs),
         loss=loss,
@@ -337,14 +652,28 @@ def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
     return model
 
 
-def build_tuned_patchtst_model(input_dim, target_channel_index):
+def build_tuned_patchtst_model(input_dim, target_channel_index, use_revin=False,
+                               use_cnn_adapter=False, adapter_channel_indices=None):
     if target_channel_index is None:
         raise ValueError('Tuned PatchTST 需要将历史功率作为输入通道')
+    if use_cnn_adapter and not adapter_channel_indices:
+        raise ValueError('启用CNN Adapter时必须提供功率/风速通道索引')
 
     patch_num = compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)
     inputs = keras.Input(shape=(HISTORY_LEN, input_dim), name='history_features')
 
-    x_input = layers.GaussianNoise(INPUT_NOISE_STD, name='input_noise')(inputs)
+    model_input = inputs
+    revin_center = None
+    revin_scale = None
+    if use_revin:
+        model_input, revin_center, revin_scale = PowerRevIN(
+            target_channel_index,
+            REVIN_EPSILON,
+            dtype='float32',
+            name='power_revin',
+        )(inputs)
+
+    x_input = layers.GaussianNoise(INPUT_NOISE_STD, name='input_noise')(model_input)
     x_input = layers.SpatialDropout1D(CHANNEL_DROPOUT, name='channel_dropout')(x_input)
 
     x = PatchExtract(PATCH_LEN, PATCH_STRIDE, name='patch_extract')(x_input)
@@ -370,6 +699,35 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
         name='forecast_ff',
     )(head)
     head = layers.Dropout(HEAD_DROPOUT, name='forecast_dropout')(head)
+
+    if use_cnn_adapter:
+        adapter = SelectInputChannels(
+            adapter_channel_indices,
+            name='adapter_input_channels',
+        )(x_input)
+        adapter = layers.SeparableConv1D(
+            CNN_ADAPTER_FILTERS,
+            kernel_size=3,
+            padding='same',
+            activation='gelu',
+            name='cnn_adapter_conv3',
+        )(adapter)
+        adapter = layers.SeparableConv1D(
+            CNN_ADAPTER_FILTERS,
+            kernel_size=5,
+            padding='same',
+            activation='gelu',
+            name='cnn_adapter_conv5',
+        )(adapter)
+        adapter = layers.GlobalAveragePooling1D(name='cnn_adapter_pool')(adapter)
+        adapter = layers.Dense(
+            D_FF,
+            activation='gelu',
+            name='cnn_adapter_projection',
+        )(adapter)
+        adapter = layers.Dropout(HEAD_DROPOUT, name='cnn_adapter_dropout')(adapter)
+        head = ZeroInitResidualAdapter(name='zero_init_cnn_adapter')([head, adapter])
+
     residual = layers.Dense(
         FORECAST_LEN,
         kernel_initializer='zeros',
@@ -381,8 +739,14 @@ def build_tuned_patchtst_model(input_dim, target_channel_index):
         target_channel_index,
         FORECAST_LEN,
         name='persistence_baseline',
-    )(inputs)
-    outputs = layers.Add(name='forecast_power')([baseline, residual])
+    )(model_input)
+    forecast_name = 'forecast_power_normalized' if use_revin else 'forecast_power'
+    outputs = layers.Add(name=forecast_name)([baseline, residual])
+    if use_revin:
+        outputs = PowerRevINDenormalize(
+            dtype='float32',
+            name='forecast_power',
+        )([outputs, revin_center, revin_scale])
     outputs = layers.Activation('linear', dtype='float32', name='forecast_power_float32')(outputs)
     return keras.Model(inputs=inputs, outputs=outputs, name='WindTunedPatchTST')
 
@@ -392,14 +756,14 @@ def inverse_power(scaler_y, values):
     return scaler_y.inverse_transform(values).reshape(-1)
 
 
-def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
-    y_pred_scaled = model.predict(val_feature_ds, verbose=0)
-    y_true = inverse_power(scaler_y, y_val)
-    y_pred = inverse_power(scaler_y, y_pred_scaled)
-    if capacity is not None:
-        y_pred = np.clip(y_pred, 0, capacity)
-    else:
-        y_pred = np.clip(y_pred, 0, None)
+def calculate_composite_metrics(y_true, y_pred, capacity=None):
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+    if len(y_true) == 0:
+        raise ValueError('验证集中没有可用于评价的功率点')
 
     mae = mean_absolute_error(y_true, y_pred)
     mse = mean_squared_error(y_true, y_pred)
@@ -407,11 +771,119 @@ def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
     r2 = np.nan
     if len(y_true) > 1 and np.nanstd(y_true) > 1e-6:
         r2 = r2_score(y_true, y_pred)
+
+    normalizer = capacity
+    if normalizer is None or normalizer <= 0:
+        normalizer = max(float(np.nanmax(y_true) - np.nanmin(y_true)), 1.0)
+    normalized_mae = float(mae / normalizer)
+    normalized_rmse = float(rmse / normalizer)
+    denominator = np.maximum(
+        np.abs(y_true) + np.abs(y_pred),
+        RELATIVE_POWER_FLOOR * normalizer,
+    )
+    smape = float(np.mean(2.0 * np.abs(y_true - y_pred) / denominator) * 100.0)
+    r2_penalty = 1.0 if not np.isfinite(r2) else max(0.0, 1.0 - float(r2))
+    score = (
+        0.45 * normalized_rmse
+        + 0.30 * normalized_mae
+        + 0.15 * (smape / 100.0)
+        + 0.10 * r2_penalty
+    )
     return {
-        'val_inverse_mae': float(mae),
-        'val_inverse_mse': float(mse),
-        'val_inverse_rmse': rmse,
-        'val_inverse_r2': r2,
+        'mae': float(mae),
+        'mse': float(mse),
+        'rmse': rmse,
+        'r2': r2,
+        'capacity_normalized_mae': normalized_mae,
+        'capacity_normalized_rmse': normalized_rmse,
+        'stable_smape': smape,
+        'composite_score': float(score),
+    }
+
+
+def aggregate_exponential_weighted_predictions(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    if y_true.shape != y_pred.shape or y_true.ndim != 2:
+        raise ValueError('指数加权聚合要求y_true/y_pred均为相同的二维窗口数组')
+
+    n_samples, forecast_len = y_true.shape
+    timeline_len = n_samples + forecast_len - 1
+    pred_sum = np.zeros(timeline_len, dtype=np.float64)
+    weight_sum = np.zeros(timeline_len, dtype=np.float64)
+    actual_sum = np.zeros(timeline_len, dtype=np.float64)
+    actual_count = np.zeros(timeline_len, dtype=np.float64)
+    horizon_weights_values = 0.5 ** (
+        np.arange(forecast_len, dtype=np.float64) / EXP_WEIGHT_HALFLIFE_STEPS
+    )
+
+    for horizon_index, weight in enumerate(horizon_weights_values):
+        target_slice = slice(horizon_index, horizon_index + n_samples)
+        valid_pred = np.isfinite(y_pred[:, horizon_index])
+        valid_actual = np.isfinite(y_true[:, horizon_index])
+        pred_sum[target_slice] += np.where(
+            valid_pred,
+            y_pred[:, horizon_index] * weight,
+            0.0,
+        )
+        weight_sum[target_slice] += valid_pred.astype(np.float64) * weight
+        actual_sum[target_slice] += np.where(
+            valid_actual,
+            y_true[:, horizon_index],
+            0.0,
+        )
+        actual_count[target_slice] += valid_actual.astype(np.float64)
+
+    valid = (weight_sum > 0) & (actual_count > 0)
+    actual = actual_sum[valid] / actual_count[valid]
+    prediction = pred_sum[valid] / weight_sum[valid]
+    return actual, prediction
+
+
+def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
+    y_pred_scaled = model.predict(val_feature_ds, verbose=0)
+    y_true = inverse_power(scaler_y, y_val).reshape(y_val.shape)
+    y_pred = inverse_power(scaler_y, y_pred_scaled).reshape(y_pred_scaled.shape)
+    if capacity is not None:
+        y_pred = np.clip(y_pred, 0, capacity)
+    else:
+        y_pred = np.clip(y_pred, 0, None)
+
+    window_metrics = calculate_composite_metrics(y_true, y_pred, capacity)
+    weighted_true, weighted_pred = aggregate_exponential_weighted_predictions(
+        y_true,
+        y_pred,
+    )
+    weighted_metrics = calculate_composite_metrics(
+        weighted_true,
+        weighted_pred,
+        capacity,
+    )
+    composite_score = (
+        0.70 * window_metrics['composite_score']
+        + 0.30 * weighted_metrics['composite_score']
+    )
+    return {
+        'val_inverse_mae': window_metrics['mae'],
+        'val_inverse_mse': window_metrics['mse'],
+        'val_inverse_rmse': window_metrics['rmse'],
+        'val_inverse_r2': window_metrics['r2'],
+        'val_capacity_normalized_mae': window_metrics['capacity_normalized_mae'],
+        'val_capacity_normalized_rmse': window_metrics['capacity_normalized_rmse'],
+        'val_stable_smape': window_metrics['stable_smape'],
+        'val_window_composite_score': window_metrics['composite_score'],
+        'val_weighted_curve_mae': weighted_metrics['mae'],
+        'val_weighted_curve_rmse': weighted_metrics['rmse'],
+        'val_weighted_curve_r2': weighted_metrics['r2'],
+        'val_weighted_curve_capacity_normalized_mae': (
+            weighted_metrics['capacity_normalized_mae']
+        ),
+        'val_weighted_curve_capacity_normalized_rmse': (
+            weighted_metrics['capacity_normalized_rmse']
+        ),
+        'val_weighted_curve_stable_smape': weighted_metrics['stable_smape'],
+        'val_weighted_curve_composite_score': weighted_metrics['composite_score'],
+        'val_composite_score': float(composite_score),
     }
 
 
@@ -423,7 +895,8 @@ def teacher_confidence(y_true, teacher_pred, keep_ratio=TEACHER_KEEP_RATIO):
 
 
 def save_distillation_stats(farm_id, train_mae, train_conf, train_threshold,
-                            val_mae, val_conf, val_threshold):
+                            val_mae, val_conf, val_threshold,
+                            output_dir=DISTILL_DIR, filename_prefix='tuned_patchtst'):
     rows = []
     for split, mae_values, conf, threshold in [
         ('train', train_mae, train_conf, train_threshold),
@@ -443,12 +916,17 @@ def save_distillation_stats(farm_id, train_mae, train_conf, train_threshold,
             'acceptance_threshold_scaled': threshold,
         })
     stats_df = pd.DataFrame(rows)
-    stats_path = os.path.join(DISTILL_DIR, f'tuned_patchtst_distillation_stats_farm_{farm_id}.csv')
+    os.makedirs(output_dir, exist_ok=True)
+    stats_path = os.path.join(
+        output_dir,
+        f'{filename_prefix}_distillation_stats_farm_{farm_id}.csv',
+    )
     stats_df.to_csv(stats_path, index=False, encoding='utf-8-sig')
     return stats_path
 
 
-def save_history_artifacts(histories, farm_id):
+def save_history_artifacts(histories, farm_id, output_dir=HISTORY_DIR,
+                           filename_prefix='tuned_patchtst'):
     frames = []
     for stage, history in histories:
         history_df = pd.DataFrame(history.history)
@@ -457,12 +935,19 @@ def save_history_artifacts(histories, farm_id):
         frames.append(history_df)
 
     combined = pd.concat(frames, ignore_index=True)
-    history_path = os.path.join(HISTORY_DIR, f'tuned_patchtst_history_farm_{farm_id}.csv')
+    os.makedirs(output_dir, exist_ok=True)
+    history_path = os.path.join(
+        output_dir,
+        f'{filename_prefix}_history_farm_{farm_id}.csv',
+    )
     combined.to_csv(history_path, index=False, encoding='utf-8-sig')
 
-    plot_path = os.path.join(HISTORY_DIR, f'tuned_patchtst_history_farm_{farm_id}.png')
+    plot_path = os.path.join(
+        output_dir,
+        f'{filename_prefix}_history_farm_{farm_id}.png',
+    )
     try:
-        cache_dir = os.path.join(MODEL_DIR, 'matplotlib_cache')
+        cache_dir = os.path.join(output_dir, 'matplotlib_cache')
         os.environ['MPLCONFIGDIR'] = cache_dir
         os.environ['XDG_CACHE_HOME'] = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
@@ -536,11 +1021,583 @@ def save_config():
         'channel_dropout': CHANNEL_DROPOUT,
         'use_mixed_precision': USE_MIXED_PRECISION,
         'use_power_history': USE_POWER_HISTORY,
+        'run_ablation': RUN_ABLATION,
+        'ablation_variants': ABLATION_VARIANTS,
+        'revin_epsilon': REVIN_EPSILON,
+        'cnn_adapter_filters': CNN_ADAPTER_FILTERS,
+        'new_ramp_loss_weight': NEW_RAMP_LOSS_WEIGHT,
+        'new_relative_loss_weight': NEW_RELATIVE_LOSS_WEIGHT,
+        'new_physical_penalty_weight': NEW_PHYSICAL_PENALTY_WEIGHT,
+        'relative_power_floor': RELATIVE_POWER_FLOOR,
+        'exp_weight_halflife_steps': EXP_WEIGHT_HALFLIFE_STEPS,
+        'swa_start_fraction': SWA_START_FRACTION,
+        'max_allowed_nrmse_degradation': MAX_ALLOWED_NRMSE_DEGRADATION,
     }
     config_path = os.path.join(MODEL_DIR, 'tuned_patchtst_config.json')
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     return config_path
+
+
+def train_ablation_variant(farm_id, variant, features, y_train, y_val,
+                           train_samples, total_samples, input_cols,
+                           target_index, adapter_channel_indices,
+                           scaler_x, scaler_y, feature_cols, capacity):
+    variant_name = variant['name']
+    dirs = make_variant_dirs(variant_name)
+    val_samples = total_samples - train_samples
+    steps_per_epoch = int(np.ceil(train_samples / BATCH_SIZE))
+
+    keras.backend.clear_session()
+    set_global_seed(seed)
+    print(
+        f'\n--- 消融variant={variant_name}: '
+        f"RevIN={variant['use_revin']}, "
+        f"CNN Adapter={variant['use_cnn_adapter']}, "
+        f"Balanced loss={variant['use_balanced_loss']}, "
+        f"SWA={variant['use_swa']} ---"
+    )
+
+    y_train_stage1 = combine_targets(y_train)
+    y_val_stage1 = combine_targets(y_val)
+    train_ds_stage1 = make_supervised_dataset(
+        features,
+        y_train_stage1,
+        start=0,
+        sample_count=train_samples,
+        shuffle=True,
+    )
+    val_ds_stage1 = make_supervised_dataset(
+        features,
+        y_val_stage1,
+        start=train_samples,
+        sample_count=val_samples,
+        shuffle=False,
+    )
+    train_feature_ds = make_feature_dataset(features, 0, train_samples)
+    val_feature_ds = make_feature_dataset(features, train_samples, val_samples)
+
+    model = build_tuned_patchtst_model(
+        len(input_cols),
+        target_index,
+        use_revin=variant['use_revin'],
+        use_cnn_adapter=variant['use_cnn_adapter'],
+        adapter_channel_indices=adapter_channel_indices,
+    )
+    compile_tuned_model(
+        model,
+        scaler_y,
+        capacity,
+        BASE_LEARNING_RATE,
+        steps_per_epoch,
+        COLD_START_EPOCHS,
+        distill_alpha=0.0,
+        use_balanced_loss=variant['use_balanced_loss'],
+    )
+    print(f'variant={variant_name}, parameters={model.count_params():,}')
+
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    teacher_weights_path = os.path.join(
+        dirs['weights'],
+        f'tuned_patchtst_{variant_name}_teacher_farm_{farm_id}_best.weights.h5',
+    )
+    teacher_model_path = os.path.join(
+        dirs['teachers'],
+        f'tuned_patchtst_{variant_name}_teacher_farm_{farm_id}.keras',
+    )
+    raw_weights_path = os.path.join(
+        dirs['weights'],
+        f'tuned_patchtst_{variant_name}_farm_{farm_id}_raw_best.weights.h5',
+    )
+    averaged_weights_path = os.path.join(
+        dirs['weights'],
+        f'tuned_patchtst_{variant_name}_farm_{farm_id}_swa.weights.h5',
+    )
+    final_weights_path = os.path.join(
+        dirs['weights'],
+        f'tuned_patchtst_{variant_name}_farm_{farm_id}_best.weights.h5',
+    )
+    final_model_path = os.path.join(
+        dirs['models'],
+        f'tuned_patchtst_{variant_name}_farm_{farm_id}.keras',
+    )
+    teacher_log_dir = os.path.join(
+        dirs['tensorboard'],
+        f'farm_{farm_id}',
+        'cold_start',
+        timestamp,
+    )
+    distill_log_dir = os.path.join(
+        dirs['tensorboard'],
+        f'farm_{farm_id}',
+        'distill',
+        timestamp,
+    )
+
+    teacher_callbacks = [
+        keras.callbacks.TensorBoard(
+            log_dir=teacher_log_dir,
+            histogram_freq=0,
+            write_graph=True,
+            update_freq='epoch',
+            profile_batch=0,
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=8,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            teacher_weights_path,
+            monitor='val_loss',
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1,
+        ),
+    ]
+    teacher_history = model.fit(
+        train_ds_stage1,
+        validation_data=val_ds_stage1,
+        epochs=COLD_START_EPOCHS,
+        callbacks=teacher_callbacks,
+        verbose=1,
+    )
+    if os.path.exists(teacher_weights_path):
+        model.load_weights(teacher_weights_path)
+    model.save(teacher_model_path)
+
+    teacher_train_pred = model.predict(train_feature_ds, verbose=0)
+    teacher_val_pred = model.predict(val_feature_ds, verbose=0)
+    train_conf, train_teacher_mae, train_threshold = teacher_confidence(
+        y_train,
+        teacher_train_pred,
+        TEACHER_KEEP_RATIO,
+    )
+    val_conf, val_teacher_mae, val_threshold = teacher_confidence(
+        y_val,
+        teacher_val_pred,
+        TEACHER_KEEP_RATIO,
+    )
+    distill_stats_path = save_distillation_stats(
+        farm_id,
+        train_teacher_mae,
+        train_conf,
+        train_threshold,
+        val_teacher_mae,
+        val_conf,
+        val_threshold,
+        output_dir=dirs['distillation'],
+        filename_prefix=f'tuned_patchtst_{variant_name}',
+    )
+
+    y_train_stage2 = combine_targets(y_train, teacher_train_pred, train_conf)
+    y_val_stage2 = combine_targets(y_val, teacher_val_pred, val_conf)
+    train_ds_stage2 = make_supervised_dataset(
+        features,
+        y_train_stage2,
+        start=0,
+        sample_count=train_samples,
+        shuffle=True,
+    )
+    val_ds_stage2 = make_supervised_dataset(
+        features,
+        y_val_stage2,
+        start=train_samples,
+        sample_count=val_samples,
+        shuffle=False,
+    )
+    compile_tuned_model(
+        model,
+        scaler_y,
+        capacity,
+        DISTILL_LEARNING_RATE,
+        steps_per_epoch,
+        DISTILL_EPOCHS,
+        distill_alpha=DISTILL_ALPHA,
+        use_balanced_loss=variant['use_balanced_loss'],
+    )
+
+    distill_callbacks = [
+        keras.callbacks.TensorBoard(
+            log_dir=distill_log_dir,
+            histogram_freq=0,
+            write_graph=True,
+            update_freq='epoch',
+            profile_batch=0,
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            raw_weights_path,
+            monitor='val_loss',
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1,
+        ),
+    ]
+    swa_callback = None
+    if variant['use_swa']:
+        swa_start_epoch = max(
+            1,
+            min(5, int(np.ceil(DISTILL_EPOCHS * SWA_START_FRACTION))),
+        )
+        swa_callback = StochasticWeightAveraging(swa_start_epoch)
+        distill_callbacks.append(swa_callback)
+
+    distill_history = model.fit(
+        train_ds_stage2,
+        validation_data=val_ds_stage2,
+        epochs=DISTILL_EPOCHS,
+        callbacks=distill_callbacks,
+        verbose=1,
+    )
+
+    selected_weight_source = 'raw_best'
+    raw_metrics = None
+    averaged_metrics = None
+    if variant['use_swa'] and swa_callback is not None and swa_callback.snapshot_count > 0:
+        model.save_weights(averaged_weights_path)
+        averaged_metrics = evaluate_model(
+            model,
+            val_feature_ds,
+            y_val,
+            scaler_y,
+            capacity,
+        )
+        if os.path.exists(raw_weights_path):
+            model.load_weights(raw_weights_path)
+        raw_metrics = evaluate_model(
+            model,
+            val_feature_ds,
+            y_val,
+            scaler_y,
+            capacity,
+        )
+        if averaged_metrics['val_composite_score'] < raw_metrics['val_composite_score']:
+            model.load_weights(averaged_weights_path)
+            selected_weight_source = 'swa'
+    elif os.path.exists(raw_weights_path):
+        model.load_weights(raw_weights_path)
+
+    model.save_weights(final_weights_path)
+    model.save(final_model_path)
+    eval_metrics = evaluate_model(
+        model,
+        val_feature_ds,
+        y_val,
+        scaler_y,
+        capacity,
+    )
+    histories = [
+        ('cold_start', teacher_history),
+        ('distill', distill_history),
+    ]
+    history_path, history_plot_path = save_history_artifacts(
+        histories,
+        farm_id,
+        output_dir=dirs['history'],
+        filename_prefix=f'tuned_patchtst_{variant_name}',
+    )
+
+    artifact = {
+        'model_name': TUNED_MODEL_NAME,
+        'farm_id': farm_id,
+        'ablation_variant': variant_name,
+        'added_module': variant['added_module'],
+        'use_revin': variant['use_revin'],
+        'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_balanced_loss': variant['use_balanced_loss'],
+        'use_swa': variant['use_swa'],
+        'selected_weight_source': selected_weight_source,
+        'adapter_channel_indices': adapter_channel_indices,
+        'feature_cols': feature_cols,
+        'input_cols': input_cols,
+        'target_col': TARGET_COL,
+        'target_index': target_index,
+        'scaler_x': scaler_x,
+        'scaler_y': scaler_y,
+        'capacity': capacity,
+        'history_len': HISTORY_LEN,
+        'forecast_len': FORECAST_LEN,
+        'time_freq': TIME_FREQ,
+        'patch_len': PATCH_LEN,
+        'patch_stride': PATCH_STRIDE,
+        'teacher_model_path': teacher_model_path,
+        'teacher_weights_path': teacher_weights_path,
+        'model_path': final_model_path,
+        'best_weights_path': final_weights_path,
+        'raw_best_weights_path': raw_weights_path,
+        'swa_weights_path': (
+            averaged_weights_path
+            if os.path.exists(averaged_weights_path)
+            else None
+        ),
+        'teacher_tensorboard_log_dir': teacher_log_dir,
+        'distill_tensorboard_log_dir': distill_log_dir,
+        'history_path': history_path,
+        'history_plot_path': history_plot_path,
+        'distillation_stats_path': distill_stats_path,
+        'distill_alpha': DISTILL_ALPHA,
+        'teacher_keep_ratio': TEACHER_KEEP_RATIO,
+        'horizon_decay': HORIZON_DECAY,
+        **eval_metrics,
+    }
+    artifact_path = os.path.join(
+        dirs['preprocess'],
+        f'tuned_patchtst_{variant_name}_farm_{farm_id}_preprocess.pkl',
+    )
+    joblib.dump(artifact, artifact_path)
+
+    result = {
+        'farm_id': farm_id,
+        'variant': variant_name,
+        'added_module': variant['added_module'],
+        'use_revin': variant['use_revin'],
+        'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_balanced_loss': variant['use_balanced_loss'],
+        'use_swa': variant['use_swa'],
+        'selected_weight_source': selected_weight_source,
+        'model_path': final_model_path,
+        'best_weights_path': final_weights_path,
+        'artifact_path': artifact_path,
+        'history_path': history_path,
+        'distillation_stats_path': distill_stats_path,
+        'train_samples': train_samples,
+        'val_samples': val_samples,
+        'raw_val_composite_score': (
+            raw_metrics['val_composite_score']
+            if raw_metrics is not None
+            else np.nan
+        ),
+        'swa_val_composite_score': (
+            averaged_metrics['val_composite_score']
+            if averaged_metrics is not None
+            else np.nan
+        ),
+        **eval_metrics,
+    }
+    print(
+        f"variant={variant_name}: score={eval_metrics['val_composite_score']:.6f}, "
+        f"NRMSE={eval_metrics['val_capacity_normalized_rmse']:.6f}, "
+        f"SMAPE={eval_metrics['val_stable_smape']:.3f}%"
+    )
+    return result
+
+
+def promote_selected_variant(train_df, selected_result):
+    farm_id = str(selected_result['farm_id'])
+    selected_artifact = joblib.load(selected_result['artifact_path'])
+    model = keras.models.load_model(
+        selected_result['model_path'],
+        compile=False,
+    )
+
+    canonical_model_path = os.path.join(
+        SAVED_MODEL_DIR,
+        f'tuned_patchtst_farm_{farm_id}.keras',
+    )
+    canonical_weights_path = os.path.join(
+        WEIGHTS_DIR,
+        f'tuned_patchtst_farm_{farm_id}_best.weights.h5',
+    )
+    canonical_artifact_path = os.path.join(
+        PREPROCESS_DIR,
+        f'tuned_patchtst_farm_{farm_id}_preprocess.pkl',
+    )
+    model.save(canonical_model_path)
+    model.save_weights(canonical_weights_path)
+
+    selected_artifact.update({
+        'selected_ablation_variant': selected_result['variant'],
+        'selected_by': 'validation_composite_score',
+        'source_variant_model_path': selected_result['model_path'],
+        'source_variant_weights_path': selected_result['best_weights_path'],
+        'model_path': canonical_model_path,
+        'best_weights_path': canonical_weights_path,
+    })
+    joblib.dump(selected_artifact, canonical_artifact_path)
+
+    tail_path = os.path.join(TAIL_DIR, f'tuned_patchtst_tail_farm_{farm_id}.csv')
+    train_df.iloc[-HISTORY_LEN:].to_csv(tail_path, index=True)
+
+    selection_path = os.path.join(
+        ABLATION_DIR,
+        f'tuned_patchtst_selected_variant_farm_{farm_id}.json',
+    )
+    selection_record = {
+        'farm_id': farm_id,
+        'selected_variant': selected_result['variant'],
+        'selected_weight_source': selected_result['selected_weight_source'],
+        'selection_metric': 'val_composite_score',
+        'val_composite_score': float(selected_result['val_composite_score']),
+        'val_capacity_normalized_rmse': float(
+            selected_result['val_capacity_normalized_rmse']
+        ),
+        'canonical_model_path': canonical_model_path,
+        'canonical_weights_path': canonical_weights_path,
+        'canonical_artifact_path': canonical_artifact_path,
+    }
+    with open(selection_path, 'w', encoding='utf-8') as file:
+        json.dump(selection_record, file, ensure_ascii=False, indent=2)
+
+    return {
+        **selected_result,
+        'model_path': canonical_model_path,
+        'best_weights_path': canonical_weights_path,
+        'artifact_path': canonical_artifact_path,
+        'tail_path': tail_path,
+        'selection_path': selection_path,
+    }
+
+
+def select_variant_for_farm(results):
+    if not results:
+        raise ValueError('没有可供选择的消融实验结果')
+
+    baseline = next(
+        (result for result in results if result['variant'] == 'baseline'),
+        None,
+    )
+    eligible = list(results)
+    if baseline is not None:
+        baseline_nrmse = baseline['val_capacity_normalized_rmse']
+        upper_limit = baseline_nrmse * (1.0 + MAX_ALLOWED_NRMSE_DEGRADATION)
+        eligible = [
+            result for result in results
+            if result['variant'] == 'baseline'
+            or result['val_capacity_normalized_rmse'] <= upper_limit
+        ]
+    return min(eligible, key=lambda result: result['val_composite_score'])
+
+
+def train_one_farm_ablation(train_file):
+    farm_id = get_farm_id(train_file)
+    print(f'\n===== tuned PatchTST 单变量消融 / 风电场 {farm_id} =====')
+
+    train_df, feature_cols, capacity = load_and_preprocess(train_file, is_train=True)
+    features, target, input_cols, target_index, scaler_x, scaler_y = build_scaled_arrays(
+        train_df,
+        feature_cols,
+    )
+    y_train, y_val, train_samples, total_samples = make_window_targets(
+        features,
+        target,
+        HISTORY_LEN,
+        FORECAST_LEN,
+        VALIDATION_SPLIT,
+    )
+    adapter_channel_indices = get_adapter_channel_indices(input_cols)
+    print(
+        f'数据形状: {train_df.shape}，输入通道: {len(input_cols)}，'
+        f'训练/验证样本: {train_samples}/{total_samples - train_samples}'
+    )
+    print(
+        'CNN Adapter通道: '
+        f'{[input_cols[index] for index in adapter_channel_indices]}'
+    )
+
+    results = []
+    for variant in get_ablation_variants():
+        results.append(
+            train_ablation_variant(
+                farm_id,
+                variant,
+                features,
+                y_train,
+                y_val,
+                train_samples,
+                total_samples,
+                input_cols,
+                target_index,
+                adapter_channel_indices,
+                scaler_x,
+                scaler_y,
+                feature_cols,
+                capacity,
+            )
+        )
+
+    farm_results = pd.DataFrame(results)
+    farm_metrics_path = os.path.join(
+        ABLATION_DIR,
+        f'tuned_patchtst_ablation_metrics_farm_{farm_id}.csv',
+    )
+    farm_results.to_csv(farm_metrics_path, index=False, encoding='utf-8-sig')
+
+    selected = select_variant_for_farm(results)
+    selected = promote_selected_variant(train_df, selected)
+    selected['ablation_metrics_path'] = farm_metrics_path
+    print(
+        f"场站 {farm_id} 选择variant={selected['variant']}，"
+        f"score={selected['val_composite_score']:.6f}"
+    )
+    return selected, results
+
+
+def summarize_ablation(all_results, selected_results):
+    detail = pd.DataFrame(all_results)
+    selected_names = pd.Series(
+        [result['variant'] for result in selected_results]
+    ).value_counts()
+    variant_order = [variant['name'] for variant in ABLATION_VARIANTS]
+    rows = []
+
+    baseline = detail[detail['variant'] == 'baseline'][
+        ['farm_id', 'val_composite_score', 'val_capacity_normalized_rmse']
+    ].rename(columns={
+        'val_composite_score': 'baseline_score',
+        'val_capacity_normalized_rmse': 'baseline_nrmse',
+    })
+    previous_mean_score = None
+    for variant in variant_order:
+        variant_df = detail[detail['variant'] == variant]
+        if variant_df.empty:
+            continue
+        mean_score = float(variant_df['val_composite_score'].mean())
+        compared = variant_df.merge(baseline, on='farm_id', how='left')
+        score_delta = compared['val_composite_score'] - compared['baseline_score']
+        nrmse_ratio = (
+            compared['val_capacity_normalized_rmse']
+            / compared['baseline_nrmse']
+            - 1.0
+        )
+        rows.append({
+            'variant': variant,
+            'added_module': variant_df['added_module'].iloc[0],
+            'farms': int(len(variant_df)),
+            'mean_composite_score': mean_score,
+            'incremental_score_delta': (
+                np.nan
+                if previous_mean_score is None
+                else mean_score - previous_mean_score
+            ),
+            'mean_score_delta_vs_baseline': float(score_delta.mean()),
+            'improved_farms_vs_baseline': int((score_delta < 0).sum()),
+            'mean_nrmse_change_vs_baseline': float(nrmse_ratio.mean()),
+            'max_nrmse_degradation_vs_baseline': float(nrmse_ratio.max()),
+            'passes_nrmse_guardrail': bool(
+                nrmse_ratio.max() <= MAX_ALLOWED_NRMSE_DEGRADATION
+            ),
+            'selected_farms': int(selected_names.get(variant, 0)),
+        })
+        previous_mean_score = mean_score
+
+    summary = pd.DataFrame(rows)
+    eligible = summary[summary['passes_nrmse_guardrail']]
+    if eligible.empty:
+        global_best_variant = 'baseline'
+    else:
+        global_best_variant = eligible.loc[
+            eligible['mean_composite_score'].idxmin(),
+            'variant',
+        ]
+    summary['global_best_variant'] = global_best_variant
+    return detail, summary, global_best_variant
 
 
 def train_one_farm(train_file):
@@ -831,8 +1888,38 @@ def main():
     print(f'输出目录: {MODEL_DIR}')
 
     rows = []
-    for train_file in train_files:
-        rows.append(train_one_farm(train_file))
+    all_ablation_results = []
+    if RUN_ABLATION:
+        print(
+            '启用顺序消融: baseline -> RevIN -> CNN Adapter '
+            '-> balanced loss -> SWA'
+        )
+        for train_file in train_files:
+            selected, variant_results = train_one_farm_ablation(train_file)
+            rows.append(selected)
+            all_ablation_results.extend(variant_results)
+
+        detail, summary, global_best_variant = summarize_ablation(
+            all_ablation_results,
+            rows,
+        )
+        detail_path = os.path.join(
+            ABLATION_DIR,
+            'tuned_patchtst_ablation_metrics_all_farms.csv',
+        )
+        summary_path = os.path.join(
+            ABLATION_DIR,
+            'tuned_patchtst_ablation_module_summary.csv',
+        )
+        detail.to_csv(detail_path, index=False, encoding='utf-8-sig')
+        summary.to_csv(summary_path, index=False, encoding='utf-8-sig')
+        print(f'消融明细: {detail_path}')
+        print(f'模块贡献汇总: {summary_path}')
+        print(f'跨场站最优variant: {global_best_variant}')
+    else:
+        print('消融关闭，按原 tuned PatchTST 流程训练')
+        for train_file in train_files:
+            rows.append(train_one_farm(train_file))
 
     metrics = pd.DataFrame(rows)
     metrics_path = os.path.join(MODEL_DIR, 'tuned_patchtst_training_metrics.csv')
