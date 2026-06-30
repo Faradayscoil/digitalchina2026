@@ -196,6 +196,35 @@ def load_artifact(model_name, farm_id):
     return artifact
 
 
+def get_tuned_ablation_trace_fields(model_name, artifact):
+    if model_name != TUNED_MODEL_NAME:
+        return {}
+    return {
+        'selected_ablation_variant': artifact.get(
+            'selected_ablation_variant',
+            artifact.get('ablation_variant', 'legacy_tuned_patchtst'),
+        ),
+        'selected_ablation_round': artifact.get(
+            'selected_ablation_round',
+            artifact.get('ablation_round'),
+        ),
+        'selected_parent_variant': artifact.get(
+            'selected_parent_variant',
+            artifact.get('parent_variant'),
+        ),
+        'selected_weight_source': artifact.get('selected_weight_source'),
+        'use_revin': artifact.get('use_revin', False),
+        'use_cnn_adapter': artifact.get('use_cnn_adapter', False),
+        'use_balanced_loss': artifact.get('use_balanced_loss', False),
+        'use_swa': artifact.get('use_swa', False),
+        'selection_val_composite_score': artifact.get('val_composite_score'),
+        'selection_val_capacity_normalized_rmse': artifact.get(
+            'val_capacity_normalized_rmse'
+        ),
+        'source_variant_model_path': artifact.get('source_variant_model_path'),
+    }
+
+
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
@@ -599,6 +628,14 @@ def predict_one_farm(model_name, test_file):
     print(f'\n===== 预测 {model_name} / 风电场 {farm_id} =====')
 
     artifact = load_artifact(model_name, farm_id)
+    ablation_trace_fields = get_tuned_ablation_trace_fields(model_name, artifact)
+    if ablation_trace_fields:
+        print(
+            '入选消融variant: '
+            f"{ablation_trace_fields['selected_ablation_variant']}，"
+            f"round={ablation_trace_fields['selected_ablation_round']}，"
+            f"weight={ablation_trace_fields['selected_weight_source']}"
+        )
     model, loaded_model_path = load_trained_model(model_name, farm_id, artifact)
     df, features, actual_power, capacity = prepare_prediction_arrays(test_file, artifact)
     history_len = artifact.get('history_len', HISTORY_LEN)
@@ -634,6 +671,8 @@ def predict_one_farm(model_name, test_file):
     pred_df.to_csv(pred_path, index=False, encoding='utf-8-sig')
 
     metric_df = metrics_by_horizon(model_name, farm_id, y_true, y_pred, capacity, forecast_len)
+    for field, value in ablation_trace_fields.items():
+        metric_df[field] = value
     horizon_metric_path = os.path.join(
         dirs['root'],
         f'{model_name}_metrics_by_horizon_farm_{farm_id}.csv',
@@ -669,6 +708,7 @@ def predict_one_farm(model_name, test_file):
         'single_window_figure_path': single_window_figure_path,
         'weighted_curve_path': weighted_curve_path,
         'weighted_curve_figure_path': weighted_curve_figure_path,
+        **ablation_trace_fields,
         **weighted_metric_fields,
     })
     print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "

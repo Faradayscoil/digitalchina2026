@@ -57,6 +57,22 @@ TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
 TAIL_DIR = os.path.join(MODEL_DIR, 'tails')
 DISTILL_DIR = os.path.join(MODEL_DIR, 'distillation')
 ABLATION_DIR = os.path.join(MODEL_DIR, 'ablation')
+ABLATION_ALL_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_metrics_all_farms.csv',
+)
+ABLATION_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_module_summary.csv',
+)
+ROUND2_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round2_metrics_all_farms.csv',
+)
+ROUND2_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round2_module_summary.csv',
+)
 
 seed = 2026
 BATCH_SIZE = int(os.getenv('WIND_TUNED_BATCH_SIZE', '192'))
@@ -78,6 +94,19 @@ INPUT_NOISE_STD = float(os.getenv('WIND_TUNED_INPUT_NOISE_STD', '0.01'))
 CHANNEL_DROPOUT = float(os.getenv('WIND_TUNED_CHANNEL_DROPOUT', '0.05'))
 USE_MIXED_PRECISION = os.getenv('WIND_TUNED_MIXED_PRECISION', '1') == '1'
 RUN_ABLATION = os.getenv('WIND_TUNED_RUN_ABLATION', '1') == '1'
+# 第二轮默认复用第一轮结果，仅训练新增分支；每个variant仍可用独立环境变量覆盖。
+RUN_PREVIOUS_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_PREVIOUS_ABLATIONS',
+    '0',
+) == '1'
+RUN_ROUND2_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_ROUND2_ABLATIONS',
+    '1',
+) == '1'
+REUSE_PREVIOUS_ABLATION_RESULTS = os.getenv(
+    'WIND_TUNED_REUSE_PREVIOUS_ABLATION_RESULTS',
+    '1',
+) == '1'
 EXP_WEIGHT_HALFLIFE_STEPS = float(
     os.getenv('WIND_TUNED_EXP_WEIGHT_HALFLIFE_STEPS', '4.0')
 )
@@ -96,6 +125,9 @@ MAX_ALLOWED_NRMSE_DEGRADATION = float(
 ABLATION_VARIANTS = [
     {
         'name': 'baseline',
+        'round': 1,
+        'parent_variant': None,
+        'execution_env': 'WIND_TUNED_RUN_BASELINE',
         'added_module': 'original_tuned_patchtst',
         'use_revin': False,
         'use_cnn_adapter': False,
@@ -104,6 +136,9 @@ ABLATION_VARIANTS = [
     },
     {
         'name': 'revin',
+        'round': 1,
+        'parent_variant': 'baseline',
+        'execution_env': 'WIND_TUNED_RUN_REVIN',
         'added_module': 'power_revin',
         'use_revin': True,
         'use_cnn_adapter': False,
@@ -112,6 +147,9 @@ ABLATION_VARIANTS = [
     },
     {
         'name': 'revin_cnn_adapter',
+        'round': 1,
+        'parent_variant': 'revin',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_CNN_ADAPTER',
         'added_module': 'zero_init_cnn_adapter',
         'use_revin': True,
         'use_cnn_adapter': True,
@@ -120,6 +158,9 @@ ABLATION_VARIANTS = [
     },
     {
         'name': 'revin_cnn_adapter_balanced_loss',
+        'round': 1,
+        'parent_variant': 'revin_cnn_adapter',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_CNN_ADAPTER_BALANCED_LOSS',
         'added_module': 'balanced_loss',
         'use_revin': True,
         'use_cnn_adapter': True,
@@ -128,11 +169,25 @@ ABLATION_VARIANTS = [
     },
     {
         'name': 'revin_cnn_adapter_balanced_loss_swa',
+        'round': 1,
+        'parent_variant': 'revin_cnn_adapter_balanced_loss',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_CNN_ADAPTER_BALANCED_LOSS_SWA',
         'added_module': 'swa',
         'use_revin': True,
         'use_cnn_adapter': True,
         'use_balanced_loss': True,
         'use_swa': True,
+    },
+    {
+        'name': 'revin_balanced_loss',
+        'round': 2,
+        'parent_variant': 'revin',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_BALANCED_LOSS',
+        'added_module': 'balanced_loss_without_cnn_adapter',
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': True,
+        'use_swa': False,
     },
 ]
 
@@ -184,18 +239,53 @@ def get_farm_id(path):
     return os.path.splitext(basename)[0]
 
 
-def get_ablation_variants():
-    requested = os.getenv('WIND_TUNED_ABLATION_VARIANTS', '').strip()
-    if not requested:
-        return ABLATION_VARIANTS
+def parse_env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    normalized = value.strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    raise ValueError(f'环境变量 {name} 应为0/1或true/false，当前为: {value}')
 
-    names = [name.strip() for name in requested.split(',') if name.strip()]
-    variants = [variant for variant in ABLATION_VARIANTS if variant['name'] in names]
-    missing = sorted(set(names) - {variant['name'] for variant in variants})
+
+def get_ablation_execution_plan():
+    requested = os.getenv('WIND_TUNED_ABLATION_VARIANTS', '').strip()
+    requested_names = {
+        name.strip()
+        for name in requested.split(',')
+        if name.strip()
+    }
+    valid_names = {variant['name'] for variant in ABLATION_VARIANTS}
+    missing = sorted(requested_names - valid_names)
     if missing:
-        valid = [variant['name'] for variant in ABLATION_VARIANTS]
-        raise ValueError(f'未知消融variant: {missing}; 可选: {valid}')
-    return variants
+        raise ValueError(
+            f'未知消融variant: {missing}; 可选: {sorted(valid_names)}'
+        )
+
+    plan = []
+    for variant in ABLATION_VARIANTS:
+        if requested:
+            execute = variant['name'] in requested_names
+        else:
+            round_default = (
+                RUN_PREVIOUS_ABLATIONS
+                if variant['round'] == 1
+                else RUN_ROUND2_ABLATIONS
+            )
+            execute = parse_env_bool(variant['execution_env'], round_default)
+        plan.append({**variant, 'execute': execute})
+    return plan
+
+
+def get_ablation_variants():
+    return [
+        variant
+        for variant in get_ablation_execution_plan()
+        if variant['execute']
+    ]
 
 
 def get_adapter_channel_indices(input_cols):
@@ -221,6 +311,59 @@ def make_variant_dirs(variant_name):
     for path in dirs.values():
         os.makedirs(path, exist_ok=True)
     return dirs
+
+
+def load_previous_ablation_results():
+    if not REUSE_PREVIOUS_ABLATION_RESULTS:
+        return []
+
+    metric_paths = []
+    if os.path.exists(ABLATION_ALL_METRICS_PATH):
+        metric_paths.append(ABLATION_ALL_METRICS_PATH)
+    metric_paths.extend(sorted(glob.glob(os.path.join(
+        ABLATION_DIR,
+        'tuned_patchtst_ablation_metrics_farm_*.csv',
+    ))))
+    if not metric_paths:
+        print(f'未找到历史消融结果，将只使用本轮训练结果: {ABLATION_DIR}')
+        return []
+
+    variant_map = {
+        variant['name']: variant
+        for variant in ABLATION_VARIANTS
+    }
+    records_by_key = {}
+    for metric_path in metric_paths:
+        previous = pd.read_csv(metric_path, dtype={'farm_id': str})
+        for record in previous.to_dict('records'):
+            variant = variant_map.get(record.get('variant'))
+            if variant is None:
+                continue
+            record.update({
+                'farm_id': str(record['farm_id']),
+                'round': variant['round'],
+                'parent_variant': variant['parent_variant'],
+                'result_source': 'reused_previous_result',
+            })
+            key = (record['farm_id'], record['variant'])
+            records_by_key[key] = record
+    records = list(records_by_key.values())
+    print(
+        f'已从 {len(metric_paths)} 个CSV加载历史消融结果 '
+        f'{len(records)} 条'
+    )
+    return records
+
+
+def result_artifacts_exist(result):
+    required_paths = [
+        result.get('model_path'),
+        result.get('artifact_path'),
+    ]
+    return all(
+        isinstance(path, str) and path and os.path.exists(path)
+        for path in required_paths
+    )
 
 
 def make_window_targets(features, target, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN,
@@ -1022,7 +1165,11 @@ def save_config():
         'use_mixed_precision': USE_MIXED_PRECISION,
         'use_power_history': USE_POWER_HISTORY,
         'run_ablation': RUN_ABLATION,
+        'run_previous_ablations': RUN_PREVIOUS_ABLATIONS,
+        'run_round2_ablations': RUN_ROUND2_ABLATIONS,
+        'reuse_previous_ablation_results': REUSE_PREVIOUS_ABLATION_RESULTS,
         'ablation_variants': ABLATION_VARIANTS,
+        'ablation_execution_plan': get_ablation_execution_plan(),
         'revin_epsilon': REVIN_EPSILON,
         'cnn_adapter_filters': CNN_ADAPTER_FILTERS,
         'new_ramp_loss_weight': NEW_RAMP_LOSS_WEIGHT,
@@ -1308,6 +1455,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'model_name': TUNED_MODEL_NAME,
         'farm_id': farm_id,
         'ablation_variant': variant_name,
+        'ablation_round': variant['round'],
+        'parent_variant': variant['parent_variant'],
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
@@ -1356,6 +1505,9 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
     result = {
         'farm_id': farm_id,
         'variant': variant_name,
+        'round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'result_source': 'trained_current_run',
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
@@ -1414,6 +1566,9 @@ def promote_selected_variant(train_df, selected_result):
 
     selected_artifact.update({
         'selected_ablation_variant': selected_result['variant'],
+        'selected_ablation_round': selected_result.get('round'),
+        'selected_parent_variant': selected_result.get('parent_variant'),
+        'selected_weight_source': selected_result.get('selected_weight_source'),
         'selected_by': 'validation_composite_score',
         'source_variant_model_path': selected_result['model_path'],
         'source_variant_weights_path': selected_result['best_weights_path'],
@@ -1432,6 +1587,8 @@ def promote_selected_variant(train_df, selected_result):
     selection_record = {
         'farm_id': farm_id,
         'selected_variant': selected_result['variant'],
+        'selected_ablation_round': selected_result.get('round'),
+        'selected_parent_variant': selected_result.get('parent_variant'),
         'selected_weight_source': selected_result['selected_weight_source'],
         'selection_metric': 'val_composite_score',
         'val_composite_score': float(selected_result['val_composite_score']),
@@ -1459,25 +1616,36 @@ def select_variant_for_farm(results):
     if not results:
         raise ValueError('没有可供选择的消融实验结果')
 
+    promotable = [
+        result for result in results
+        if result_artifacts_exist(result)
+    ]
+    if not promotable:
+        raise FileNotFoundError('消融结果存在，但没有可加载的模型与artifact用于晋升')
+    skipped = len(results) - len(promotable)
+    if skipped:
+        print(f'警告: {skipped} 个历史variant缺少模型/artifact，不参与最终晋升')
+
     baseline = next(
-        (result for result in results if result['variant'] == 'baseline'),
+        (result for result in promotable if result['variant'] == 'baseline'),
         None,
     )
-    eligible = list(results)
+    eligible = list(promotable)
     if baseline is not None:
         baseline_nrmse = baseline['val_capacity_normalized_rmse']
         upper_limit = baseline_nrmse * (1.0 + MAX_ALLOWED_NRMSE_DEGRADATION)
         eligible = [
-            result for result in results
+            result for result in promotable
             if result['variant'] == 'baseline'
             or result['val_capacity_normalized_rmse'] <= upper_limit
         ]
     return min(eligible, key=lambda result: result['val_composite_score'])
 
 
-def train_one_farm_ablation(train_file):
+def train_one_farm_ablation(train_file, previous_results=None):
     farm_id = get_farm_id(train_file)
     print(f'\n===== tuned PatchTST 单变量消融 / 风电场 {farm_id} =====')
+    previous_results = previous_results or []
 
     train_df, feature_cols, capacity = load_and_preprocess(train_file, is_train=True)
     features, target, input_cols, target_index, scaler_x, scaler_y = build_scaled_arrays(
@@ -1501,10 +1669,17 @@ def train_one_farm_ablation(train_file):
         f'{[input_cols[index] for index in adapter_channel_indices]}'
     )
 
-    results = []
-    for variant in get_ablation_variants():
-        results.append(
-            train_ablation_variant(
+    result_by_variant = {
+        result['variant']: dict(result)
+        for result in previous_results
+        if str(result.get('farm_id')) == str(farm_id)
+    }
+    trained_results = []
+    for variant in get_ablation_execution_plan():
+        variant_name = variant['name']
+        if variant['execute']:
+            print(f'执行variant训练: {variant_name}')
+            result = train_ablation_variant(
                 farm_id,
                 variant,
                 features,
@@ -1520,6 +1695,23 @@ def train_one_farm_ablation(train_file):
                 feature_cols,
                 capacity,
             )
+            result_by_variant[variant_name] = result
+            trained_results.append(result)
+        elif variant_name in result_by_variant:
+            print(f'复用历史variant结果: {variant_name}')
+        else:
+            print(f'跳过variant且无历史结果: {variant_name}')
+
+    variant_order = [variant['name'] for variant in ABLATION_VARIANTS]
+    results = [
+        result_by_variant[name]
+        for name in variant_order
+        if name in result_by_variant
+    ]
+    if not results:
+        raise ValueError(
+            f'场站 {farm_id} 没有任何可用消融结果；'
+            '请至少启用一个variant或开启历史结果复用'
         )
 
     farm_results = pd.DataFrame(results)
@@ -1536,7 +1728,7 @@ def train_one_farm_ablation(train_file):
         f"场站 {farm_id} 选择variant={selected['variant']}，"
         f"score={selected['val_composite_score']:.6f}"
     )
-    return selected, results
+    return selected, results, trained_results
 
 
 def summarize_ablation(all_results, selected_results):
@@ -1553,11 +1745,16 @@ def summarize_ablation(all_results, selected_results):
         'val_composite_score': 'baseline_score',
         'val_capacity_normalized_rmse': 'baseline_nrmse',
     })
-    previous_mean_score = None
+    variant_map = {
+        variant['name']: variant
+        for variant in ABLATION_VARIANTS
+    }
     for variant in variant_order:
         variant_df = detail[detail['variant'] == variant]
         if variant_df.empty:
             continue
+        variant_config = variant_map[variant]
+        parent_variant = variant_config['parent_variant']
         mean_score = float(variant_df['val_composite_score'].mean())
         compared = variant_df.merge(baseline, on='farm_id', how='left')
         score_delta = compared['val_composite_score'] - compared['baseline_score']
@@ -1566,15 +1763,32 @@ def summarize_ablation(all_results, selected_results):
             / compared['baseline_nrmse']
             - 1.0
         )
+        parent_score_delta = pd.Series(dtype=float)
+        if parent_variant is not None:
+            parent_df = detail[detail['variant'] == parent_variant][
+                ['farm_id', 'val_composite_score']
+            ].rename(columns={'val_composite_score': 'parent_score'})
+            parent_compared = variant_df.merge(parent_df, on='farm_id', how='inner')
+            parent_score_delta = (
+                parent_compared['val_composite_score']
+                - parent_compared['parent_score']
+            )
         rows.append({
             'variant': variant,
+            'round': variant_config['round'],
+            'parent_variant': parent_variant,
             'added_module': variant_df['added_module'].iloc[0],
             'farms': int(len(variant_df)),
             'mean_composite_score': mean_score,
             'incremental_score_delta': (
                 np.nan
-                if previous_mean_score is None
-                else mean_score - previous_mean_score
+                if parent_score_delta.empty
+                else float(parent_score_delta.mean())
+            ),
+            'improved_farms_vs_parent': (
+                0
+                if parent_score_delta.empty
+                else int((parent_score_delta < 0).sum())
             ),
             'mean_score_delta_vs_baseline': float(score_delta.mean()),
             'improved_farms_vs_baseline': int((score_delta < 0).sum()),
@@ -1585,7 +1799,6 @@ def summarize_ablation(all_results, selected_results):
             ),
             'selected_farms': int(selected_names.get(variant, 0)),
         })
-        previous_mean_score = mean_score
 
     summary = pd.DataFrame(rows)
     eligible = summary[summary['passes_nrmse_guardrail']]
@@ -1889,32 +2102,57 @@ def main():
 
     rows = []
     all_ablation_results = []
+    current_run_results = []
     if RUN_ABLATION:
-        print(
-            '启用顺序消融: baseline -> RevIN -> CNN Adapter '
-            '-> balanced loss -> SWA'
-        )
+        execution_plan = get_ablation_execution_plan()
+        print('消融执行计划:')
+        for variant in execution_plan:
+            action = '训练' if variant['execute'] else '复用/跳过'
+            print(
+                f"  round{variant['round']} {variant['name']}: {action} "
+                f"(开关 {variant['execution_env']})"
+            )
+        previous_results = load_previous_ablation_results()
         for train_file in train_files:
-            selected, variant_results = train_one_farm_ablation(train_file)
+            selected, variant_results, trained_results = train_one_farm_ablation(
+                train_file,
+                previous_results=previous_results,
+            )
             rows.append(selected)
             all_ablation_results.extend(variant_results)
+            current_run_results.extend(trained_results)
 
         detail, summary, global_best_variant = summarize_ablation(
             all_ablation_results,
             rows,
         )
-        detail_path = os.path.join(
-            ABLATION_DIR,
-            'tuned_patchtst_ablation_metrics_all_farms.csv',
+        detail.to_csv(
+            ABLATION_ALL_METRICS_PATH,
+            index=False,
+            encoding='utf-8-sig',
         )
-        summary_path = os.path.join(
-            ABLATION_DIR,
-            'tuned_patchtst_ablation_module_summary.csv',
+        summary.to_csv(
+            ABLATION_MODULE_SUMMARY_PATH,
+            index=False,
+            encoding='utf-8-sig',
         )
-        detail.to_csv(detail_path, index=False, encoding='utf-8-sig')
-        summary.to_csv(summary_path, index=False, encoding='utf-8-sig')
-        print(f'消融明细: {detail_path}')
-        print(f'模块贡献汇总: {summary_path}')
+
+        round2_detail = pd.DataFrame(current_run_results)
+        round2_summary = summary[summary['round'] == 2].copy()
+        round2_detail.to_csv(
+            ROUND2_METRICS_PATH,
+            index=False,
+            encoding='utf-8-sig',
+        )
+        round2_summary.to_csv(
+            ROUND2_MODULE_SUMMARY_PATH,
+            index=False,
+            encoding='utf-8-sig',
+        )
+        print(f'合并消融明细: {ABLATION_ALL_METRICS_PATH}')
+        print(f'合并模块贡献汇总: {ABLATION_MODULE_SUMMARY_PATH}')
+        print(f'第二轮训练明细: {ROUND2_METRICS_PATH}')
+        print(f'第二轮模块汇总: {ROUND2_MODULE_SUMMARY_PATH}')
         print(f'跨场站最优variant: {global_best_variant}')
     else:
         print('消融关闭，按原 tuned PatchTST 流程训练')
