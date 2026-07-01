@@ -73,6 +73,36 @@ ROUND2_MODULE_SUMMARY_PATH = os.path.join(
     ABLATION_DIR,
     'tuned_patchtst_ablation_round2_module_summary.csv',
 )
+ROUND3_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round3_metrics_all_farms.csv',
+)
+ROUND3_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round3_module_summary.csv',
+)
+ROUND4_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round4_metrics_all_farms.csv',
+)
+ROUND4_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round4_module_summary.csv',
+)
+ROUND5_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round5_metrics_all_farms.csv',
+)
+ROUND5_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round5_module_summary.csv',
+)
+ROUND_OUTPUT_PATHS = {
+    2: (ROUND2_METRICS_PATH, ROUND2_MODULE_SUMMARY_PATH),
+    3: (ROUND3_METRICS_PATH, ROUND3_MODULE_SUMMARY_PATH),
+    4: (ROUND4_METRICS_PATH, ROUND4_MODULE_SUMMARY_PATH),
+    5: (ROUND5_METRICS_PATH, ROUND5_MODULE_SUMMARY_PATH),
+}
 
 seed = 2026
 BATCH_SIZE = int(os.getenv('WIND_TUNED_BATCH_SIZE', '192'))
@@ -94,13 +124,25 @@ INPUT_NOISE_STD = float(os.getenv('WIND_TUNED_INPUT_NOISE_STD', '0.01'))
 CHANNEL_DROPOUT = float(os.getenv('WIND_TUNED_CHANNEL_DROPOUT', '0.05'))
 USE_MIXED_PRECISION = os.getenv('WIND_TUNED_MIXED_PRECISION', '1') == '1'
 RUN_ABLATION = os.getenv('WIND_TUNED_RUN_ABLATION', '1') == '1'
-# 第二轮默认复用第一轮结果，仅训练新增分支；每个variant仍可用独立环境变量覆盖。
+# 后续轮次默认复用已完成结果，仅训练新增分支；每个variant仍可独立覆盖。
 RUN_PREVIOUS_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_PREVIOUS_ABLATIONS',
     '0',
 ) == '1'
 RUN_ROUND2_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND2_ABLATIONS',
+    '0',
+) == '1'
+RUN_ROUND3_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_ROUND3_ABLATIONS',
+    '1',
+) == '1'
+RUN_ROUND4_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_ROUND4_ABLATIONS',
+    '1',
+) == '1'
+RUN_ROUND5_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_ROUND5_ABLATIONS',
     '1',
 ) == '1'
 REUSE_PREVIOUS_ABLATION_RESULTS = os.getenv(
@@ -117,6 +159,13 @@ NEW_RAMP_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RAMP_WEIGHT', '0.03'))
 NEW_RELATIVE_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RELATIVE_WEIGHT', '0.03'))
 NEW_PHYSICAL_PENALTY_WEIGHT = float(os.getenv('WIND_TUNED_NEW_PHYSICAL_WEIGHT', '0.01'))
 RELATIVE_POWER_FLOOR = float(os.getenv('WIND_TUNED_RELATIVE_FLOOR', '0.05'))
+RMSE_MSE_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_RMSE_MSE_WEIGHT', '0.10'))
+RMSE_HORIZON_END_WEIGHT = float(os.getenv('WIND_TUNED_RMSE_HORIZON_END_WEIGHT', '1.25'))
+MULTI_SEEDS = tuple(
+    int(value.strip())
+    for value in os.getenv('WIND_TUNED_MULTI_SEEDS', '2026,2027,2028').split(',')
+    if value.strip()
+)
 SWA_START_FRACTION = float(os.getenv('WIND_TUNED_SWA_START_FRACTION', '0.50'))
 MAX_ALLOWED_NRMSE_DEGRADATION = float(
     os.getenv('WIND_TUNED_MAX_NRMSE_DEGRADATION', '0.02')
@@ -188,6 +237,48 @@ ABLATION_VARIANTS = [
         'use_cnn_adapter': False,
         'use_balanced_loss': True,
         'use_swa': False,
+    },
+    {
+        'name': 'revin_balanced_loss_multiseed',
+        'round': 3,
+        'parent_variant': 'revin_balanced_loss',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_BALANCED_LOSS_MULTISEED',
+        'added_module': 'multi_seed_and_validation_ensemble',
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': True,
+        'use_rmse_balanced_loss': False,
+        'use_swa': False,
+        'use_distillation': True,
+        'multi_seed': True,
+    },
+    {
+        'name': 'revin_rmse_balanced_loss',
+        'round': 4,
+        'parent_variant': 'revin_balanced_loss',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_RMSE_BALANCED_LOSS',
+        'added_module': 'rmse_balanced_loss',
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': False,
+        'use_rmse_balanced_loss': True,
+        'use_swa': False,
+        'use_distillation': True,
+        'multi_seed': False,
+    },
+    {
+        'name': 'revin_rmse_balanced_loss_no_distill',
+        'round': 5,
+        'parent_variant': 'revin_rmse_balanced_loss',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_RMSE_BALANCED_LOSS_NO_DISTILL',
+        'added_module': 'disable_self_distillation',
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': False,
+        'use_rmse_balanced_loss': True,
+        'use_swa': False,
+        'use_distillation': False,
+        'multi_seed': False,
     },
 ]
 
@@ -270,11 +361,14 @@ def get_ablation_execution_plan():
         if requested:
             execute = variant['name'] in requested_names
         else:
-            round_default = (
-                RUN_PREVIOUS_ABLATIONS
-                if variant['round'] == 1
-                else RUN_ROUND2_ABLATIONS
-            )
+            round_defaults = {
+                1: RUN_PREVIOUS_ABLATIONS,
+                2: RUN_ROUND2_ABLATIONS,
+                3: RUN_ROUND3_ABLATIONS,
+                4: RUN_ROUND4_ABLATIONS,
+                5: RUN_ROUND5_ABLATIONS,
+            }
+            round_default = round_defaults.get(variant['round'], False)
             execute = parse_env_bool(variant['execution_env'], round_default)
         plan.append({**variant, 'execute': execute})
     return plan
@@ -364,6 +458,76 @@ def result_artifacts_exist(result):
         isinstance(path, str) and path and os.path.exists(path)
         for path in required_paths
     )
+
+
+def resolve_training_seed(value, default=seed):
+    if value is None or pd.isna(value):
+        return int(default)
+    return int(value)
+
+
+def load_saved_seed_member_result(farm_id, variant, member_seed):
+    if not REUSE_PREVIOUS_ABLATION_RESULTS:
+        return None
+
+    storage_name = f"{variant['name']}_seed_{member_seed}"
+    dirs = make_variant_dirs(storage_name)
+    artifact_path = os.path.join(
+        dirs['preprocess'],
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}_preprocess.pkl',
+    )
+    if not os.path.exists(artifact_path):
+        return None
+
+    artifact = joblib.load(artifact_path)
+    artifact_seed = resolve_training_seed(
+        artifact.get('training_seed'),
+        member_seed,
+    )
+    model_path = artifact.get('model_path')
+    if artifact_seed != member_seed or not model_path or not os.path.exists(model_path):
+        return None
+    required_metrics = {
+        'val_composite_score',
+        'val_capacity_normalized_rmse',
+    }
+    if not required_metrics.issubset(artifact):
+        return None
+
+    return {
+        'farm_id': str(farm_id),
+        'variant': variant['name'],
+        'storage_variant': storage_name,
+        'round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'result_source': 'reused_seed_member',
+        'added_module': variant['added_module'],
+        'use_revin': variant['use_revin'],
+        'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_balanced_loss': variant['use_balanced_loss'],
+        'use_rmse_balanced_loss': variant.get(
+            'use_rmse_balanced_loss',
+            False,
+        ),
+        'use_swa': variant['use_swa'],
+        'use_distillation': variant.get('use_distillation', True),
+        'training_seed': member_seed,
+        'multi_seed': True,
+        'selected_weight_source': artifact.get(
+            'selected_weight_source',
+            'raw_best',
+        ),
+        'model_path': model_path,
+        'best_weights_path': artifact.get('best_weights_path'),
+        'artifact_path': artifact_path,
+        'history_path': artifact.get('history_path'),
+        'distillation_stats_path': artifact.get('distillation_stats_path'),
+        **{
+            key: value
+            for key, value in artifact.items()
+            if key.startswith('val_')
+        },
+    }
 
 
 def make_window_targets(features, target, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN,
@@ -550,8 +714,9 @@ class TunedPatchTSTLoss(keras.losses.Loss):
                  distill_alpha=DISTILL_ALPHA, zero_scaled=0.0, capacity_scaled=None,
                  physical_penalty_weight=PHYSICAL_PENALTY_WEIGHT,
                  smoothness_weight=SMOOTHNESS_WEIGHT, delta=HUBER_DELTA,
-                 name='tuned_patchtst_loss'):
-        super().__init__(name=name)
+                 name='tuned_patchtst_loss',
+                 reduction=keras.losses.Reduction.AUTO):
+        super().__init__(name=name, reduction=reduction)
         self.forecast_len = forecast_len
         self.horizon_weight_values = (
             list(horizon_weight_values)
@@ -623,8 +788,9 @@ class BalancedTunedPatchTSTLoss(keras.losses.Loss):
                  relative_loss_weight=NEW_RELATIVE_LOSS_WEIGHT,
                  physical_penalty_weight=NEW_PHYSICAL_PENALTY_WEIGHT,
                  relative_power_floor=RELATIVE_POWER_FLOOR,
-                 delta=HUBER_DELTA, name='balanced_tuned_patchtst_loss'):
-        super().__init__(name=name)
+                 delta=HUBER_DELTA, name='balanced_tuned_patchtst_loss',
+                 reduction=keras.losses.Reduction.AUTO):
+        super().__init__(name=name, reduction=reduction)
         self.forecast_len = forecast_len
         self.distill_alpha = float(distill_alpha)
         self.zero_scaled = float(zero_scaled)
@@ -702,6 +868,57 @@ class BalancedTunedPatchTSTLoss(keras.losses.Loss):
 
 
 @keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class RMSEBalancedTunedPatchTSTLoss(BalancedTunedPatchTSTLoss):
+    def __init__(self, forecast_len=FORECAST_LEN, distill_alpha=DISTILL_ALPHA,
+                 zero_scaled=0.0, capacity_scaled=None,
+                 ramp_loss_weight=NEW_RAMP_LOSS_WEIGHT,
+                 relative_loss_weight=NEW_RELATIVE_LOSS_WEIGHT,
+                 physical_penalty_weight=NEW_PHYSICAL_PENALTY_WEIGHT,
+                 relative_power_floor=RELATIVE_POWER_FLOOR,
+                 mse_loss_weight=RMSE_MSE_LOSS_WEIGHT,
+                 horizon_end_weight=RMSE_HORIZON_END_WEIGHT,
+                 delta=HUBER_DELTA, name='rmse_balanced_tuned_patchtst_loss',
+                 reduction=keras.losses.Reduction.AUTO):
+        super().__init__(
+            forecast_len=forecast_len,
+            distill_alpha=distill_alpha,
+            zero_scaled=zero_scaled,
+            capacity_scaled=capacity_scaled,
+            ramp_loss_weight=ramp_loss_weight,
+            relative_loss_weight=relative_loss_weight,
+            physical_penalty_weight=physical_penalty_weight,
+            relative_power_floor=relative_power_floor,
+            delta=delta,
+            name=name,
+            reduction=reduction,
+        )
+        self.mse_loss_weight = float(mse_loss_weight)
+        self.horizon_end_weight = float(horizon_end_weight)
+
+    def call(self, y_true, y_pred):
+        base_loss = super().call(y_true, y_pred)
+        actual = y_true[:, :self.forecast_len]
+        horizon_weight_values = tf.linspace(
+            tf.cast(1.0, y_pred.dtype),
+            tf.cast(self.horizon_end_weight, y_pred.dtype),
+            self.forecast_len,
+        )
+        horizon_weight_values /= tf.reduce_mean(horizon_weight_values)
+        weighted_mse = tf.reduce_mean(
+            horizon_weight_values[tf.newaxis, :] * tf.square(actual - y_pred)
+        )
+        return base_loss + self.mse_loss_weight * weighted_mse
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'mse_loss_weight': self.mse_loss_weight,
+            'horizon_end_weight': self.horizon_end_weight,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
 def actual_mae(y_true, y_pred):
     actual = y_true[:, :FORECAST_LEN]
     return tf.reduce_mean(tf.abs(actual - y_pred))
@@ -770,9 +987,17 @@ def make_optimizer(initial_lr, steps_per_epoch, epochs):
 
 
 def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
-                        epochs, distill_alpha, use_balanced_loss=False):
+                        epochs, distill_alpha, use_balanced_loss=False,
+                        use_rmse_balanced_loss=False):
     zero_scaled, capacity_scaled = scaled_bounds(scaler_y, capacity)
-    if use_balanced_loss:
+    if use_rmse_balanced_loss:
+        loss = RMSEBalancedTunedPatchTSTLoss(
+            forecast_len=FORECAST_LEN,
+            distill_alpha=distill_alpha,
+            zero_scaled=zero_scaled,
+            capacity_scaled=capacity_scaled,
+        )
+    elif use_balanced_loss:
         loss = BalancedTunedPatchTSTLoss(
             forecast_len=FORECAST_LEN,
             distill_alpha=distill_alpha,
@@ -983,8 +1208,8 @@ def aggregate_exponential_weighted_predictions(y_true, y_pred):
     return actual, prediction
 
 
-def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
-    y_pred_scaled = model.predict(val_feature_ds, verbose=0)
+def evaluate_scaled_predictions(y_pred_scaled, y_val, scaler_y, capacity=None):
+    y_pred_scaled = np.asarray(y_pred_scaled)
     y_true = inverse_power(scaler_y, y_val).reshape(y_val.shape)
     y_pred = inverse_power(scaler_y, y_pred_scaled).reshape(y_pred_scaled.shape)
     if capacity is not None:
@@ -1028,6 +1253,16 @@ def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
         'val_weighted_curve_composite_score': weighted_metrics['composite_score'],
         'val_composite_score': float(composite_score),
     }
+
+
+def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
+    y_pred_scaled = model.predict(val_feature_ds, verbose=0)
+    return evaluate_scaled_predictions(
+        y_pred_scaled,
+        y_val,
+        scaler_y,
+        capacity,
+    )
 
 
 def teacher_confidence(y_true, teacher_pred, keep_ratio=TEACHER_KEEP_RATIO):
@@ -1167,6 +1402,9 @@ def save_config():
         'run_ablation': RUN_ABLATION,
         'run_previous_ablations': RUN_PREVIOUS_ABLATIONS,
         'run_round2_ablations': RUN_ROUND2_ABLATIONS,
+        'run_round3_ablations': RUN_ROUND3_ABLATIONS,
+        'run_round4_ablations': RUN_ROUND4_ABLATIONS,
+        'run_round5_ablations': RUN_ROUND5_ABLATIONS,
         'reuse_previous_ablation_results': REUSE_PREVIOUS_ABLATION_RESULTS,
         'ablation_variants': ABLATION_VARIANTS,
         'ablation_execution_plan': get_ablation_execution_plan(),
@@ -1176,6 +1414,9 @@ def save_config():
         'new_relative_loss_weight': NEW_RELATIVE_LOSS_WEIGHT,
         'new_physical_penalty_weight': NEW_PHYSICAL_PENALTY_WEIGHT,
         'relative_power_floor': RELATIVE_POWER_FLOOR,
+        'rmse_mse_loss_weight': RMSE_MSE_LOSS_WEIGHT,
+        'rmse_horizon_end_weight': RMSE_HORIZON_END_WEIGHT,
+        'multi_seeds': list(MULTI_SEEDS),
         'exp_weight_halflife_steps': EXP_WEIGHT_HALFLIFE_STEPS,
         'swa_start_fraction': SWA_START_FRACTION,
         'max_allowed_nrmse_degradation': MAX_ALLOWED_NRMSE_DEGRADATION,
@@ -1189,19 +1430,24 @@ def save_config():
 def train_ablation_variant(farm_id, variant, features, y_train, y_val,
                            train_samples, total_samples, input_cols,
                            target_index, adapter_channel_indices,
-                           scaler_x, scaler_y, feature_cols, capacity):
+                           scaler_x, scaler_y, feature_cols, capacity,
+                           training_seed=None, storage_name=None):
     variant_name = variant['name']
-    dirs = make_variant_dirs(variant_name)
+    training_seed = seed if training_seed is None else int(training_seed)
+    storage_name = storage_name or variant_name
+    dirs = make_variant_dirs(storage_name)
     val_samples = total_samples - train_samples
     steps_per_epoch = int(np.ceil(train_samples / BATCH_SIZE))
 
     keras.backend.clear_session()
-    set_global_seed(seed)
+    set_global_seed(training_seed)
     print(
-        f'\n--- 消融variant={variant_name}: '
+        f'\n--- 消融variant={variant_name}, seed={training_seed}: '
         f"RevIN={variant['use_revin']}, "
         f"CNN Adapter={variant['use_cnn_adapter']}, "
         f"Balanced loss={variant['use_balanced_loss']}, "
+        f"RMSE loss={variant.get('use_rmse_balanced_loss', False)}, "
+        f"Distill={variant.get('use_distillation', True)}, "
         f"SWA={variant['use_swa']} ---"
     )
 
@@ -1240,33 +1486,34 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         COLD_START_EPOCHS,
         distill_alpha=0.0,
         use_balanced_loss=variant['use_balanced_loss'],
+        use_rmse_balanced_loss=variant.get('use_rmse_balanced_loss', False),
     )
     print(f'variant={variant_name}, parameters={model.count_params():,}')
 
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     teacher_weights_path = os.path.join(
         dirs['weights'],
-        f'tuned_patchtst_{variant_name}_teacher_farm_{farm_id}_best.weights.h5',
+        f'tuned_patchtst_{storage_name}_teacher_farm_{farm_id}_best.weights.h5',
     )
     teacher_model_path = os.path.join(
         dirs['teachers'],
-        f'tuned_patchtst_{variant_name}_teacher_farm_{farm_id}.keras',
+        f'tuned_patchtst_{storage_name}_teacher_farm_{farm_id}.keras',
     )
     raw_weights_path = os.path.join(
         dirs['weights'],
-        f'tuned_patchtst_{variant_name}_farm_{farm_id}_raw_best.weights.h5',
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}_raw_best.weights.h5',
     )
     averaged_weights_path = os.path.join(
         dirs['weights'],
-        f'tuned_patchtst_{variant_name}_farm_{farm_id}_swa.weights.h5',
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}_swa.weights.h5',
     )
     final_weights_path = os.path.join(
         dirs['weights'],
-        f'tuned_patchtst_{variant_name}_farm_{farm_id}_best.weights.h5',
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}_best.weights.h5',
     )
     final_model_path = os.path.join(
         dirs['models'],
-        f'tuned_patchtst_{variant_name}_farm_{farm_id}.keras',
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}.keras',
     )
     teacher_log_dir = os.path.join(
         dirs['tensorboard'],
@@ -1277,7 +1524,11 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
     distill_log_dir = os.path.join(
         dirs['tensorboard'],
         f'farm_{farm_id}',
-        'distill',
+        (
+            'distill'
+            if variant.get('use_distillation', True)
+            else 'supervised_continue'
+        ),
         timestamp,
     )
 
@@ -1314,32 +1565,39 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         model.load_weights(teacher_weights_path)
     model.save(teacher_model_path)
 
-    teacher_train_pred = model.predict(train_feature_ds, verbose=0)
-    teacher_val_pred = model.predict(val_feature_ds, verbose=0)
-    train_conf, train_teacher_mae, train_threshold = teacher_confidence(
-        y_train,
-        teacher_train_pred,
-        TEACHER_KEEP_RATIO,
-    )
-    val_conf, val_teacher_mae, val_threshold = teacher_confidence(
-        y_val,
-        teacher_val_pred,
-        TEACHER_KEEP_RATIO,
-    )
-    distill_stats_path = save_distillation_stats(
-        farm_id,
-        train_teacher_mae,
-        train_conf,
-        train_threshold,
-        val_teacher_mae,
-        val_conf,
-        val_threshold,
-        output_dir=dirs['distillation'],
-        filename_prefix=f'tuned_patchtst_{variant_name}',
-    )
-
-    y_train_stage2 = combine_targets(y_train, teacher_train_pred, train_conf)
-    y_val_stage2 = combine_targets(y_val, teacher_val_pred, val_conf)
+    use_distillation = variant.get('use_distillation', True)
+    if use_distillation:
+        teacher_train_pred = model.predict(train_feature_ds, verbose=0)
+        teacher_val_pred = model.predict(val_feature_ds, verbose=0)
+        train_conf, train_teacher_mae, train_threshold = teacher_confidence(
+            y_train,
+            teacher_train_pred,
+            TEACHER_KEEP_RATIO,
+        )
+        val_conf, val_teacher_mae, val_threshold = teacher_confidence(
+            y_val,
+            teacher_val_pred,
+            TEACHER_KEEP_RATIO,
+        )
+        distill_stats_path = save_distillation_stats(
+            farm_id,
+            train_teacher_mae,
+            train_conf,
+            train_threshold,
+            val_teacher_mae,
+            val_conf,
+            val_threshold,
+            output_dir=dirs['distillation'],
+            filename_prefix=f'tuned_patchtst_{storage_name}',
+        )
+        y_train_stage2 = combine_targets(y_train, teacher_train_pred, train_conf)
+        y_val_stage2 = combine_targets(y_val, teacher_val_pred, val_conf)
+        stage2_distill_alpha = DISTILL_ALPHA
+    else:
+        distill_stats_path = None
+        y_train_stage2 = combine_targets(y_train)
+        y_val_stage2 = combine_targets(y_val)
+        stage2_distill_alpha = 0.0
     train_ds_stage2 = make_supervised_dataset(
         features,
         y_train_stage2,
@@ -1361,8 +1619,9 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         DISTILL_LEARNING_RATE,
         steps_per_epoch,
         DISTILL_EPOCHS,
-        distill_alpha=DISTILL_ALPHA,
+        distill_alpha=stage2_distill_alpha,
         use_balanced_loss=variant['use_balanced_loss'],
+        use_rmse_balanced_loss=variant.get('use_rmse_balanced_loss', False),
     )
 
     distill_callbacks = [
@@ -1442,26 +1701,34 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
     )
     histories = [
         ('cold_start', teacher_history),
-        ('distill', distill_history),
+        (
+            'distill' if use_distillation else 'supervised_continue',
+            distill_history,
+        ),
     ]
     history_path, history_plot_path = save_history_artifacts(
         histories,
         farm_id,
         output_dir=dirs['history'],
-        filename_prefix=f'tuned_patchtst_{variant_name}',
+        filename_prefix=f'tuned_patchtst_{storage_name}',
     )
 
     artifact = {
         'model_name': TUNED_MODEL_NAME,
         'farm_id': farm_id,
         'ablation_variant': variant_name,
+        'storage_variant': storage_name,
         'ablation_round': variant['round'],
         'parent_variant': variant['parent_variant'],
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
         'use_balanced_loss': variant['use_balanced_loss'],
+        'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
+        'use_distillation': use_distillation,
+        'training_seed': training_seed,
+        'multi_seed': variant.get('multi_seed', False),
         'selected_weight_source': selected_weight_source,
         'adapter_channel_indices': adapter_channel_indices,
         'feature_cols': feature_cols,
@@ -1491,20 +1758,21 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
         'distillation_stats_path': distill_stats_path,
-        'distill_alpha': DISTILL_ALPHA,
+        'distill_alpha': stage2_distill_alpha,
         'teacher_keep_ratio': TEACHER_KEEP_RATIO,
         'horizon_decay': HORIZON_DECAY,
         **eval_metrics,
     }
     artifact_path = os.path.join(
         dirs['preprocess'],
-        f'tuned_patchtst_{variant_name}_farm_{farm_id}_preprocess.pkl',
+        f'tuned_patchtst_{storage_name}_farm_{farm_id}_preprocess.pkl',
     )
     joblib.dump(artifact, artifact_path)
 
     result = {
         'farm_id': farm_id,
         'variant': variant_name,
+        'storage_variant': storage_name,
         'round': variant['round'],
         'parent_variant': variant['parent_variant'],
         'result_source': 'trained_current_run',
@@ -1512,7 +1780,11 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
         'use_balanced_loss': variant['use_balanced_loss'],
+        'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
+        'use_distillation': use_distillation,
+        'training_seed': training_seed,
+        'multi_seed': variant.get('multi_seed', False),
         'selected_weight_source': selected_weight_source,
         'model_path': final_model_path,
         'best_weights_path': final_weights_path,
@@ -1537,6 +1809,248 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         f"variant={variant_name}: score={eval_metrics['val_composite_score']:.6f}, "
         f"NRMSE={eval_metrics['val_capacity_normalized_rmse']:.6f}, "
         f"SMAPE={eval_metrics['val_stable_smape']:.3f}%"
+    )
+    return result
+
+
+def train_multiseed_ablation_variant(
+        farm_id, variant, parent_result, features, y_train, y_val,
+        train_samples, total_samples, input_cols, target_index,
+        adapter_channel_indices, scaler_x, scaler_y, feature_cols, capacity):
+    if not MULTI_SEEDS:
+        raise ValueError('WIND_TUNED_MULTI_SEEDS至少需要包含一个随机种子')
+
+    member_results = []
+    parent_seed = (
+        resolve_training_seed(parent_result.get('training_seed'), seed)
+        if parent_result
+        else None
+    )
+    for member_seed in MULTI_SEEDS:
+        if (
+            parent_result is not None
+            and member_seed == parent_seed
+            and result_artifacts_exist(parent_result)
+        ):
+            member_result = dict(parent_result)
+            member_result['training_seed'] = member_seed
+            member_result['member_source'] = 'reused_parent_variant'
+            print(
+                f"多seed复用父分支: variant={parent_result['variant']}, "
+                f'seed={member_seed}'
+            )
+        else:
+            member_result = load_saved_seed_member_result(
+                farm_id,
+                variant,
+                member_seed,
+            )
+            if member_result is not None:
+                member_result['member_source'] = 'reused_saved_seed_member'
+                print(
+                    f"多seed复用已保存成员: variant={variant['name']}, "
+                    f'seed={member_seed}'
+                )
+            else:
+                storage_name = f"{variant['name']}_seed_{member_seed}"
+                member_result = train_ablation_variant(
+                    farm_id,
+                    variant,
+                    features,
+                    y_train,
+                    y_val,
+                    train_samples,
+                    total_samples,
+                    input_cols,
+                    target_index,
+                    adapter_channel_indices,
+                    scaler_x,
+                    scaler_y,
+                    feature_cols,
+                    capacity,
+                    training_seed=member_seed,
+                    storage_name=storage_name,
+                )
+                member_result['member_source'] = 'trained_seed_member'
+        member_results.append(member_result)
+
+    val_samples = total_samples - train_samples
+    val_feature_ds = make_feature_dataset(
+        features,
+        train_samples,
+        val_samples,
+    )
+    member_predictions = []
+    for member_result in member_results:
+        keras.backend.clear_session()
+        member_model = keras.models.load_model(
+            member_result['model_path'],
+            compile=False,
+        )
+        member_predictions.append(
+            member_model.predict(val_feature_ds, verbose=0)
+        )
+        del member_model
+
+    ensemble_prediction = np.mean(np.stack(member_predictions, axis=0), axis=0)
+    ensemble_metrics = evaluate_scaled_predictions(
+        ensemble_prediction,
+        y_val,
+        scaler_y,
+        capacity,
+    )
+    best_member = min(
+        member_results,
+        key=lambda result: (
+            result['val_capacity_normalized_rmse'],
+            result['val_composite_score'],
+        ),
+    )
+    use_seed_ensemble = (
+        ensemble_metrics['val_capacity_normalized_rmse']
+        <= best_member['val_capacity_normalized_rmse']
+        and ensemble_metrics['val_composite_score']
+        <= best_member['val_composite_score']
+    )
+    selected_metrics = (
+        ensemble_metrics
+        if use_seed_ensemble
+        else {
+            key: value
+            for key, value in best_member.items()
+            if key.startswith('val_')
+        }
+    )
+    selected_weight_source = (
+        'seed_ensemble'
+        if use_seed_ensemble
+        else f"best_seed_{best_member['training_seed']}"
+    )
+    seed_nrmse_values = np.asarray([
+        result['val_capacity_normalized_rmse']
+        for result in member_results
+    ], dtype=float)
+    seed_score_values = np.asarray([
+        result['val_composite_score']
+        for result in member_results
+    ], dtype=float)
+    seed_statistics = {
+        'seed_nrmse_mean': float(np.mean(seed_nrmse_values)),
+        'seed_nrmse_std': float(np.std(seed_nrmse_values)),
+        'seed_composite_score_mean': float(np.mean(seed_score_values)),
+        'seed_composite_score_std': float(np.std(seed_score_values)),
+    }
+
+    dirs = make_variant_dirs(variant['name'])
+    member_metrics_path = os.path.join(
+        dirs['root'],
+        f"tuned_patchtst_{variant['name']}_seed_metrics_farm_{farm_id}.csv",
+    )
+    member_metric_rows = []
+    for member_result in member_results:
+        member_metric_rows.append({
+            'farm_id': farm_id,
+            'variant': variant['name'],
+            'training_seed': member_result['training_seed'],
+            'member_source': member_result.get('member_source'),
+            'model_path': member_result['model_path'],
+            'artifact_path': member_result['artifact_path'],
+            **{
+                key: value
+                for key, value in member_result.items()
+                if key.startswith('val_')
+            },
+        })
+    member_metric_rows.append({
+        'farm_id': farm_id,
+        'variant': variant['name'],
+        'training_seed': 'ensemble',
+        'member_source': 'mean_prediction',
+        'model_path': '',
+        'artifact_path': '',
+        **ensemble_metrics,
+    })
+    pd.DataFrame(member_metric_rows).to_csv(
+        member_metrics_path,
+        index=False,
+        encoding='utf-8-sig',
+    )
+
+    selected_artifact = joblib.load(best_member['artifact_path'])
+    ensemble_model_paths = [
+        result['model_path']
+        for result in member_results
+    ]
+    selected_artifact.update({
+        'ablation_variant': variant['name'],
+        'storage_variant': variant['name'],
+        'ablation_round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'added_module': variant['added_module'],
+        'use_revin': variant['use_revin'],
+        'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_balanced_loss': variant['use_balanced_loss'],
+        'use_rmse_balanced_loss': variant.get(
+            'use_rmse_balanced_loss',
+            False,
+        ),
+        'use_swa': variant['use_swa'],
+        'use_distillation': variant.get('use_distillation', True),
+        'multi_seed': True,
+        'multi_seed_values': list(MULTI_SEEDS),
+        'use_seed_ensemble': use_seed_ensemble,
+        'ensemble_model_paths': ensemble_model_paths,
+        'ensemble_member_count': len(ensemble_model_paths),
+        'selected_weight_source': selected_weight_source,
+        'seed_member_metrics_path': member_metrics_path,
+        'model_path': best_member['model_path'],
+        'best_weights_path': best_member['best_weights_path'],
+        **seed_statistics,
+        **selected_metrics,
+    })
+    artifact_path = os.path.join(
+        dirs['preprocess'],
+        f"tuned_patchtst_{variant['name']}_farm_{farm_id}_preprocess.pkl",
+    )
+    joblib.dump(selected_artifact, artifact_path)
+
+    result = {
+        'farm_id': farm_id,
+        'variant': variant['name'],
+        'storage_variant': variant['name'],
+        'round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'result_source': 'trained_current_run',
+        'added_module': variant['added_module'],
+        'use_revin': variant['use_revin'],
+        'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_balanced_loss': variant['use_balanced_loss'],
+        'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
+        'use_swa': variant['use_swa'],
+        'use_distillation': variant.get('use_distillation', True),
+        'training_seed': best_member['training_seed'],
+        'multi_seed': True,
+        'multi_seed_values': ','.join(str(value) for value in MULTI_SEEDS),
+        'use_seed_ensemble': use_seed_ensemble,
+        'ensemble_member_count': len(ensemble_model_paths),
+        'selected_weight_source': selected_weight_source,
+        'model_path': best_member['model_path'],
+        'best_weights_path': best_member['best_weights_path'],
+        'artifact_path': artifact_path,
+        'history_path': best_member.get('history_path'),
+        'distillation_stats_path': best_member.get('distillation_stats_path'),
+        'seed_member_metrics_path': member_metrics_path,
+        'train_samples': train_samples,
+        'val_samples': val_samples,
+        'raw_val_composite_score': np.nan,
+        'swa_val_composite_score': np.nan,
+        **seed_statistics,
+        **selected_metrics,
+    }
+    print(
+        f"多seed选择: {selected_weight_source}, "
+        f"score={selected_metrics['val_composite_score']:.6f}, "
+        f"NRMSE={selected_metrics['val_capacity_normalized_rmse']:.6f}"
     )
     return result
 
@@ -1569,6 +2083,11 @@ def promote_selected_variant(train_df, selected_result):
         'selected_ablation_round': selected_result.get('round'),
         'selected_parent_variant': selected_result.get('parent_variant'),
         'selected_weight_source': selected_result.get('selected_weight_source'),
+        'selected_training_seed': selected_result.get('training_seed'),
+        'selected_use_seed_ensemble': selected_result.get(
+            'use_seed_ensemble',
+            False,
+        ),
         'selected_by': 'validation_composite_score',
         'source_variant_model_path': selected_result['model_path'],
         'source_variant_weights_path': selected_result['best_weights_path'],
@@ -1590,6 +2109,11 @@ def promote_selected_variant(train_df, selected_result):
         'selected_ablation_round': selected_result.get('round'),
         'selected_parent_variant': selected_result.get('parent_variant'),
         'selected_weight_source': selected_result['selected_weight_source'],
+        'selected_training_seed': selected_result.get('training_seed'),
+        'selected_use_seed_ensemble': selected_result.get(
+            'use_seed_ensemble',
+            False,
+        ),
         'selection_metric': 'val_composite_score',
         'val_composite_score': float(selected_result['val_composite_score']),
         'val_capacity_normalized_rmse': float(
@@ -1679,22 +2203,41 @@ def train_one_farm_ablation(train_file, previous_results=None):
         variant_name = variant['name']
         if variant['execute']:
             print(f'执行variant训练: {variant_name}')
-            result = train_ablation_variant(
-                farm_id,
-                variant,
-                features,
-                y_train,
-                y_val,
-                train_samples,
-                total_samples,
-                input_cols,
-                target_index,
-                adapter_channel_indices,
-                scaler_x,
-                scaler_y,
-                feature_cols,
-                capacity,
-            )
+            if variant.get('multi_seed', False):
+                result = train_multiseed_ablation_variant(
+                    farm_id,
+                    variant,
+                    result_by_variant.get(variant.get('parent_variant')),
+                    features,
+                    y_train,
+                    y_val,
+                    train_samples,
+                    total_samples,
+                    input_cols,
+                    target_index,
+                    adapter_channel_indices,
+                    scaler_x,
+                    scaler_y,
+                    feature_cols,
+                    capacity,
+                )
+            else:
+                result = train_ablation_variant(
+                    farm_id,
+                    variant,
+                    features,
+                    y_train,
+                    y_val,
+                    train_samples,
+                    total_samples,
+                    input_cols,
+                    target_index,
+                    adapter_channel_indices,
+                    scaler_x,
+                    scaler_y,
+                    feature_cols,
+                    capacity,
+                )
             result_by_variant[variant_name] = result
             trained_results.append(result)
         elif variant_name in result_by_variant:
@@ -1764,14 +2307,27 @@ def summarize_ablation(all_results, selected_results):
             - 1.0
         )
         parent_score_delta = pd.Series(dtype=float)
+        parent_nrmse_delta = pd.Series(dtype=float)
         if parent_variant is not None:
             parent_df = detail[detail['variant'] == parent_variant][
-                ['farm_id', 'val_composite_score']
-            ].rename(columns={'val_composite_score': 'parent_score'})
+                [
+                    'farm_id',
+                    'val_composite_score',
+                    'val_capacity_normalized_rmse',
+                ]
+            ].rename(columns={
+                'val_composite_score': 'parent_score',
+                'val_capacity_normalized_rmse': 'parent_nrmse',
+            })
             parent_compared = variant_df.merge(parent_df, on='farm_id', how='inner')
             parent_score_delta = (
                 parent_compared['val_composite_score']
                 - parent_compared['parent_score']
+            )
+            parent_nrmse_delta = (
+                parent_compared['val_capacity_normalized_rmse']
+                / parent_compared['parent_nrmse']
+                - 1.0
             )
         rows.append({
             'variant': variant,
@@ -1789,6 +2345,16 @@ def summarize_ablation(all_results, selected_results):
                 0
                 if parent_score_delta.empty
                 else int((parent_score_delta < 0).sum())
+            ),
+            'mean_nrmse_change_vs_parent': (
+                np.nan
+                if parent_nrmse_delta.empty
+                else float(parent_nrmse_delta.mean())
+            ),
+            'nrmse_improved_farms_vs_parent': (
+                0
+                if parent_nrmse_delta.empty
+                else int((parent_nrmse_delta < 0).sum())
             ),
             'mean_score_delta_vs_baseline': float(score_delta.mean()),
             'improved_farms_vs_baseline': int((score_delta < 0).sum()),
@@ -2137,22 +2703,27 @@ def main():
             encoding='utf-8-sig',
         )
 
-        round2_detail = pd.DataFrame(current_run_results)
-        round2_summary = summary[summary['round'] == 2].copy()
-        round2_detail.to_csv(
-            ROUND2_METRICS_PATH,
-            index=False,
-            encoding='utf-8-sig',
-        )
-        round2_summary.to_csv(
-            ROUND2_MODULE_SUMMARY_PATH,
-            index=False,
-            encoding='utf-8-sig',
-        )
         print(f'合并消融明细: {ABLATION_ALL_METRICS_PATH}')
         print(f'合并模块贡献汇总: {ABLATION_MODULE_SUMMARY_PATH}')
-        print(f'第二轮训练明细: {ROUND2_METRICS_PATH}')
-        print(f'第二轮模块汇总: {ROUND2_MODULE_SUMMARY_PATH}')
+        for round_number, (metrics_path, round_summary_path) in ROUND_OUTPUT_PATHS.items():
+            round_results = [
+                result for result in current_run_results
+                if int(result['round']) == round_number
+            ]
+            if not round_results:
+                continue
+            pd.DataFrame(round_results).to_csv(
+                metrics_path,
+                index=False,
+                encoding='utf-8-sig',
+            )
+            summary[summary['round'] == round_number].to_csv(
+                round_summary_path,
+                index=False,
+                encoding='utf-8-sig',
+            )
+            print(f'第{round_number}轮训练明细: {metrics_path}')
+            print(f'第{round_number}轮模块汇总: {round_summary_path}')
         print(f'跨场站最优variant: {global_best_variant}')
     else:
         print('消融关闭，按原 tuned PatchTST 流程训练')

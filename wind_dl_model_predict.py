@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import re
 import warnings
@@ -53,6 +54,7 @@ from wind_dl_tuned_patchtst_train import (
     BalancedTunedPatchTSTLoss,
     PowerRevIN,
     PowerRevINDenormalize,
+    RMSEBalancedTunedPatchTSTLoss,
     RepeatLastTarget,
     SelectInputChannels,
     TunedPatchTSTLoss,
@@ -135,6 +137,10 @@ def get_custom_objects():
         'WindTunedPatchTST>TunedPatchTSTLoss': TunedPatchTSTLoss,
         'BalancedTunedPatchTSTLoss': BalancedTunedPatchTSTLoss,
         'WindTunedPatchTST>BalancedTunedPatchTSTLoss': BalancedTunedPatchTSTLoss,
+        'RMSEBalancedTunedPatchTSTLoss': RMSEBalancedTunedPatchTSTLoss,
+        'WindTunedPatchTST>RMSEBalancedTunedPatchTSTLoss': (
+            RMSEBalancedTunedPatchTSTLoss
+        ),
         'PowerRevIN': PowerRevIN,
         'WindTunedPatchTST>PowerRevIN': PowerRevIN,
         'PowerRevINDenormalize': PowerRevINDenormalize,
@@ -199,6 +205,9 @@ def load_artifact(model_name, farm_id):
 def get_tuned_ablation_trace_fields(model_name, artifact):
     if model_name != TUNED_MODEL_NAME:
         return {}
+    multi_seed_values = artifact.get('multi_seed_values')
+    if isinstance(multi_seed_values, (list, tuple)):
+        multi_seed_values = ','.join(str(value) for value in multi_seed_values)
     return {
         'selected_ablation_variant': artifact.get(
             'selected_ablation_variant',
@@ -216,7 +225,24 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
         'use_revin': artifact.get('use_revin', False),
         'use_cnn_adapter': artifact.get('use_cnn_adapter', False),
         'use_balanced_loss': artifact.get('use_balanced_loss', False),
+        'use_rmse_balanced_loss': artifact.get(
+            'use_rmse_balanced_loss',
+            False,
+        ),
         'use_swa': artifact.get('use_swa', False),
+        'use_distillation': artifact.get('use_distillation', True),
+        'multi_seed': artifact.get('multi_seed', False),
+        'multi_seed_values': multi_seed_values,
+        'use_seed_ensemble': artifact.get('use_seed_ensemble', False),
+        'ensemble_member_count': artifact.get('ensemble_member_count', 1),
+        'seed_nrmse_mean': artifact.get('seed_nrmse_mean'),
+        'seed_nrmse_std': artifact.get('seed_nrmse_std'),
+        'seed_composite_score_mean': artifact.get(
+            'seed_composite_score_mean'
+        ),
+        'seed_composite_score_std': artifact.get(
+            'seed_composite_score_std'
+        ),
         'selection_val_composite_score': artifact.get('val_composite_score'),
         'selection_val_capacity_normalized_rmse': artifact.get(
             'val_capacity_normalized_rmse'
@@ -245,6 +271,31 @@ def build_model_from_weights(model_name, artifact):
 
 
 def load_trained_model(model_name, farm_id, artifact):
+    if model_name == TUNED_MODEL_NAME and artifact.get('use_seed_ensemble', False):
+        ensemble_paths = artifact.get('ensemble_model_paths') or []
+        missing_paths = [
+            path for path in ensemble_paths
+            if not os.path.exists(path)
+        ]
+        if not ensemble_paths:
+            raise FileNotFoundError(
+                f'tuned_patchtst 场站 {farm_id} 标记为seed集成，'
+                '但artifact中没有ensemble_model_paths'
+            )
+        if missing_paths:
+            raise FileNotFoundError(
+                f'tuned_patchtst 场站 {farm_id} 缺少seed成员模型: {missing_paths}'
+            )
+        models = [
+            keras.models.load_model(
+                path,
+                custom_objects=get_custom_objects(),
+                compile=False,
+            )
+            for path in ensemble_paths
+        ]
+        return models, json.dumps(ensemble_paths, ensure_ascii=False)
+
     if model_name == PATCHTST_MODEL_NAME:
         model_path = artifact.get('model_path') or os.path.join(
             SAVED_MODEL_DIR,
@@ -642,7 +693,18 @@ def predict_one_farm(model_name, test_file):
     forecast_len = artifact.get('forecast_len', FORECAST_LEN)
 
     pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
-    y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)
+    if isinstance(model, list):
+        print(f'使用 {len(model)} 个seed成员模型进行均值集成')
+        member_predictions = [
+            member_model.predict(pred_ds, verbose=PREDICT_VERBOSE)
+            for member_model in model
+        ]
+        y_pred_scaled = np.mean(
+            np.stack(member_predictions, axis=0),
+            axis=0,
+        )
+    else:
+        y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)
     y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
     if y_pred.shape[0] != n_samples:
         raise ValueError(
@@ -714,6 +776,9 @@ def predict_one_farm(model_name, test_file):
     print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "
           f"RMSE={all_metrics['rmse']:.4f}")
 
+    if isinstance(model, list):
+        for member_model in model:
+            del member_model
     del model
     keras.backend.clear_session()
     return all_metrics, metric_df
