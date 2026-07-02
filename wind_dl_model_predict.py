@@ -51,6 +51,7 @@ from wind_dl_tuned_patchtst_train import (
     TUNED_MODEL_NAME,
     SAVED_MODEL_DIR as TUNED_SAVED_MODEL_DIR,
     WEIGHTS_DIR as TUNED_WEIGHTS_DIR,
+    ActualNRMSE,
     BalancedTunedPatchTSTLoss,
     PowerRevIN,
     PowerRevINDenormalize,
@@ -153,6 +154,8 @@ def get_custom_objects():
         'WindTunedPatchTST>actual_mae': actual_mae,
         'actual_rmse': actual_rmse,
         'WindTunedPatchTST>actual_rmse': actual_rmse,
+        'ActualNRMSE': ActualNRMSE,
+        'WindTunedPatchTST>ActualNRMSE': ActualNRMSE,
         'FixedPositionEmbedding': FixedPositionEmbedding,
         'WindInformer>FixedPositionEmbedding': FixedPositionEmbedding,
         'CircularTokenEmbedding': CircularTokenEmbedding,
@@ -208,6 +211,11 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
     multi_seed_values = artifact.get('multi_seed_values')
     if isinstance(multi_seed_values, (list, tuple)):
         multi_seed_values = ','.join(str(value) for value in multi_seed_values)
+    ensemble_weights = artifact.get('ensemble_weights')
+    if isinstance(ensemble_weights, (list, tuple, np.ndarray)):
+        ensemble_weights = json.dumps(
+            [float(value) for value in ensemble_weights],
+        )
     return {
         'selected_ablation_variant': artifact.get(
             'selected_ablation_variant',
@@ -234,6 +242,7 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
         'multi_seed': artifact.get('multi_seed', False),
         'multi_seed_values': multi_seed_values,
         'use_seed_ensemble': artifact.get('use_seed_ensemble', False),
+        'ensemble_weights': ensemble_weights,
         'ensemble_member_count': artifact.get('ensemble_member_count', 1),
         'seed_nrmse_mean': artifact.get('seed_nrmse_mean'),
         'seed_nrmse_std': artifact.get('seed_nrmse_std'),
@@ -242,6 +251,37 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
         ),
         'seed_composite_score_std': artifact.get(
             'seed_composite_score_std'
+        ),
+        'checkpoint_monitor': artifact.get('checkpoint_monitor'),
+        'rolling_validation': artifact.get('rolling_validation', False),
+        'rolling_fold_count': artifact.get('rolling_fold_count'),
+        'rolling_selected_candidate': artifact.get(
+            'rolling_selected_candidate'
+        ),
+        'rolling_mean_nrmse': artifact.get('rolling_mean_nrmse'),
+        'rolling_worst_nrmse': artifact.get('rolling_worst_nrmse'),
+        'rolling_mean_composite_score': artifact.get(
+            'rolling_mean_composite_score'
+        ),
+        'strict_baseline_fallback_policy': artifact.get(
+            'strict_baseline_fallback_policy',
+            False,
+        ),
+        'baseline_fallback': artifact.get('baseline_fallback', False),
+        'baseline_fallback_reason': artifact.get(
+            'baseline_fallback_reason'
+        ),
+        'candidate_val_composite_score': artifact.get(
+            'candidate_val_composite_score'
+        ),
+        'candidate_val_capacity_normalized_rmse': artifact.get(
+            'candidate_val_capacity_normalized_rmse'
+        ),
+        'baseline_val_composite_score': artifact.get(
+            'baseline_val_composite_score'
+        ),
+        'baseline_val_capacity_normalized_rmse': artifact.get(
+            'baseline_val_capacity_normalized_rmse'
         ),
         'selection_val_composite_score': artifact.get('val_composite_score'),
         'selection_val_capacity_normalized_rmse': artifact.get(
@@ -694,14 +734,45 @@ def predict_one_farm(model_name, test_file):
 
     pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
     if isinstance(model, list):
-        print(f'使用 {len(model)} 个seed成员模型进行均值集成')
+        ensemble_weights = artifact.get('ensemble_weights')
+        if ensemble_weights is None or len(ensemble_weights) == 0:
+            ensemble_weights = np.full(
+                len(model),
+                1.0 / len(model),
+                dtype=np.float64,
+            )
+        else:
+            ensemble_weights = np.asarray(
+                ensemble_weights,
+                dtype=np.float64,
+            )
+            if len(ensemble_weights) != len(model):
+                raise ValueError(
+                    f'tuned_patchtst 场站 {farm_id} 集成权重数量'
+                    f'{len(ensemble_weights)}与模型数量{len(model)}不一致'
+                )
+            if (
+                not np.all(np.isfinite(ensemble_weights))
+                or np.any(ensemble_weights < 0)
+                or ensemble_weights.sum() <= 0
+            ):
+                raise ValueError(
+                    f'tuned_patchtst 场站 {farm_id} 集成权重无效: '
+                    f'{ensemble_weights.tolist()}'
+                )
+            ensemble_weights /= ensemble_weights.sum()
+        print(
+            f'使用 {len(model)} 个seed成员模型加权集成: '
+            f'{ensemble_weights.tolist()}'
+        )
         member_predictions = [
             member_model.predict(pred_ds, verbose=PREDICT_VERBOSE)
             for member_model in model
         ]
-        y_pred_scaled = np.mean(
+        y_pred_scaled = np.tensordot(
+            ensemble_weights,
             np.stack(member_predictions, axis=0),
-            axis=0,
+            axes=(0, 0),
         )
     else:
         y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)

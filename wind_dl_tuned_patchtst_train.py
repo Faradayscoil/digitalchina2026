@@ -10,7 +10,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from scipy.optimize import minimize
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 from tensorflow import keras
 from tensorflow.keras import layers, regularizers
 from tensorflow.keras import mixed_precision
@@ -97,11 +99,20 @@ ROUND5_MODULE_SUMMARY_PATH = os.path.join(
     ABLATION_DIR,
     'tuned_patchtst_ablation_round5_module_summary.csv',
 )
+ROUND6_METRICS_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round6_metrics_all_farms.csv',
+)
+ROUND6_MODULE_SUMMARY_PATH = os.path.join(
+    ABLATION_DIR,
+    'tuned_patchtst_ablation_round6_module_summary.csv',
+)
 ROUND_OUTPUT_PATHS = {
     2: (ROUND2_METRICS_PATH, ROUND2_MODULE_SUMMARY_PATH),
     3: (ROUND3_METRICS_PATH, ROUND3_MODULE_SUMMARY_PATH),
     4: (ROUND4_METRICS_PATH, ROUND4_MODULE_SUMMARY_PATH),
     5: (ROUND5_METRICS_PATH, ROUND5_MODULE_SUMMARY_PATH),
+    6: (ROUND6_METRICS_PATH, ROUND6_MODULE_SUMMARY_PATH),
 }
 
 seed = 2026
@@ -135,14 +146,18 @@ RUN_ROUND2_ABLATIONS = os.getenv(
 ) == '1'
 RUN_ROUND3_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND3_ABLATIONS',
-    '1',
+    '0',
 ) == '1'
 RUN_ROUND4_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND4_ABLATIONS',
-    '1',
+    '0',
 ) == '1'
 RUN_ROUND5_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND5_ABLATIONS',
+    '0',
+) == '1'
+RUN_ROUND6_ABLATIONS = os.getenv(
+    'WIND_TUNED_RUN_ROUND6_ABLATIONS',
     '1',
 ) == '1'
 REUSE_PREVIOUS_ABLATION_RESULTS = os.getenv(
@@ -165,6 +180,31 @@ MULTI_SEEDS = tuple(
     int(value.strip())
     for value in os.getenv('WIND_TUNED_MULTI_SEEDS', '2026,2027,2028').split(',')
     if value.strip()
+)
+ROLLING_FOLDS = int(os.getenv('WIND_TUNED_ROLLING_FOLDS', '3'))
+ROLLING_VALIDATION_SPLIT = float(
+    os.getenv('WIND_TUNED_ROLLING_VALIDATION_SPLIT', str(VALIDATION_SPLIT))
+)
+ROLLING_PURGE_SAMPLES = int(
+    os.getenv('WIND_TUNED_ROLLING_PURGE_SAMPLES', str(FORECAST_LEN - 1))
+)
+ROLLING_MIN_TRAIN_SAMPLES = int(
+    os.getenv('WIND_TUNED_ROLLING_MIN_TRAIN_SAMPLES', '64')
+)
+ROLLING_WORST_FOLD_WEIGHT = float(
+    os.getenv('WIND_TUNED_ROLLING_WORST_FOLD_WEIGHT', '0.50')
+)
+ROLLING_ENSEMBLE_L2 = float(
+    os.getenv('WIND_TUNED_ROLLING_ENSEMBLE_L2', '1e-4')
+)
+ROLLING_WEIGHT_SHRINKAGE = float(
+    os.getenv('WIND_TUNED_ROLLING_WEIGHT_SHRINKAGE', '0.15')
+)
+BASELINE_NRMSE_TOLERANCE = float(
+    os.getenv('WIND_TUNED_BASELINE_NRMSE_TOLERANCE', '0.0')
+)
+BASELINE_COMPOSITE_TOLERANCE = float(
+    os.getenv('WIND_TUNED_BASELINE_COMPOSITE_TOLERANCE', '0.0')
 )
 SWA_START_FRACTION = float(os.getenv('WIND_TUNED_SWA_START_FRACTION', '0.50'))
 MAX_ALLOWED_NRMSE_DEGRADATION = float(
@@ -280,6 +320,27 @@ ABLATION_VARIANTS = [
         'use_distillation': False,
         'multi_seed': False,
     },
+    {
+        'name': 'revin_balanced_loss_rolling_weighted',
+        'round': 6,
+        'parent_variant': 'revin_balanced_loss_multiseed',
+        'execution_env': 'WIND_TUNED_RUN_REVIN_BALANCED_LOSS_ROLLING_WEIGHTED',
+        'added_module': (
+            'rolling_validation_nrmse_checkpoint_'
+            'baseline_fallback_weighted_ensemble'
+        ),
+        'use_revin': True,
+        'use_cnn_adapter': False,
+        'use_balanced_loss': True,
+        'use_rmse_balanced_loss': False,
+        'use_swa': False,
+        'use_distillation': True,
+        'multi_seed': True,
+        'rolling_validation': True,
+        'use_nrmse_checkpoint': True,
+        'validation_weighted_ensemble': True,
+        'strict_baseline_fallback': True,
+    },
 ]
 
 
@@ -342,6 +403,14 @@ def parse_env_bool(name, default):
     raise ValueError(f'环境变量 {name} 应为0/1或true/false，当前为: {value}')
 
 
+def value_is_true(value):
+    if value is None or (not isinstance(value, (list, tuple)) and pd.isna(value)):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
 def get_ablation_execution_plan():
     requested = os.getenv('WIND_TUNED_ABLATION_VARIANTS', '').strip()
     requested_names = {
@@ -367,6 +436,7 @@ def get_ablation_execution_plan():
                 3: RUN_ROUND3_ABLATIONS,
                 4: RUN_ROUND4_ABLATIONS,
                 5: RUN_ROUND5_ABLATIONS,
+                6: RUN_ROUND6_ABLATIONS,
             }
             round_default = round_defaults.get(variant['round'], False)
             execute = parse_env_bool(variant['execution_env'], round_default)
@@ -466,11 +536,11 @@ def resolve_training_seed(value, default=seed):
     return int(value)
 
 
-def load_saved_seed_member_result(farm_id, variant, member_seed):
+def load_saved_variant_member_result(farm_id, variant, storage_name,
+                                     member_seed, expected_metadata=None):
     if not REUSE_PREVIOUS_ABLATION_RESULTS:
         return None
 
-    storage_name = f"{variant['name']}_seed_{member_seed}"
     dirs = make_variant_dirs(storage_name)
     artifact_path = os.path.join(
         dirs['preprocess'],
@@ -487,6 +557,9 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
     model_path = artifact.get('model_path')
     if artifact_seed != member_seed or not model_path or not os.path.exists(model_path):
         return None
+    for key, expected_value in (expected_metadata or {}).items():
+        if artifact.get(key) != expected_value:
+            return None
     required_metrics = {
         'val_composite_score',
         'val_capacity_normalized_rmse',
@@ -523,6 +596,10 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
         'history_path': artifact.get('history_path'),
         'distillation_stats_path': artifact.get('distillation_stats_path'),
         **{
+            key: artifact.get(key)
+            for key in (expected_metadata or {})
+        },
+        **{
             key: value
             for key, value in artifact.items()
             if key.startswith('val_')
@@ -530,18 +607,122 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
     }
 
 
-def make_window_targets(features, target, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN,
-                        validation_split=VALIDATION_SPLIT):
-    n_samples = len(features) - history_len - forecast_len + 1
+def load_saved_seed_member_result(farm_id, variant, member_seed):
+    storage_name = f"{variant['name']}_seed_{member_seed}"
+    return load_saved_variant_member_result(
+        farm_id,
+        variant,
+        storage_name,
+        member_seed,
+    )
+
+
+def make_all_window_targets(target, history_len=HISTORY_LEN,
+                            forecast_len=FORECAST_LEN):
+    n_samples = len(target) - history_len - forecast_len + 1
     if n_samples <= 0:
         raise ValueError('数据量不足，无法构造完整历史窗口和预测窗口')
 
     target_windows = np.lib.stride_tricks.sliding_window_view(target, forecast_len)
-    y = target_windows[history_len:history_len + n_samples].astype(np.float32)
+    return target_windows[
+        history_len:history_len + n_samples
+    ].astype(np.float32)
+
+
+def make_window_targets(features, target, history_len=HISTORY_LEN, forecast_len=FORECAST_LEN,
+                        validation_split=VALIDATION_SPLIT):
+    y = make_all_window_targets(target, history_len, forecast_len)
+    n_samples = len(y)
 
     split_idx = int(n_samples * (1 - validation_split))
     split_idx = max(1, min(split_idx, n_samples - 1))
     return y[:split_idx], y[split_idx:], split_idx, n_samples
+
+
+def make_rolling_origin_folds(total_samples, n_folds=None,
+                              validation_split=None, purge_samples=None,
+                              min_train_samples=None):
+    n_folds = ROLLING_FOLDS if n_folds is None else int(n_folds)
+    validation_split = (
+        ROLLING_VALIDATION_SPLIT
+        if validation_split is None
+        else float(validation_split)
+    )
+    purge_samples = (
+        ROLLING_PURGE_SAMPLES
+        if purge_samples is None
+        else int(purge_samples)
+    )
+    min_train_samples = (
+        ROLLING_MIN_TRAIN_SAMPLES
+        if min_train_samples is None
+        else int(min_train_samples)
+    )
+    if total_samples < 2:
+        raise ValueError('滚动验证至少需要2个窗口样本')
+    if n_folds < 1:
+        raise ValueError('WIND_TUNED_ROLLING_FOLDS至少为1')
+    if not 0 < validation_split < 1:
+        raise ValueError('WIND_TUNED_ROLLING_VALIDATION_SPLIT必须位于(0, 1)')
+
+    validation_samples = max(
+        1,
+        total_samples - int(total_samples * (1.0 - validation_split)),
+    )
+    max_folds = max(
+        0,
+        (total_samples - purge_samples - min_train_samples)
+        // validation_samples,
+    )
+    actual_folds = min(n_folds, max_folds)
+    if actual_folds < 1:
+        raise ValueError(
+            f'样本数{total_samples}不足以构造滚动验证: '
+            f'validation={validation_samples}, purge={purge_samples}, '
+            f'min_train={min_train_samples}'
+        )
+
+    first_validation_start = total_samples - actual_folds * validation_samples
+    folds = []
+    for fold_index in range(actual_folds):
+        val_start = first_validation_start + fold_index * validation_samples
+        val_end = min(val_start + validation_samples, total_samples)
+        train_end = val_start - purge_samples
+        folds.append({
+            'fold': fold_index + 1,
+            'train_start': 0,
+            'train_end': train_end,
+            'val_start': val_start,
+            'val_end': val_end,
+            'train_samples': train_end,
+            'val_samples': val_end - val_start,
+            'purge_samples': purge_samples,
+        })
+    return folds
+
+
+def build_prefix_scaled_arrays(train_df, feature_cols, fit_row_end):
+    input_cols = feature_cols.copy()
+    if USE_POWER_HISTORY and TARGET_COL in train_df.columns:
+        input_cols.append(TARGET_COL)
+    fit_row_end = int(fit_row_end)
+    if fit_row_end < 2 or fit_row_end > len(train_df):
+        raise ValueError(
+            f'滚动fold缩放器拟合边界无效: {fit_row_end}/{len(train_df)}'
+        )
+
+    scaler_x = StandardScaler()
+    scaler_y = StandardScaler()
+    scaler_x.fit(train_df[input_cols].iloc[:fit_row_end].values)
+    scaler_y.fit(train_df[[TARGET_COL]].iloc[:fit_row_end].values)
+    features = scaler_x.transform(
+        train_df[input_cols].values
+    ).astype(np.float32)
+    target = scaler_y.transform(
+        train_df[[TARGET_COL]].values
+    ).ravel().astype(np.float32)
+    target_index = input_cols.index(TARGET_COL) if TARGET_COL in input_cols else None
+    return features, target, input_cols, target_index, scaler_x, scaler_y
 
 
 def combine_targets(y_true, teacher_pred=None, confidence=None):
@@ -561,7 +742,7 @@ def combine_targets(y_true, teacher_pred=None, confidence=None):
 
 def make_supervised_dataset(features, targets, start, sample_count,
                             history_len=HISTORY_LEN, batch_size=BATCH_SIZE,
-                            shuffle=False):
+                            shuffle=False, dataset_seed=None):
     data_slice = features[start:start + sample_count + history_len - 1]
     ds = keras.utils.timeseries_dataset_from_array(
         data=data_slice,
@@ -570,7 +751,7 @@ def make_supervised_dataset(features, targets, start, sample_count,
         sequence_stride=1,
         shuffle=shuffle,
         batch_size=batch_size,
-        seed=seed if shuffle else None,
+        seed=(seed if dataset_seed is None else dataset_seed) if shuffle else None,
     )
     return ds.prefetch(tf.data.AUTOTUNE)
 
@@ -930,6 +1111,35 @@ def actual_rmse(y_true, y_pred):
     return tf.sqrt(tf.reduce_mean(tf.square(actual - y_pred)))
 
 
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class ActualNRMSE(keras.metrics.RootMeanSquaredError):
+    def __init__(self, physical_scale=1.0, normalizer=1.0,
+                 forecast_len=FORECAST_LEN, name='actual_nrmse', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.physical_scale = float(physical_scale)
+        self.normalizer = max(float(normalizer), 1e-6)
+        self.forecast_len = int(forecast_len)
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        actual = y_true[:, :self.forecast_len]
+        return super().update_state(actual, y_pred, sample_weight)
+
+    def result(self):
+        return (
+            super().result()
+            * tf.cast(self.physical_scale / self.normalizer, self.dtype)
+        )
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'physical_scale': self.physical_scale,
+            'normalizer': self.normalizer,
+            'forecast_len': self.forecast_len,
+        })
+        return config
+
+
 def scaled_bounds(scaler_y, capacity=None):
     zero_scaled = float(scaler_y.transform([[0.0]])[0, 0])
     capacity_scaled = None
@@ -990,6 +1200,12 @@ def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
                         epochs, distill_alpha, use_balanced_loss=False,
                         use_rmse_balanced_loss=False):
     zero_scaled, capacity_scaled = scaled_bounds(scaler_y, capacity)
+    physical_scale = float(np.asarray(scaler_y.scale_).reshape(-1)[0])
+    nrmse_normalizer = (
+        float(capacity)
+        if capacity is not None and capacity > 0
+        else physical_scale
+    )
     if use_rmse_balanced_loss:
         loss = RMSEBalancedTunedPatchTSTLoss(
             forecast_len=FORECAST_LEN,
@@ -1015,7 +1231,14 @@ def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
     model.compile(
         optimizer=make_optimizer(initial_lr, steps_per_epoch, epochs),
         loss=loss,
-        metrics=[actual_mae, actual_rmse],
+        metrics=[
+            actual_mae,
+            actual_rmse,
+            ActualNRMSE(
+                physical_scale=physical_scale,
+                normalizer=nrmse_normalizer,
+            ),
+        ],
     )
     return model
 
@@ -1208,10 +1431,9 @@ def aggregate_exponential_weighted_predictions(y_true, y_pred):
     return actual, prediction
 
 
-def evaluate_scaled_predictions(y_pred_scaled, y_val, scaler_y, capacity=None):
-    y_pred_scaled = np.asarray(y_pred_scaled)
-    y_true = inverse_power(scaler_y, y_val).reshape(y_val.shape)
-    y_pred = inverse_power(scaler_y, y_pred_scaled).reshape(y_pred_scaled.shape)
+def evaluate_physical_predictions(y_true, y_pred, capacity=None):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
     if capacity is not None:
         y_pred = np.clip(y_pred, 0, capacity)
     else:
@@ -1255,6 +1477,13 @@ def evaluate_scaled_predictions(y_pred_scaled, y_val, scaler_y, capacity=None):
     }
 
 
+def evaluate_scaled_predictions(y_pred_scaled, y_val, scaler_y, capacity=None):
+    y_pred_scaled = np.asarray(y_pred_scaled)
+    y_true = inverse_power(scaler_y, y_val).reshape(y_val.shape)
+    y_pred = inverse_power(scaler_y, y_pred_scaled).reshape(y_pred_scaled.shape)
+    return evaluate_physical_predictions(y_true, y_pred, capacity)
+
+
 def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
     y_pred_scaled = model.predict(val_feature_ds, verbose=0)
     return evaluate_scaled_predictions(
@@ -1263,6 +1492,143 @@ def evaluate_model(model, val_feature_ds, y_val, scaler_y, capacity=None):
         scaler_y,
         capacity,
     )
+
+
+def combine_member_predictions(member_predictions, weights):
+    predictions = np.asarray(member_predictions, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if predictions.ndim != 3:
+        raise ValueError('成员预测应为[成员, 样本, horizon]三维数组')
+    if len(weights) != predictions.shape[0]:
+        raise ValueError('集成权重数量与成员模型数量不一致')
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError('集成权重必须为有限非负数')
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0:
+        raise ValueError('集成权重之和必须大于0')
+    normalized_weights = weights / weight_sum
+    return np.tensordot(normalized_weights, predictions, axes=(0, 0))
+
+
+def select_rolling_ensemble_weights(fold_truths, fold_member_predictions,
+                                    capacity=None):
+    if not fold_truths or len(fold_truths) != len(fold_member_predictions):
+        raise ValueError('滚动验证真实值与成员预测fold数量不一致')
+    member_count = np.asarray(fold_member_predictions[0]).shape[0]
+    if member_count < 1:
+        raise ValueError('滚动验证集成至少需要一个成员模型')
+
+    uniform = np.full(member_count, 1.0 / member_count, dtype=np.float64)
+    normalizer = capacity if capacity is not None and capacity > 0 else None
+    if normalizer is None:
+        all_truth = np.concatenate([
+            np.asarray(values).reshape(-1)
+            for values in fold_truths
+        ])
+        normalizer = max(
+            float(np.nanmax(all_truth) - np.nanmin(all_truth)),
+            1.0,
+        )
+
+    def objective(weights):
+        fold_mse = []
+        for y_true, member_predictions in zip(
+                fold_truths, fold_member_predictions):
+            prediction = combine_member_predictions(
+                member_predictions,
+                weights,
+            )
+            error_pu = (prediction - y_true) / normalizer
+            fold_mse.append(float(np.mean(np.square(error_pu))))
+        return (
+            float(np.mean(fold_mse))
+            + ROLLING_WORST_FOLD_WEIGHT * float(np.max(fold_mse))
+            + ROLLING_ENSEMBLE_L2 * float(np.sum(np.square(weights - uniform)))
+        )
+
+    optimization = minimize(
+        objective,
+        uniform,
+        method='SLSQP',
+        bounds=[(0.0, 1.0)] * member_count,
+        constraints=[{
+            'type': 'eq',
+            'fun': lambda values: float(np.sum(values) - 1.0),
+        }],
+        options={'maxiter': 500, 'ftol': 1e-12},
+    )
+    optimized = uniform
+    if optimization.success and np.all(np.isfinite(optimization.x)):
+        optimized = np.clip(optimization.x, 0.0, 1.0)
+        optimized /= optimized.sum()
+        shrinkage = min(max(ROLLING_WEIGHT_SHRINKAGE, 0.0), 1.0)
+        optimized = (1.0 - shrinkage) * optimized + shrinkage * uniform
+        optimized /= optimized.sum()
+    else:
+        print(f'滚动集成权重优化失败，回退等权: {optimization.message}')
+
+    candidates = [
+        ('optimized_weighted', optimized),
+        ('equal_weighted', uniform),
+    ]
+    for member_index in range(member_count):
+        one_hot = np.zeros(member_count, dtype=np.float64)
+        one_hot[member_index] = 1.0
+        candidates.append((f'seed_member_{member_index + 1}', one_hot))
+
+    candidate_rows = []
+    candidate_details = []
+    for candidate_name, weights in candidates:
+        fold_metrics = []
+        for fold_index, (y_true, member_predictions) in enumerate(zip(
+                fold_truths, fold_member_predictions), start=1):
+            prediction = combine_member_predictions(
+                member_predictions,
+                weights,
+            )
+            metrics = evaluate_physical_predictions(
+                y_true,
+                prediction,
+                capacity,
+            )
+            fold_metrics.append(metrics)
+            candidate_rows.append({
+                'candidate': candidate_name,
+                'fold': fold_index,
+                'weights': json.dumps(weights.tolist()),
+                **metrics,
+            })
+        mean_nrmse = float(np.mean([
+            metrics['val_capacity_normalized_rmse']
+            for metrics in fold_metrics
+        ]))
+        worst_nrmse = float(np.max([
+            metrics['val_capacity_normalized_rmse']
+            for metrics in fold_metrics
+        ]))
+        mean_composite = float(np.mean([
+            metrics['val_composite_score']
+            for metrics in fold_metrics
+        ]))
+        candidate_details.append({
+            'candidate': candidate_name,
+            'weights': weights,
+            'rolling_mean_nrmse': mean_nrmse,
+            'rolling_worst_nrmse': worst_nrmse,
+            'rolling_mean_composite_score': mean_composite,
+            'rolling_robust_nrmse_score': (
+                mean_nrmse + ROLLING_WORST_FOLD_WEIGHT * worst_nrmse
+            ),
+        })
+
+    selected = min(
+        candidate_details,
+        key=lambda item: (
+            item['rolling_robust_nrmse_score'],
+            item['rolling_mean_composite_score'],
+        ),
+    )
+    return selected, candidate_rows, candidate_details
 
 
 def teacher_confidence(y_true, teacher_pred, keep_ratio=TEACHER_KEEP_RATIO):
@@ -1405,6 +1771,7 @@ def save_config():
         'run_round3_ablations': RUN_ROUND3_ABLATIONS,
         'run_round4_ablations': RUN_ROUND4_ABLATIONS,
         'run_round5_ablations': RUN_ROUND5_ABLATIONS,
+        'run_round6_ablations': RUN_ROUND6_ABLATIONS,
         'reuse_previous_ablation_results': REUSE_PREVIOUS_ABLATION_RESULTS,
         'ablation_variants': ABLATION_VARIANTS,
         'ablation_execution_plan': get_ablation_execution_plan(),
@@ -1417,6 +1784,15 @@ def save_config():
         'rmse_mse_loss_weight': RMSE_MSE_LOSS_WEIGHT,
         'rmse_horizon_end_weight': RMSE_HORIZON_END_WEIGHT,
         'multi_seeds': list(MULTI_SEEDS),
+        'rolling_folds': ROLLING_FOLDS,
+        'rolling_validation_split': ROLLING_VALIDATION_SPLIT,
+        'rolling_purge_samples': ROLLING_PURGE_SAMPLES,
+        'rolling_min_train_samples': ROLLING_MIN_TRAIN_SAMPLES,
+        'rolling_worst_fold_weight': ROLLING_WORST_FOLD_WEIGHT,
+        'rolling_ensemble_l2': ROLLING_ENSEMBLE_L2,
+        'rolling_weight_shrinkage': ROLLING_WEIGHT_SHRINKAGE,
+        'baseline_nrmse_tolerance': BASELINE_NRMSE_TOLERANCE,
+        'baseline_composite_tolerance': BASELINE_COMPOSITE_TOLERANCE,
         'exp_weight_halflife_steps': EXP_WEIGHT_HALFLIFE_STEPS,
         'swa_start_fraction': SWA_START_FRACTION,
         'max_allowed_nrmse_degradation': MAX_ALLOWED_NRMSE_DEGRADATION,
@@ -1431,13 +1807,31 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
                            train_samples, total_samples, input_cols,
                            target_index, adapter_channel_indices,
                            scaler_x, scaler_y, feature_cols, capacity,
-                           training_seed=None, storage_name=None):
+                           training_seed=None, storage_name=None,
+                           val_start=None, training_metadata=None):
     variant_name = variant['name']
     training_seed = seed if training_seed is None else int(training_seed)
     storage_name = storage_name or variant_name
+    val_start = train_samples if val_start is None else int(val_start)
+    training_metadata = dict(training_metadata or {})
     dirs = make_variant_dirs(storage_name)
-    val_samples = total_samples - train_samples
+    val_samples = len(y_val)
+    if len(y_train) != train_samples:
+        raise ValueError(
+            f'{variant_name}训练target数量不匹配: '
+            f'{len(y_train)} vs {train_samples}'
+        )
+    if val_start < train_samples:
+        raise ValueError(
+            f'{variant_name}验证起点不能早于训练终点: '
+            f'{val_start} < {train_samples}'
+        )
     steps_per_epoch = int(np.ceil(train_samples / BATCH_SIZE))
+    checkpoint_monitor = (
+        'val_actual_nrmse'
+        if variant.get('use_nrmse_checkpoint', False)
+        else 'val_loss'
+    )
 
     keras.backend.clear_session()
     set_global_seed(training_seed)
@@ -1448,7 +1842,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         f"Balanced loss={variant['use_balanced_loss']}, "
         f"RMSE loss={variant.get('use_rmse_balanced_loss', False)}, "
         f"Distill={variant.get('use_distillation', True)}, "
-        f"SWA={variant['use_swa']} ---"
+        f"SWA={variant['use_swa']}, "
+        f'checkpoint={checkpoint_monitor} ---'
     )
 
     y_train_stage1 = combine_targets(y_train)
@@ -1459,16 +1854,17 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         start=0,
         sample_count=train_samples,
         shuffle=True,
+        dataset_seed=training_seed,
     )
     val_ds_stage1 = make_supervised_dataset(
         features,
         y_val_stage1,
-        start=train_samples,
+        start=val_start,
         sample_count=val_samples,
         shuffle=False,
     )
     train_feature_ds = make_feature_dataset(features, 0, train_samples)
-    val_feature_ds = make_feature_dataset(features, train_samples, val_samples)
+    val_feature_ds = make_feature_dataset(features, val_start, val_samples)
 
     model = build_tuned_patchtst_model(
         len(input_cols),
@@ -1541,14 +1937,16 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
             profile_batch=0,
         ),
         keras.callbacks.EarlyStopping(
-            monitor='val_loss',
+            monitor=checkpoint_monitor,
+            mode='min',
             patience=8,
             restore_best_weights=True,
             verbose=1,
         ),
         keras.callbacks.ModelCheckpoint(
             teacher_weights_path,
-            monitor='val_loss',
+            monitor=checkpoint_monitor,
+            mode='min',
             save_best_only=True,
             save_weights_only=True,
             verbose=1,
@@ -1604,11 +2002,12 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         start=0,
         sample_count=train_samples,
         shuffle=True,
+        dataset_seed=training_seed,
     )
     val_ds_stage2 = make_supervised_dataset(
         features,
         y_val_stage2,
-        start=train_samples,
+        start=val_start,
         sample_count=val_samples,
         shuffle=False,
     )
@@ -1633,14 +2032,16 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
             profile_batch=0,
         ),
         keras.callbacks.EarlyStopping(
-            monitor='val_loss',
+            monitor=checkpoint_monitor,
+            mode='min',
             patience=10,
             restore_best_weights=True,
             verbose=1,
         ),
         keras.callbacks.ModelCheckpoint(
             raw_weights_path,
-            monitor='val_loss',
+            monitor=checkpoint_monitor,
+            mode='min',
             save_best_only=True,
             save_weights_only=True,
             verbose=1,
@@ -1729,6 +2130,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'use_distillation': use_distillation,
         'training_seed': training_seed,
         'multi_seed': variant.get('multi_seed', False),
+        'checkpoint_monitor': checkpoint_monitor,
+        'validation_start_sample': val_start,
         'selected_weight_source': selected_weight_source,
         'adapter_channel_indices': adapter_channel_indices,
         'feature_cols': feature_cols,
@@ -1763,6 +2166,7 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'horizon_decay': HORIZON_DECAY,
         **eval_metrics,
     }
+    artifact.update(training_metadata)
     artifact_path = os.path.join(
         dirs['preprocess'],
         f'tuned_patchtst_{storage_name}_farm_{farm_id}_preprocess.pkl',
@@ -1785,6 +2189,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'use_distillation': use_distillation,
         'training_seed': training_seed,
         'multi_seed': variant.get('multi_seed', False),
+        'checkpoint_monitor': checkpoint_monitor,
+        'validation_start_sample': val_start,
         'selected_weight_source': selected_weight_source,
         'model_path': final_model_path,
         'best_weights_path': final_weights_path,
@@ -1805,6 +2211,7 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         ),
         **eval_metrics,
     }
+    result.update(training_metadata)
     print(
         f"variant={variant_name}: score={eval_metrics['val_composite_score']:.6f}, "
         f"NRMSE={eval_metrics['val_capacity_normalized_rmse']:.6f}, "
@@ -2055,6 +2462,414 @@ def train_multiseed_ablation_variant(
     return result
 
 
+def train_rolling_weighted_ablation_variant(
+        farm_id, variant, baseline_result, train_df, feature_cols, capacity):
+    if not MULTI_SEEDS:
+        raise ValueError('滚动加权实验至少需要一个随机种子')
+    if baseline_result is None or not result_artifacts_exist(baseline_result):
+        raise FileNotFoundError(
+            f'场站{farm_id}缺少可回退的baseline模型与artifact'
+        )
+
+    total_samples = len(train_df) - HISTORY_LEN - FORECAST_LEN + 1
+    folds = make_rolling_origin_folds(total_samples)
+    print(
+        f"round6滚动验证: folds={len(folds)}, seeds={list(MULTI_SEEDS)}, "
+        f'purge={ROLLING_PURGE_SAMPLES}'
+    )
+
+    fold_truths = []
+    fold_member_predictions = []
+    member_metric_rows = []
+    latest_fold_context = None
+
+    for fold in folds:
+        fit_row_end = (
+            HISTORY_LEN
+            + fold['train_end']
+            + FORECAST_LEN
+            - 1
+        )
+        (
+            fold_features,
+            fold_target,
+            input_cols,
+            target_index,
+            scaler_x,
+            scaler_y,
+        ) = build_prefix_scaled_arrays(
+            train_df,
+            feature_cols,
+            fit_row_end,
+        )
+        y_all = make_all_window_targets(fold_target)
+        y_train = y_all[:fold['train_end']]
+        y_val = y_all[fold['val_start']:fold['val_end']]
+        adapter_channel_indices = get_adapter_channel_indices(input_cols)
+        fold_metadata = {
+            'rolling_fold': fold['fold'],
+            'rolling_train_end': fold['train_end'],
+            'rolling_val_start': fold['val_start'],
+            'rolling_val_end': fold['val_end'],
+            'rolling_purge_samples': fold['purge_samples'],
+            'rolling_scaler_fit_row_end': fit_row_end,
+            'rolling_fold_count': len(folds),
+        }
+
+        members = []
+        for member_seed in MULTI_SEEDS:
+            storage_name = (
+                f"{variant['name']}_fold_{fold['fold']}_seed_{member_seed}"
+            )
+            member_result = load_saved_variant_member_result(
+                farm_id,
+                variant,
+                storage_name,
+                member_seed,
+                expected_metadata=fold_metadata,
+            )
+            if member_result is not None:
+                member_result['member_source'] = 'reused_rolling_member'
+                print(
+                    f"复用滚动成员: fold={fold['fold']}, "
+                    f'seed={member_seed}'
+                )
+            else:
+                member_result = train_ablation_variant(
+                    farm_id,
+                    variant,
+                    fold_features,
+                    y_train,
+                    y_val,
+                    fold['train_samples'],
+                    total_samples,
+                    input_cols,
+                    target_index,
+                    adapter_channel_indices,
+                    scaler_x,
+                    scaler_y,
+                    feature_cols,
+                    capacity,
+                    training_seed=member_seed,
+                    storage_name=storage_name,
+                    val_start=fold['val_start'],
+                    training_metadata=fold_metadata,
+                )
+                member_result['member_source'] = 'trained_rolling_member'
+            members.append(member_result)
+            member_metric_rows.append({
+                'farm_id': farm_id,
+                'variant': variant['name'],
+                'fold': fold['fold'],
+                'training_seed': member_seed,
+                'member_source': member_result.get('member_source'),
+                'model_path': member_result['model_path'],
+                'artifact_path': member_result['artifact_path'],
+                **{
+                    key: value
+                    for key, value in member_result.items()
+                    if key.startswith('val_')
+                },
+            })
+
+        val_feature_ds = make_feature_dataset(
+            fold_features,
+            fold['val_start'],
+            fold['val_samples'],
+        )
+        predictions = []
+        for member_result in members:
+            keras.backend.clear_session()
+            member_model = keras.models.load_model(
+                member_result['model_path'],
+                compile=False,
+            )
+            prediction_scaled = member_model.predict(
+                val_feature_ds,
+                verbose=0,
+            )
+            prediction = inverse_power(
+                scaler_y,
+                prediction_scaled,
+            ).reshape(prediction_scaled.shape)
+            if capacity is not None:
+                prediction = np.clip(prediction, 0, capacity)
+            else:
+                prediction = np.clip(prediction, 0, None)
+            predictions.append(prediction)
+            del member_model
+
+        y_true = inverse_power(
+            scaler_y,
+            y_val,
+        ).reshape(y_val.shape)
+        fold_truths.append(y_true)
+        fold_member_predictions.append(np.stack(predictions, axis=0))
+        latest_fold_context = {
+            'fold': fold,
+            'members': members,
+            'truth': y_true,
+            'member_predictions': np.stack(predictions, axis=0),
+        }
+
+    selected_weights, candidate_rows, candidate_details = (
+        select_rolling_ensemble_weights(
+            fold_truths,
+            fold_member_predictions,
+            capacity,
+        )
+    )
+    ensemble_weights = np.asarray(
+        selected_weights['weights'],
+        dtype=np.float64,
+    )
+    latest_prediction = combine_member_predictions(
+        latest_fold_context['member_predictions'],
+        ensemble_weights,
+    )
+    candidate_metrics = evaluate_physical_predictions(
+        latest_fold_context['truth'],
+        latest_prediction,
+        capacity,
+    )
+
+    baseline_nrmse = float(
+        baseline_result['val_capacity_normalized_rmse']
+    )
+    baseline_score = float(baseline_result['val_composite_score'])
+    nrmse_limit = baseline_nrmse * (1.0 + BASELINE_NRMSE_TOLERANCE)
+    score_limit = baseline_score * (1.0 + BASELINE_COMPOSITE_TOLERANCE)
+    nrmse_pass = (
+        candidate_metrics['val_capacity_normalized_rmse'] <= nrmse_limit
+    )
+    composite_pass = candidate_metrics['val_composite_score'] <= score_limit
+    fallback_to_baseline = not (nrmse_pass and composite_pass)
+    fallback_reason = None
+    if fallback_to_baseline:
+        failed_checks = []
+        if not nrmse_pass:
+            failed_checks.append('nrmse')
+        if not composite_pass:
+            failed_checks.append('composite')
+        fallback_reason = '+'.join(failed_checks)
+
+    dirs = make_variant_dirs(variant['name'])
+    member_metrics_path = os.path.join(
+        dirs['root'],
+        f"tuned_patchtst_{variant['name']}_rolling_members_farm_{farm_id}.csv",
+    )
+    pd.DataFrame(member_metric_rows).to_csv(
+        member_metrics_path,
+        index=False,
+        encoding='utf-8-sig',
+    )
+    candidate_metrics_path = os.path.join(
+        dirs['root'],
+        f"tuned_patchtst_{variant['name']}_ensemble_candidates_farm_{farm_id}.csv",
+    )
+    candidate_frame = pd.DataFrame(candidate_rows)
+    candidate_frame.insert(0, 'farm_id', farm_id)
+    candidate_frame['selected_candidate'] = (
+        candidate_frame['candidate'] == selected_weights['candidate']
+    )
+    candidate_frame.to_csv(
+        candidate_metrics_path,
+        index=False,
+        encoding='utf-8-sig',
+    )
+
+    latest_members = latest_fold_context['members']
+    highest_weight_index = int(np.argmax(ensemble_weights))
+    candidate_source_result = latest_members[highest_weight_index]
+    if fallback_to_baseline:
+        source_result = baseline_result
+        selected_artifact = joblib.load(baseline_result['artifact_path'])
+        selected_metrics = {
+            key: value
+            for key, value in baseline_result.items()
+            if key.startswith('val_')
+        }
+        selected_weight_source = 'baseline_fallback'
+        deployed_model_paths = []
+        deployed_weights = []
+    else:
+        source_result = candidate_source_result
+        selected_artifact = joblib.load(
+            candidate_source_result['artifact_path']
+        )
+        selected_metrics = candidate_metrics
+        selected_weight_source = (
+            f"rolling_{selected_weights['candidate']}"
+        )
+        deployed_model_paths = [
+            result['model_path']
+            for result in latest_members
+        ]
+        deployed_weights = ensemble_weights.tolist()
+
+    rolling_metadata = {
+        'rolling_validation': True,
+        'rolling_fold_count': len(folds),
+        'rolling_fold_definitions': folds,
+        'rolling_selected_candidate': selected_weights['candidate'],
+        'rolling_mean_nrmse': selected_weights['rolling_mean_nrmse'],
+        'rolling_worst_nrmse': selected_weights['rolling_worst_nrmse'],
+        'rolling_mean_composite_score': (
+            selected_weights['rolling_mean_composite_score']
+        ),
+        'rolling_robust_nrmse_score': (
+            selected_weights['rolling_robust_nrmse_score']
+        ),
+        'rolling_member_metrics_path': member_metrics_path,
+        'rolling_candidate_metrics_path': candidate_metrics_path,
+        'candidate_val_composite_score': (
+            candidate_metrics['val_composite_score']
+        ),
+        'candidate_val_capacity_normalized_rmse': (
+            candidate_metrics['val_capacity_normalized_rmse']
+        ),
+        'baseline_val_composite_score': baseline_score,
+        'baseline_val_capacity_normalized_rmse': baseline_nrmse,
+        'baseline_fallback': fallback_to_baseline,
+        'baseline_fallback_reason': fallback_reason,
+        'baseline_nrmse_tolerance': BASELINE_NRMSE_TOLERANCE,
+        'baseline_composite_tolerance': BASELINE_COMPOSITE_TOLERANCE,
+    }
+    latest_nrmse_values = np.asarray([
+        result['val_capacity_normalized_rmse']
+        for result in latest_members
+    ], dtype=float)
+    latest_score_values = np.asarray([
+        result['val_composite_score']
+        for result in latest_members
+    ], dtype=float)
+    seed_statistics = {
+        'seed_nrmse_mean': float(np.mean(latest_nrmse_values)),
+        'seed_nrmse_std': float(np.std(latest_nrmse_values)),
+        'seed_composite_score_mean': float(np.mean(latest_score_values)),
+        'seed_composite_score_std': float(np.std(latest_score_values)),
+    }
+
+    selected_artifact.update({
+        'ablation_variant': variant['name'],
+        'storage_variant': variant['name'],
+        'ablation_round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'added_module': variant['added_module'],
+        'candidate_use_revin': variant['use_revin'],
+        'candidate_use_cnn_adapter': variant['use_cnn_adapter'],
+        'candidate_use_balanced_loss': variant['use_balanced_loss'],
+        'candidate_use_distillation': variant.get('use_distillation', True),
+        'checkpoint_monitor': 'val_actual_nrmse',
+        'strict_baseline_fallback_policy': True,
+        'multi_seed': not fallback_to_baseline,
+        'multi_seed_values': list(MULTI_SEEDS),
+        'use_seed_ensemble': not fallback_to_baseline,
+        'ensemble_model_paths': deployed_model_paths,
+        'ensemble_weights': deployed_weights,
+        'ensemble_seed_order': list(MULTI_SEEDS),
+        'ensemble_member_count': len(deployed_model_paths),
+        'selected_weight_source': selected_weight_source,
+        'model_path': source_result['model_path'],
+        'best_weights_path': source_result['best_weights_path'],
+        **seed_statistics,
+        **rolling_metadata,
+        **selected_metrics,
+    })
+    artifact_path = os.path.join(
+        dirs['preprocess'],
+        f"tuned_patchtst_{variant['name']}_farm_{farm_id}_preprocess.pkl",
+    )
+    joblib.dump(selected_artifact, artifact_path)
+
+    selection_path = os.path.join(
+        dirs['root'],
+        f"tuned_patchtst_{variant['name']}_selection_farm_{farm_id}.json",
+    )
+    with open(selection_path, 'w', encoding='utf-8') as file:
+        json.dump({
+            'farm_id': farm_id,
+            'variant': variant['name'],
+            'selected_candidate': selected_weights['candidate'],
+            'ensemble_weights': ensemble_weights.tolist(),
+            'ensemble_seed_order': list(MULTI_SEEDS),
+            'fallback_to_baseline': fallback_to_baseline,
+            'fallback_reason': fallback_reason,
+            'candidate_val_nrmse': (
+                candidate_metrics['val_capacity_normalized_rmse']
+            ),
+            'baseline_val_nrmse': baseline_nrmse,
+            'candidate_val_composite_score': (
+                candidate_metrics['val_composite_score']
+            ),
+            'baseline_val_composite_score': baseline_score,
+            'rolling_candidates': [
+                {
+                    **{
+                        key: value
+                        for key, value in detail.items()
+                        if key != 'weights'
+                    },
+                    'weights': detail['weights'].tolist(),
+                }
+                for detail in candidate_details
+            ],
+        }, file, ensure_ascii=False, indent=2)
+
+    result = {
+        'farm_id': farm_id,
+        'variant': variant['name'],
+        'storage_variant': variant['name'],
+        'round': variant['round'],
+        'parent_variant': variant['parent_variant'],
+        'result_source': 'trained_current_run',
+        'added_module': variant['added_module'],
+        'use_revin': selected_artifact.get('use_revin', False),
+        'use_cnn_adapter': selected_artifact.get('use_cnn_adapter', False),
+        'use_balanced_loss': selected_artifact.get(
+            'use_balanced_loss',
+            False,
+        ),
+        'use_rmse_balanced_loss': selected_artifact.get(
+            'use_rmse_balanced_loss',
+            False,
+        ),
+        'use_swa': selected_artifact.get('use_swa', False),
+        'use_distillation': selected_artifact.get(
+            'use_distillation',
+            True,
+        ),
+        'training_seed': source_result.get('training_seed', seed),
+        'multi_seed': not fallback_to_baseline,
+        'multi_seed_values': ','.join(str(value) for value in MULTI_SEEDS),
+        'use_seed_ensemble': not fallback_to_baseline,
+        'ensemble_weights': json.dumps(deployed_weights),
+        'ensemble_member_count': len(deployed_model_paths),
+        'selected_weight_source': selected_weight_source,
+        'strict_baseline_fallback_policy': True,
+        'model_path': source_result['model_path'],
+        'best_weights_path': source_result['best_weights_path'],
+        'artifact_path': artifact_path,
+        'selection_path': selection_path,
+        'history_path': source_result.get('history_path'),
+        'distillation_stats_path': source_result.get(
+            'distillation_stats_path'
+        ),
+        'train_samples': latest_fold_context['fold']['train_samples'],
+        'val_samples': latest_fold_context['fold']['val_samples'],
+        **seed_statistics,
+        **rolling_metadata,
+        **selected_metrics,
+    }
+    print(
+        f"round6选择: {selected_weight_source}, "
+        f"NRMSE={float(result['val_capacity_normalized_rmse']):.6f}, "
+        f"score={float(result['val_composite_score']):.6f}, "
+        f'fallback={fallback_to_baseline}'
+    )
+    return result
+
+
 def promote_selected_variant(train_df, selected_result):
     farm_id = str(selected_result['farm_id'])
     selected_artifact = joblib.load(selected_result['artifact_path'])
@@ -2078,6 +2893,13 @@ def promote_selected_variant(train_df, selected_result):
     model.save(canonical_model_path)
     model.save_weights(canonical_weights_path)
 
+    selected_by = (
+        'rolling_nrmse_guarded_policy'
+        if value_is_true(
+            selected_result.get('strict_baseline_fallback_policy', False)
+        )
+        else 'validation_composite_score'
+    )
     selected_artifact.update({
         'selected_ablation_variant': selected_result['variant'],
         'selected_ablation_round': selected_result.get('round'),
@@ -2088,7 +2910,7 @@ def promote_selected_variant(train_df, selected_result):
             'use_seed_ensemble',
             False,
         ),
-        'selected_by': 'validation_composite_score',
+        'selected_by': selected_by,
         'source_variant_model_path': selected_result['model_path'],
         'source_variant_weights_path': selected_result['best_weights_path'],
         'model_path': canonical_model_path,
@@ -2114,7 +2936,11 @@ def promote_selected_variant(train_df, selected_result):
             'use_seed_ensemble',
             False,
         ),
-        'selection_metric': 'val_composite_score',
+        'selected_baseline_fallback': selected_result.get(
+            'baseline_fallback',
+            False,
+        ),
+        'selection_metric': selected_by,
         'val_composite_score': float(selected_result['val_composite_score']),
         'val_capacity_normalized_rmse': float(
             selected_result['val_capacity_normalized_rmse']
@@ -2149,6 +2975,18 @@ def select_variant_for_farm(results):
     skipped = len(results) - len(promotable)
     if skipped:
         print(f'警告: {skipped} 个历史variant缺少模型/artifact，不参与最终晋升')
+
+    guarded_results = [
+        result for result in promotable
+        if value_is_true(
+            result.get('strict_baseline_fallback_policy', False)
+        )
+    ]
+    if guarded_results:
+        return max(
+            guarded_results,
+            key=lambda result: int(result.get('round', 0)),
+        )
 
     baseline = next(
         (result for result in promotable if result['variant'] == 'baseline'),
@@ -2203,7 +3041,16 @@ def train_one_farm_ablation(train_file, previous_results=None):
         variant_name = variant['name']
         if variant['execute']:
             print(f'执行variant训练: {variant_name}')
-            if variant.get('multi_seed', False):
+            if variant.get('rolling_validation', False):
+                result = train_rolling_weighted_ablation_variant(
+                    farm_id,
+                    variant,
+                    result_by_variant.get('baseline'),
+                    train_df,
+                    feature_cols,
+                    capacity,
+                )
+            elif variant.get('multi_seed', False):
                 result = train_multiseed_ablation_variant(
                     farm_id,
                     variant,
@@ -2329,6 +3176,14 @@ def summarize_ablation(all_results, selected_results):
                 / parent_compared['parent_nrmse']
                 - 1.0
             )
+        fallback_values = variant_df.get(
+            'baseline_fallback',
+            pd.Series(False, index=variant_df.index),
+        ).map(value_is_true)
+        ensemble_values = variant_df.get(
+            'use_seed_ensemble',
+            pd.Series(False, index=variant_df.index),
+        ).map(value_is_true)
         rows.append({
             'variant': variant,
             'round': variant_config['round'],
@@ -2363,6 +3218,8 @@ def summarize_ablation(all_results, selected_results):
             'passes_nrmse_guardrail': bool(
                 nrmse_ratio.max() <= MAX_ALLOWED_NRMSE_DEGRADATION
             ),
+            'baseline_fallback_farms': int(fallback_values.sum()),
+            'weighted_ensemble_farms': int(ensemble_values.sum()),
             'selected_farms': int(selected_names.get(variant, 0)),
         })
 
