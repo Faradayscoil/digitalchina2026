@@ -1,0 +1,12 @@
+# Ignore every untracked project artifact by default.
+/*
+
+# Keep repository configuration and the four maintained source files visible.
+!/.gitignore
+!/wind_dl_model_predict.py
+!/wind_dl_model_train.py
+!/wind_dl_other_models_train.py
+!/wind_dl_tuned_patchtst_train.py
+
+# Add future source files explicitly with:
+# git add -f path/to/new_source.py
