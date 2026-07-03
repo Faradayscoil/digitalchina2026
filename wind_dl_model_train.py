@@ -121,23 +121,36 @@ def add_wind_physics_features(df):
     return df
 
 
-def load_and_preprocess(data_path, is_train=True):
+def preprocess_wind_dataframe(df, is_train=True, capacity=None):
     """
     风电短期预测预处理：
     1. 恢复15分钟等间隔序列；
     2. 清洗天气/功率异常；
     3. 风向转sin/cos；
     4. 添加时间周期、风速平方/立方、垂直风切变特征。
+
+    ``df`` 可以来自原始CSV，也可以来自已对齐为主数据字段的补充数据。
+    ``capacity`` 仅用于补充数据显式传入目标场站容量；未传入时仍从
+    ``装机`` 列按原逻辑推断。
     """
-    df = pd.read_csv(data_path, parse_dates=['时间'])
-    df = df.sort_values('时间').drop_duplicates('时间')
-    df.set_index('时间', inplace=True)
+    df = df.copy()
+    if '时间' in df.columns:
+        df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+        df = df.dropna(subset=['时间'])
+        df = df.sort_values('时间').drop_duplicates('时间')
+        df.set_index('时间', inplace=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df[~df.index.isna()]
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep='first')]
+        df.index.name = '时间'
+    else:
+        raise ValueError("预处理数据必须包含 '时间' 列或使用 DatetimeIndex")
 
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    capacity = None
-    if '装机' in df.columns:
+    if capacity is None and '装机' in df.columns:
         capacity_values = df['装机'].replace(0, np.nan).dropna()
         if not capacity_values.empty:
             capacity = float(capacity_values.median())
@@ -195,6 +208,11 @@ def load_and_preprocess(data_path, is_train=True):
     feature_cols = [col for col in df.columns if col != TARGET_COL]
     df = df.astype(np.float32)
     return df, feature_cols, capacity
+
+
+def load_and_preprocess(data_path, is_train=True):
+    df = pd.read_csv(data_path, parse_dates=['时间'])
+    return preprocess_wind_dataframe(df, is_train=is_train)
 
 
 def build_scaled_arrays(train_df, feature_cols):

@@ -40,8 +40,10 @@ from wind_dl_model_train import (
     build_scaled_arrays,
     compute_patch_num,
     load_and_preprocess,
+    preprocess_wind_dataframe,
     transformer_encoder,
 )
+from wind_supplementary_preprocess import WEATHER_COLS as SUPPLEMENTARY_RAW_COLUMNS
 
 warnings.filterwarnings('ignore')
 
@@ -105,6 +107,10 @@ ROUND_OUTPUT_PATHS = {
 }
 
 seed = 2026
+ENABLE_TUNED_TRAINING = os.getenv(
+    'WIND_TUNED_ENABLE_TRAINING',
+    '0',
+) == '1'
 BATCH_SIZE = int(os.getenv('WIND_TUNED_BATCH_SIZE', '192'))
 COLD_START_EPOCHS = int(os.getenv('WIND_TUNED_COLD_START_EPOCHS', '25'))
 DISTILL_EPOCHS = int(os.getenv('WIND_TUNED_DISTILL_EPOCHS', '45'))
@@ -124,7 +130,7 @@ INPUT_NOISE_STD = float(os.getenv('WIND_TUNED_INPUT_NOISE_STD', '0.01'))
 CHANNEL_DROPOUT = float(os.getenv('WIND_TUNED_CHANNEL_DROPOUT', '0.05'))
 USE_MIXED_PRECISION = os.getenv('WIND_TUNED_MIXED_PRECISION', '1') == '1'
 RUN_ABLATION = os.getenv('WIND_TUNED_RUN_ABLATION', '1') == '1'
-# 后续轮次默认复用已完成结果，仅训练新增分支；每个variant仍可独立覆盖。
+# 历史消融默认全部关闭，避免直接运行脚本时重训并覆盖canonical模型。
 RUN_PREVIOUS_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_PREVIOUS_ABLATIONS',
     '0',
@@ -135,15 +141,15 @@ RUN_ROUND2_ABLATIONS = os.getenv(
 ) == '1'
 RUN_ROUND3_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND3_ABLATIONS',
-    '1',
+    '0',
 ) == '1'
 RUN_ROUND4_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND4_ABLATIONS',
-    '1',
+    '0',
 ) == '1'
 RUN_ROUND5_ABLATIONS = os.getenv(
     'WIND_TUNED_RUN_ROUND5_ABLATIONS',
-    '1',
+    '0',
 ) == '1'
 REUSE_PREVIOUS_ABLATION_RESULTS = os.getenv(
     'WIND_TUNED_REUSE_PREVIOUS_ABLATION_RESULTS',
@@ -163,12 +169,42 @@ RMSE_MSE_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_RMSE_MSE_WEIGHT', '0.10'))
 RMSE_HORIZON_END_WEIGHT = float(os.getenv('WIND_TUNED_RMSE_HORIZON_END_WEIGHT', '1.25'))
 MULTI_SEEDS = tuple(
     int(value.strip())
-    for value in os.getenv('WIND_TUNED_MULTI_SEEDS', '2026,2027,2028').split(',')
+    for value in os.getenv('WIND_TUNED_MULTI_SEEDS', '2026').split(',')
     if value.strip()
 )
 SWA_START_FRACTION = float(os.getenv('WIND_TUNED_SWA_START_FRACTION', '0.50'))
 MAX_ALLOWED_NRMSE_DEGRADATION = float(
     os.getenv('WIND_TUNED_MAX_NRMSE_DEGRADATION', '0.02')
+)
+
+SUPPLEMENTARY_CACHE_DIR = os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_CACHE_DIR',
+    './wind_split/supplementary_other_wind_data/processed_npz',
+)
+SUPPLEMENTARY_PRETRAIN_EPOCHS = int(os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_PRETRAIN_EPOCHS',
+    '3',
+))
+SUPPLEMENTARY_PRETRAIN_LR = float(os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_PRETRAIN_LR',
+    '2e-4',
+))
+SUPPLEMENTARY_MAX_WINDOWS_PER_STATION = int(os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_MAX_WINDOWS_PER_STATION',
+    '8192',
+))
+SUPPLEMENTARY_MIN_WINDOWS_PER_STATION = int(os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_MIN_WINDOWS_PER_STATION',
+    '1024',
+))
+SUPPLEMENTARY_SCALED_FEATURE_CLIP = float(os.getenv(
+    'WIND_TUNED_SUPPLEMENTARY_SCALED_FEATURE_CLIP',
+    '8.0',
+))
+SUPPLEMENTARY_STATIONS = tuple(
+    value.strip()
+    for value in os.getenv('WIND_TUNED_SUPPLEMENTARY_STATIONS', '').split(',')
+    if value.strip()
 )
 
 ABLATION_VARIANTS = [
@@ -511,6 +547,10 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
         ),
         'use_swa': variant['use_swa'],
         'use_distillation': variant.get('use_distillation', True),
+        'use_supplementary_teacher_pretraining': variant.get(
+            'use_supplementary_teacher_pretraining',
+            False,
+        ),
         'training_seed': member_seed,
         'multi_seed': True,
         'selected_weight_source': artifact.get(
@@ -525,7 +565,7 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
         **{
             key: value
             for key, value in artifact.items()
-            if key.startswith('val_')
+            if key.startswith('val_') or key.startswith('teacher_val_')
         },
     }
 
@@ -587,6 +627,214 @@ def make_feature_dataset(features, start, sample_count,
         batch_size=batch_size,
     )
     return ds.prefetch(tf.data.AUTOTUNE)
+
+
+class SupplementaryWindowSequence(keras.utils.Sequence):
+    """Balanced on-demand windows without materializing all 96xfeature tensors."""
+
+    def __init__(self, station_arrays, batch_size=BATCH_SIZE,
+                 shuffle=True, random_seed=seed):
+        self.station_arrays = station_arrays
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.rng = np.random.default_rng(random_seed)
+        pairs = []
+        for station_index, station in enumerate(station_arrays):
+            starts = np.asarray(station['window_starts'], dtype=np.int64)
+            if len(starts):
+                pairs.append(np.column_stack([
+                    np.full(len(starts), station_index, dtype=np.int64),
+                    starts,
+                ]))
+        if not pairs:
+            raise ValueError('补充数据中没有可用于teacher预训练的连续窗口')
+        self.pairs = np.concatenate(pairs, axis=0)
+        self.order = np.arange(len(self.pairs), dtype=np.int64)
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.ceil(len(self.order) / self.batch_size))
+
+    def __getitem__(self, batch_index):
+        start = batch_index * self.batch_size
+        end = min(start + self.batch_size, len(self.order))
+        selected_pairs = self.pairs[self.order[start:end]]
+        x_batch = []
+        y_batch = []
+        for station_index, window_start in selected_pairs:
+            station = self.station_arrays[int(station_index)]
+            window_start = int(window_start)
+            x_batch.append(
+                station['features'][
+                    window_start:window_start + HISTORY_LEN
+                ]
+            )
+            target_start = window_start + HISTORY_LEN
+            y_batch.append(
+                station['target'][
+                    target_start:target_start + FORECAST_LEN
+                ]
+            )
+        x_batch = np.asarray(x_batch, dtype=np.float32)
+        y_batch = np.asarray(y_batch, dtype=np.float32)
+        return x_batch, combine_targets(y_batch)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.rng.shuffle(self.order)
+
+
+def _valid_supplementary_window_starts(quality_mask):
+    window_len = HISTORY_LEN + FORECAST_LEN
+    quality_mask = np.asarray(quality_mask, dtype=np.int16)
+    if len(quality_mask) < window_len:
+        return np.empty(0, dtype=np.int64)
+    valid_counts = np.convolve(
+        quality_mask,
+        np.ones(window_len, dtype=np.int16),
+        mode='valid',
+    )
+    return np.flatnonzero(valid_counts == window_len).astype(np.int64)
+
+
+def build_supplementary_transfer_bundle(
+        input_cols, scaler_x, scaler_y, target_capacity,
+        cache_dir=SUPPLEMENTARY_CACHE_DIR,
+        max_windows_per_station=SUPPLEMENTARY_MAX_WINDOWS_PER_STATION,
+        min_windows_per_station=SUPPLEMENTARY_MIN_WINDOWS_PER_STATION):
+    """Map unrelated farms to the target farm's per-unit power/scaler space."""
+    if target_capacity is None or target_capacity <= 0:
+        raise ValueError('补充数据迁移需要有效的目标场站装机容量')
+
+    cache_paths = sorted(glob.glob(os.path.join(cache_dir, 'JSFD*_15min.npz')))
+    if SUPPLEMENTARY_STATIONS:
+        allowed = set(SUPPLEMENTARY_STATIONS)
+        cache_paths = [
+            path for path in cache_paths
+            if os.path.basename(path).split('_15min.npz')[0] in allowed
+        ]
+    if not cache_paths:
+        raise FileNotFoundError(
+            f'未在 {cache_dir} 找到补充数据缓存。请先执行 '
+            'python wind_supplementary_preprocess.py'
+        )
+
+    station_arrays = []
+    station_rows = []
+    for cache_path in cache_paths:
+        with np.load(cache_path, allow_pickle=False) as cached:
+            metadata = json.loads(str(cached['metadata_json'].item()))
+            raw_values = cached['raw_values'].astype(np.float32)
+            timestamps_ns = cached['timestamps_ns'].astype(np.int64)
+            source_power = cached['power_mw'].astype(np.float32)
+            quality_mask = cached['quality_mask'].astype(bool)
+            source_capacity = float(cached['capacity_mw'])
+
+        station_id = metadata.get(
+            'station_id',
+            os.path.basename(cache_path).split('_15min.npz')[0],
+        )
+        if raw_values.shape[1] != len(SUPPLEMENTARY_RAW_COLUMNS):
+            print(
+                f'跳过 {station_id}: raw_values列数={raw_values.shape[1]}，'
+                f'期望={len(SUPPLEMENTARY_RAW_COLUMNS)}'
+            )
+            continue
+
+        external_power_pu = np.clip(
+            source_power / max(source_capacity, 1e-6),
+            0.0,
+            1.0,
+        )
+        external_frame = pd.DataFrame(
+            raw_values,
+            columns=SUPPLEMENTARY_RAW_COLUMNS,
+            index=pd.to_datetime(timestamps_ns),
+        )
+        external_frame.index.name = '时间'
+        external_frame['装机'] = float(target_capacity)
+        external_frame[TARGET_COL] = (
+            external_power_pu * float(target_capacity)
+        ).astype(np.float32)
+        processed, _, _ = preprocess_wind_dataframe(
+            external_frame,
+            is_train=True,
+            capacity=float(target_capacity),
+        )
+        if len(processed) != len(quality_mask):
+            print(
+                f'跳过 {station_id}: 预处理后长度 {len(processed)} '
+                f'与quality mask {len(quality_mask)} 不一致'
+            )
+            continue
+
+        missing_cols = [
+            column for column in input_cols
+            if column not in processed.columns
+        ]
+        if missing_cols:
+            print(f'{station_id}: 补齐缺失迁移特征 {missing_cols}')
+            for column in missing_cols:
+                processed[column] = 0.0
+
+        scaled_features = scaler_x.transform(
+            processed[input_cols].to_numpy()
+        ).astype(np.float32)
+        if SUPPLEMENTARY_SCALED_FEATURE_CLIP > 0:
+            scaled_features = np.clip(
+                scaled_features,
+                -SUPPLEMENTARY_SCALED_FEATURE_CLIP,
+                SUPPLEMENTARY_SCALED_FEATURE_CLIP,
+            )
+        scaled_target = scaler_y.transform(
+            processed[[TARGET_COL]].to_numpy()
+        ).ravel().astype(np.float32)
+
+        starts = _valid_supplementary_window_starts(quality_mask)
+        available_windows = len(starts)
+        if available_windows < min_windows_per_station:
+            print(
+                f'跳过 {station_id}: 连续有效窗口 {available_windows} '
+                f'< {min_windows_per_station}'
+            )
+            continue
+        if max_windows_per_station > 0 and available_windows > max_windows_per_station:
+            station_rng = np.random.default_rng(
+                seed + sum(ord(value) for value in station_id)
+            )
+            starts = np.sort(station_rng.choice(
+                starts,
+                size=max_windows_per_station,
+                replace=False,
+            ))
+
+        station_arrays.append({
+            'station_id': station_id,
+            'features': scaled_features,
+            'target': scaled_target,
+            'window_starts': starts,
+        })
+        station_rows.append({
+            'station_id': station_id,
+            'cache_path': cache_path,
+            'source_capacity_mw': source_capacity,
+            'rows': len(processed),
+            'available_valid_windows': available_windows,
+            'selected_windows': len(starts),
+        })
+
+    if not station_arrays:
+        raise ValueError('没有补充场站通过teacher预训练质量门槛')
+    return {
+        'station_arrays': station_arrays,
+        'station_metrics': station_rows,
+        'station_count': len(station_arrays),
+        'selected_window_count': int(sum(
+            len(station['window_starts'])
+            for station in station_arrays
+        )),
+        'cache_dir': cache_dir,
+    }
 
 
 def horizon_weights(forecast_len=FORECAST_LEN, decay=HORIZON_DECAY):
@@ -1020,6 +1268,54 @@ def compile_tuned_model(model, scaler_y, capacity, initial_lr, steps_per_epoch,
     return model
 
 
+def pretrain_teacher_with_supplementary(
+        model, supplementary_bundle, scaler_y, capacity, variant,
+        training_seed, tensorboard_log_dir):
+    sequence = SupplementaryWindowSequence(
+        supplementary_bundle['station_arrays'],
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        random_seed=training_seed,
+    )
+    compile_tuned_model(
+        model,
+        scaler_y,
+        capacity,
+        SUPPLEMENTARY_PRETRAIN_LR,
+        len(sequence),
+        SUPPLEMENTARY_PRETRAIN_EPOCHS,
+        distill_alpha=0.0,
+        use_balanced_loss=variant['use_balanced_loss'],
+        use_rmse_balanced_loss=variant.get(
+            'use_rmse_balanced_loss',
+            False,
+        ),
+    )
+    callbacks = [
+        keras.callbacks.TensorBoard(
+            log_dir=tensorboard_log_dir,
+            histogram_freq=0,
+            write_graph=True,
+            update_freq='epoch',
+            profile_batch=0,
+        ),
+        keras.callbacks.TerminateOnNaN(),
+    ]
+    print(
+        '补充数据teacher预训练: '
+        f"stations={supplementary_bundle['station_count']}, "
+        f"windows={supplementary_bundle['selected_window_count']}, "
+        f'epochs={SUPPLEMENTARY_PRETRAIN_EPOCHS}'
+    )
+    history = model.fit(
+        sequence,
+        epochs=SUPPLEMENTARY_PRETRAIN_EPOCHS,
+        callbacks=callbacks,
+        verbose=1,
+    )
+    return history
+
+
 def build_tuned_patchtst_model(input_dim, target_channel_index, use_revin=False,
                                use_cnn_adapter=False, adapter_channel_indices=None):
     if target_channel_index is None:
@@ -1399,6 +1695,7 @@ def save_config():
         'channel_dropout': CHANNEL_DROPOUT,
         'use_mixed_precision': USE_MIXED_PRECISION,
         'use_power_history': USE_POWER_HISTORY,
+        'enable_tuned_training': ENABLE_TUNED_TRAINING,
         'run_ablation': RUN_ABLATION,
         'run_previous_ablations': RUN_PREVIOUS_ABLATIONS,
         'run_round2_ablations': RUN_ROUND2_ABLATIONS,
@@ -1420,6 +1717,19 @@ def save_config():
         'exp_weight_halflife_steps': EXP_WEIGHT_HALFLIFE_STEPS,
         'swa_start_fraction': SWA_START_FRACTION,
         'max_allowed_nrmse_degradation': MAX_ALLOWED_NRMSE_DEGRADATION,
+        'supplementary_cache_dir': SUPPLEMENTARY_CACHE_DIR,
+        'supplementary_pretrain_epochs': SUPPLEMENTARY_PRETRAIN_EPOCHS,
+        'supplementary_pretrain_learning_rate': SUPPLEMENTARY_PRETRAIN_LR,
+        'supplementary_max_windows_per_station': (
+            SUPPLEMENTARY_MAX_WINDOWS_PER_STATION
+        ),
+        'supplementary_min_windows_per_station': (
+            SUPPLEMENTARY_MIN_WINDOWS_PER_STATION
+        ),
+        'supplementary_scaled_feature_clip': (
+            SUPPLEMENTARY_SCALED_FEATURE_CLIP
+        ),
+        'supplementary_stations': list(SUPPLEMENTARY_STATIONS),
     }
     config_path = os.path.join(MODEL_DIR, 'tuned_patchtst_config.json')
     with open(config_path, 'w', encoding='utf-8') as f:
@@ -1431,7 +1741,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
                            train_samples, total_samples, input_cols,
                            target_index, adapter_channel_indices,
                            scaler_x, scaler_y, feature_cols, capacity,
-                           training_seed=None, storage_name=None):
+                           training_seed=None, storage_name=None,
+                           supplementary_bundle=None):
     variant_name = variant['name']
     training_seed = seed if training_seed is None else int(training_seed)
     storage_name = storage_name or variant_name
@@ -1447,6 +1758,7 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         f"CNN Adapter={variant['use_cnn_adapter']}, "
         f"Balanced loss={variant['use_balanced_loss']}, "
         f"RMSE loss={variant.get('use_rmse_balanced_loss', False)}, "
+        f"External teacher={variant.get('use_supplementary_teacher_pretraining', False)}, "
         f"Distill={variant.get('use_distillation', True)}, "
         f"SWA={variant['use_swa']} ---"
     )
@@ -1477,20 +1789,14 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         use_cnn_adapter=variant['use_cnn_adapter'],
         adapter_channel_indices=adapter_channel_indices,
     )
-    compile_tuned_model(
-        model,
-        scaler_y,
-        capacity,
-        BASE_LEARNING_RATE,
-        steps_per_epoch,
-        COLD_START_EPOCHS,
-        distill_alpha=0.0,
-        use_balanced_loss=variant['use_balanced_loss'],
-        use_rmse_balanced_loss=variant.get('use_rmse_balanced_loss', False),
-    )
     print(f'variant={variant_name}, parameters={model.count_params():,}')
 
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    supplementary_pretrain_weights_path = os.path.join(
+        dirs['weights'],
+        f'tuned_patchtst_{storage_name}_external_pretrain_'
+        f'farm_{farm_id}.weights.h5',
+    )
     teacher_weights_path = os.path.join(
         dirs['weights'],
         f'tuned_patchtst_{storage_name}_teacher_farm_{farm_id}_best.weights.h5',
@@ -1531,6 +1837,50 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         ),
         timestamp,
     )
+    supplementary_log_dir = os.path.join(
+        dirs['tensorboard'],
+        f'farm_{farm_id}',
+        'supplementary_teacher_pretrain',
+        timestamp,
+    )
+
+    use_supplementary_teacher = variant.get(
+        'use_supplementary_teacher_pretraining',
+        False,
+    )
+    supplementary_history = None
+    if use_supplementary_teacher:
+        if supplementary_bundle is None:
+            supplementary_bundle = build_supplementary_transfer_bundle(
+                input_cols,
+                scaler_x,
+                scaler_y,
+                capacity,
+            )
+        supplementary_history = pretrain_teacher_with_supplementary(
+            model,
+            supplementary_bundle,
+            scaler_y,
+            capacity,
+            variant,
+            training_seed,
+            supplementary_log_dir,
+        )
+        model.save_weights(supplementary_pretrain_weights_path)
+
+    # Supplementary pretraining is only an initialization.  The teacher is
+    # always fine-tuned and selected on the target farm's chronological split.
+    compile_tuned_model(
+        model,
+        scaler_y,
+        capacity,
+        BASE_LEARNING_RATE,
+        steps_per_epoch,
+        COLD_START_EPOCHS,
+        distill_alpha=0.0,
+        use_balanced_loss=variant['use_balanced_loss'],
+        use_rmse_balanced_loss=variant.get('use_rmse_balanced_loss', False),
+    )
 
     teacher_callbacks = [
         keras.callbacks.TensorBoard(
@@ -1569,6 +1919,12 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
     if use_distillation:
         teacher_train_pred = model.predict(train_feature_ds, verbose=0)
         teacher_val_pred = model.predict(val_feature_ds, verbose=0)
+        teacher_eval_metrics = evaluate_scaled_predictions(
+            teacher_val_pred,
+            y_val,
+            scaler_y,
+            capacity,
+        )
         train_conf, train_teacher_mae, train_threshold = teacher_confidence(
             y_train,
             teacher_train_pred,
@@ -1595,6 +1951,13 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         stage2_distill_alpha = DISTILL_ALPHA
     else:
         distill_stats_path = None
+        teacher_val_pred = model.predict(val_feature_ds, verbose=0)
+        teacher_eval_metrics = evaluate_scaled_predictions(
+            teacher_val_pred,
+            y_val,
+            scaler_y,
+            capacity,
+        )
         y_train_stage2 = combine_targets(y_train)
         y_val_stage2 = combine_targets(y_val)
         stage2_distill_alpha = 0.0
@@ -1699,13 +2062,16 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         scaler_y,
         capacity,
     )
-    histories = [
+    histories = []
+    if supplementary_history is not None:
+        histories.append(('supplementary_pretrain', supplementary_history))
+    histories.extend([
         ('cold_start', teacher_history),
         (
             'distill' if use_distillation else 'supervised_continue',
             distill_history,
         ),
-    ]
+    ])
     history_path, history_plot_path = save_history_artifacts(
         histories,
         farm_id,
@@ -1727,6 +2093,7 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
         'use_distillation': use_distillation,
+        'use_supplementary_teacher_pretraining': use_supplementary_teacher,
         'training_seed': training_seed,
         'multi_seed': variant.get('multi_seed', False),
         'selected_weight_source': selected_weight_source,
@@ -1745,6 +2112,31 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'patch_stride': PATCH_STRIDE,
         'teacher_model_path': teacher_model_path,
         'teacher_weights_path': teacher_weights_path,
+        'supplementary_pretrain_weights_path': (
+            supplementary_pretrain_weights_path
+            if use_supplementary_teacher
+            else None
+        ),
+        'supplementary_cache_dir': (
+            supplementary_bundle['cache_dir']
+            if use_supplementary_teacher
+            else None
+        ),
+        'supplementary_station_count': (
+            supplementary_bundle['station_count']
+            if use_supplementary_teacher
+            else 0
+        ),
+        'supplementary_selected_window_count': (
+            supplementary_bundle['selected_window_count']
+            if use_supplementary_teacher
+            else 0
+        ),
+        'supplementary_station_metrics': (
+            supplementary_bundle['station_metrics']
+            if use_supplementary_teacher
+            else []
+        ),
         'model_path': final_model_path,
         'best_weights_path': final_weights_path,
         'raw_best_weights_path': raw_weights_path,
@@ -1761,6 +2153,10 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'distill_alpha': stage2_distill_alpha,
         'teacher_keep_ratio': TEACHER_KEEP_RATIO,
         'horizon_decay': HORIZON_DECAY,
+        **{
+            f'teacher_{key}': value
+            for key, value in teacher_eval_metrics.items()
+        },
         **eval_metrics,
     }
     artifact_path = os.path.join(
@@ -1783,6 +2179,7 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
         'use_distillation': use_distillation,
+        'use_supplementary_teacher_pretraining': use_supplementary_teacher,
         'training_seed': training_seed,
         'multi_seed': variant.get('multi_seed', False),
         'selected_weight_source': selected_weight_source,
@@ -1803,6 +2200,10 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
             if averaged_metrics is not None
             else np.nan
         ),
+        **{
+            f'teacher_{key}': value
+            for key, value in teacher_eval_metrics.items()
+        },
         **eval_metrics,
     }
     print(
@@ -1826,9 +2227,18 @@ def train_multiseed_ablation_variant(
         if parent_result
         else None
     )
+    supplementary_bundle = None
+    if variant.get('use_supplementary_teacher_pretraining', False):
+        supplementary_bundle = build_supplementary_transfer_bundle(
+            input_cols,
+            scaler_x,
+            scaler_y,
+            capacity,
+        )
     for member_seed in MULTI_SEEDS:
         if (
-            parent_result is not None
+            variant.get('reuse_parent_seed_member', True)
+            and parent_result is not None
             and member_seed == parent_seed
             and result_artifacts_exist(parent_result)
         ):
@@ -1870,6 +2280,7 @@ def train_multiseed_ablation_variant(
                     capacity,
                     training_seed=member_seed,
                     storage_name=storage_name,
+                    supplementary_bundle=supplementary_bundle,
                 )
                 member_result['member_source'] = 'trained_seed_member'
         member_results.append(member_result)
@@ -1906,8 +2317,10 @@ def train_multiseed_ablation_variant(
             result['val_composite_score'],
         ),
     )
+    is_multi_seed = len(member_results) > 1
     use_seed_ensemble = (
-        ensemble_metrics['val_capacity_normalized_rmse']
+        is_multi_seed
+        and ensemble_metrics['val_capacity_normalized_rmse']
         <= best_member['val_capacity_normalized_rmse']
         and ensemble_metrics['val_composite_score']
         <= best_member['val_composite_score']
@@ -1958,18 +2371,19 @@ def train_multiseed_ablation_variant(
             **{
                 key: value
                 for key, value in member_result.items()
-                if key.startswith('val_')
+                if key.startswith('val_') or key.startswith('teacher_val_')
             },
         })
-    member_metric_rows.append({
-        'farm_id': farm_id,
-        'variant': variant['name'],
-        'training_seed': 'ensemble',
-        'member_source': 'mean_prediction',
-        'model_path': '',
-        'artifact_path': '',
-        **ensemble_metrics,
-    })
+    if is_multi_seed:
+        member_metric_rows.append({
+            'farm_id': farm_id,
+            'variant': variant['name'],
+            'training_seed': 'ensemble',
+            'member_source': 'mean_prediction',
+            'model_path': '',
+            'artifact_path': '',
+            **ensemble_metrics,
+        })
     pd.DataFrame(member_metric_rows).to_csv(
         member_metrics_path,
         index=False,
@@ -1996,7 +2410,11 @@ def train_multiseed_ablation_variant(
         ),
         'use_swa': variant['use_swa'],
         'use_distillation': variant.get('use_distillation', True),
-        'multi_seed': True,
+        'use_supplementary_teacher_pretraining': variant.get(
+            'use_supplementary_teacher_pretraining',
+            False,
+        ),
+        'multi_seed': is_multi_seed,
         'multi_seed_values': list(MULTI_SEEDS),
         'use_seed_ensemble': use_seed_ensemble,
         'ensemble_model_paths': ensemble_model_paths,
@@ -2028,8 +2446,12 @@ def train_multiseed_ablation_variant(
         'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
         'use_distillation': variant.get('use_distillation', True),
+        'use_supplementary_teacher_pretraining': variant.get(
+            'use_supplementary_teacher_pretraining',
+            False,
+        ),
         'training_seed': best_member['training_seed'],
-        'multi_seed': True,
+        'multi_seed': is_multi_seed,
         'multi_seed_values': ','.join(str(value) for value in MULTI_SEEDS),
         'use_seed_ensemble': use_seed_ensemble,
         'ensemble_member_count': len(ensemble_model_paths),
@@ -2044,6 +2466,11 @@ def train_multiseed_ablation_variant(
         'val_samples': val_samples,
         'raw_val_composite_score': np.nan,
         'swa_val_composite_score': np.nan,
+        **{
+            key: value
+            for key, value in best_member.items()
+            if key.startswith('teacher_val_')
+        },
         **seed_statistics,
         **selected_metrics,
     }
@@ -2655,6 +3082,25 @@ def train_one_farm(train_file):
 def main():
     configure_runtime()
     set_global_seed(seed)
+    if not ENABLE_TUNED_TRAINING:
+        print(
+            'tuned PatchTST历史训练入口默认关闭，未执行训练。'
+            '如需显式运行前五轮代码，请设置 '
+            'WIND_TUNED_ENABLE_TRAINING=1，并单独开启所需variant。'
+        )
+        return
+    if (
+        RUN_ABLATION
+        and not any(
+            variant['execute']
+            for variant in get_ablation_execution_plan()
+        )
+    ):
+        print(
+            'WIND_TUNED_ENABLE_TRAINING已开启，但没有启用任何历史消融'
+            'variant；为避免仅复用结果却覆盖canonical artifact，本次不执行。'
+        )
+        return
     ensure_dirs()
     config_path = save_config()
 

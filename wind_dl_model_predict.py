@@ -70,11 +70,20 @@ warnings.filterwarnings('ignore')
 TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
-ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME, TUNED_MODEL_NAME] + OTHER_MODEL_NAMES
+EXTERNAL_TEACHER_MODEL_NAME = 'tuned_patchtst_external_teacher'
+ALL_MODEL_NAMES = [
+    PATCHTST_MODEL_NAME,
+    TUNED_MODEL_NAME,
+    EXTERNAL_TEACHER_MODEL_NAME,
+] + OTHER_MODEL_NAMES
 OUTPUT_SUBDIR = 'testdata_predict_output'
 PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
 EXP_WEIGHT_HALFLIFE_STEPS = 4.0
 PREDICT_VERBOSE = int(os.getenv('WIND_DL_PREDICT_VERBOSE', '1'))
+ALLOW_HISTORICAL_ROUND6_EQUAL_WEIGHT = os.getenv(
+    'WIND_DL_ALLOW_HISTORICAL_ROUND6_EQUAL_WEIGHT',
+    '0',
+) == '1'
 
 
 def discover_test_files(data_dir=DATA_DIR):
@@ -203,7 +212,10 @@ def load_artifact(model_name, farm_id):
 
 
 def get_tuned_ablation_trace_fields(model_name, artifact):
-    if model_name != TUNED_MODEL_NAME:
+    if model_name not in {
+        TUNED_MODEL_NAME,
+        EXTERNAL_TEACHER_MODEL_NAME,
+    }:
         return {}
     multi_seed_values = artifact.get('multi_seed_values')
     if isinstance(multi_seed_values, (list, tuple)):
@@ -231,6 +243,10 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
         ),
         'use_swa': artifact.get('use_swa', False),
         'use_distillation': artifact.get('use_distillation', True),
+        'use_supplementary_teacher_pretraining': artifact.get(
+            'use_supplementary_teacher_pretraining',
+            False,
+        ),
         'multi_seed': artifact.get('multi_seed', False),
         'multi_seed_values': multi_seed_values,
         'use_seed_ensemble': artifact.get('use_seed_ensemble', False),
@@ -248,13 +264,39 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
             'val_capacity_normalized_rmse'
         ),
         'source_variant_model_path': artifact.get('source_variant_model_path'),
+        'external_teacher_candidate_selected': artifact.get(
+            'external_teacher_candidate_selected'
+        ),
+        'external_teacher_fallback': artifact.get(
+            'external_teacher_fallback'
+        ),
+        'external_teacher_candidate_val_nrmse': artifact.get(
+            'external_teacher_candidate_val_nrmse'
+        ),
+        'external_teacher_parent_val_nrmse': artifact.get(
+            'external_teacher_parent_val_nrmse'
+        ),
+        'teacher_val_capacity_normalized_rmse': artifact.get(
+            'teacher_val_capacity_normalized_rmse'
+        ),
+        'teacher_val_composite_score': artifact.get(
+            'teacher_val_composite_score'
+        ),
+        'supplementary_station_count': artifact.get(
+            'supplementary_station_count',
+            0,
+        ),
+        'supplementary_selected_window_count': artifact.get(
+            'supplementary_selected_window_count',
+            0,
+        ),
     }
 
 
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
-    if model_name == TUNED_MODEL_NAME:
+    if model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}:
         return build_tuned_patchtst_model(
             len(artifact['input_cols']),
             artifact['target_index'],
@@ -271,7 +313,10 @@ def build_model_from_weights(model_name, artifact):
 
 
 def load_trained_model(model_name, farm_id, artifact):
-    if model_name == TUNED_MODEL_NAME and artifact.get('use_seed_ensemble', False):
+    if (
+        model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}
+        and artifact.get('use_seed_ensemble', False)
+    ):
         ensemble_paths = artifact.get('ensemble_model_paths') or []
         missing_paths = [
             path for path in ensemble_paths
@@ -305,14 +350,27 @@ def load_trained_model(model_name, farm_id, artifact):
             PATCHTST_MODEL_DIR,
             f'patchtst_farm_{farm_id}_best.weights.h5',
         )
-    elif model_name == TUNED_MODEL_NAME:
+    elif model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}:
+        if model_name == TUNED_MODEL_NAME:
+            default_model_dir = TUNED_SAVED_MODEL_DIR
+            default_weights_dir = TUNED_WEIGHTS_DIR
+        else:
+            default_model_dir = os.path.join(
+                './models',
+                EXTERNAL_TEACHER_MODEL_NAME,
+            )
+            default_weights_dir = os.path.join(
+                BASE_RESULT_DIR,
+                EXTERNAL_TEACHER_MODEL_NAME,
+                'weights',
+            )
         model_path = artifact.get('model_path') or os.path.join(
-            TUNED_SAVED_MODEL_DIR,
-            f'tuned_patchtst_farm_{farm_id}.keras',
+            default_model_dir,
+            f'{model_name}_farm_{farm_id}.keras',
         )
         best_weights_path = artifact.get('best_weights_path') or os.path.join(
-            TUNED_WEIGHTS_DIR,
-            f'tuned_patchtst_farm_{farm_id}_best.weights.h5',
+            default_weights_dir,
+            f'{model_name}_farm_{farm_id}_best.weights.h5',
         )
     else:
         model_path = artifact.get('model_path') or os.path.join(
@@ -784,7 +842,55 @@ def predict_one_farm(model_name, test_file):
     return all_metrics, metric_df
 
 
+def historical_round6_requires_saved_predictions(model_name, test_files):
+    if (
+        model_name != TUNED_MODEL_NAME
+        or ALLOW_HISTORICAL_ROUND6_EQUAL_WEIGHT
+    ):
+        return False
+
+    incompatible_farms = []
+    for test_file in test_files:
+        farm_id = get_farm_id(test_file)
+        try:
+            artifact = load_artifact(model_name, farm_id)
+        except FileNotFoundError:
+            continue
+        selected_round = artifact.get(
+            'selected_ablation_round',
+            artifact.get('ablation_round'),
+        )
+        try:
+            selected_round = int(selected_round)
+        except (TypeError, ValueError):
+            selected_round = None
+        raw_weights = artifact.get('ensemble_weights')
+        weights = np.asarray(
+            [] if raw_weights is None else raw_weights,
+            dtype=float,
+        )
+        if (
+            selected_round == 6
+            and len(weights) > 1
+            and not np.allclose(weights, np.mean(weights))
+        ):
+            incompatible_farms.append(farm_id)
+
+    if incompatible_farms:
+        print(
+            '跳过 tuned_patchtst 整个模型族：当前canonical artifact包含'
+            f'第六轮非均匀权重（场站 {incompatible_farms}），而活动预测代码'
+            '只支持等权。请直接使用已保存的第六轮CSV；如确需覆盖式等权重跑，'
+            '显式设置 WIND_DL_ALLOW_HISTORICAL_ROUND6_EQUAL_WEIGHT=1。'
+        )
+        return True
+    return False
+
+
 def predict_model_family(model_name, test_files):
+    if historical_round6_requires_saved_predictions(model_name, test_files):
+        return pd.DataFrame(), pd.DataFrame()
+
     dirs = model_output_dirs(model_name)
     summary_rows = []
     horizon_metric_frames = []
