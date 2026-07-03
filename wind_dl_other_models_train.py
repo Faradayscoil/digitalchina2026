@@ -41,6 +41,10 @@ DEFAULT_MODEL_NAMES = [
 ]
 
 seed = 2026
+ENABLE_OTHER_MODELS_TRAINING = os.getenv(
+    'WIND_OTHER_MODELS_ENABLE_TRAINING',
+    '0',
+) == '1'
 BATCH_SIZE = int(os.getenv('WIND_DL_BATCH_SIZE', PATCHTST_BATCH_SIZE))
 EPOCHS = int(os.getenv('WIND_DL_EPOCHS', 60))
 VALIDATION_SPLIT = float(os.getenv('WIND_DL_VALIDATION_SPLIT', 0.15))
@@ -1178,8 +1182,15 @@ def train_model_family(model_name, train_files):
     return metrics
 
 
-if __name__ == '__main__':
+def main():
     set_global_seed(seed)
+    if not ENABLE_OTHER_MODELS_TRAINING:
+        print(
+            '其它基线模型训练已完成，入口默认关闭，现有模型和结果保持'
+            '不变。如确需重训，请设置 '
+            'WIND_OTHER_MODELS_ENABLE_TRAINING=1。'
+        )
+        return
 
     train_files = discover_train_files(DATA_DIR)
     if not train_files:
@@ -1198,3 +1209,7 @@ if __name__ == '__main__':
     summary_path = os.path.join(BASE_RESULT_DIR, 'wind_dl_other_models_training_metrics.csv')
     summary.to_csv(summary_path, index=False, encoding='utf-8-sig')
     print(f'\n全部深度学习对比模型训练完成，汇总指标已保存至 {summary_path}')
+
+
+if __name__ == '__main__':
+    main()

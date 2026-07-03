@@ -25,6 +25,10 @@ HISTORY_DIR = os.path.join(MODEL_DIR, 'history')
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
 
 seed = 2026
+ENABLE_PATCHTST_TRAINING = os.getenv(
+    'WIND_PATCHTST_ENABLE_TRAINING',
+    '0',
+) == '1'
 TIME_FREQ = '15min'
 HISTORY_LEN = 96          # 24小时历史窗口
 FORECAST_LEN = 16         # 未来4小时预测
@@ -647,8 +651,15 @@ def train_one_farm(train_file):
     }
 
 
-if __name__ == '__main__':
+def main():
     set_global_seed(seed)
+    if not ENABLE_PATCHTST_TRAINING:
+        print(
+            '原生PatchTST训练已完成，入口默认关闭，现有模型和结果保持'
+            '不变。如确需重训，请设置 WIND_PATCHTST_ENABLE_TRAINING=1。'
+        )
+        return
+
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(SAVED_MODEL_DIR, exist_ok=True)
     os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
@@ -681,3 +692,7 @@ if __name__ == '__main__':
     metrics.to_csv(metrics_path, index=False, encoding='utf-8-sig')
     print(f'\n训练完成，指标已保存至 {metrics_path}')
     print(f'启动TensorBoard查看训练/验证曲线: tensorboard --logdir {TENSORBOARD_LOG_DIR}')
+
+
+if __name__ == '__main__':
+    main()

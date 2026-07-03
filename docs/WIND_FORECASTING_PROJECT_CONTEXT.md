@@ -125,6 +125,9 @@ validation_split = 0.15
 - MLP 输出未来 16 个功率点。
 - Huber loss，MAE 和 RMSE。
 
+原生 PatchTST 已完成，训练入口默认关闭；只有显式设置
+`WIND_PATCHTST_ENABLE_TRAINING=1` 才会重训。
+
 ### 4.2 `wind_dl_other_models_train.py`
 
 训练以下基线：
@@ -170,6 +173,9 @@ Autoformer 保留：
 - top-k delay aggregation。
 - seasonal/trend 初始化和重构。
 
+其它基线已完成，训练入口默认关闭；只有显式设置
+`WIND_OTHER_MODELS_ENABLE_TRAINING=1` 才会重训。
+
 ### 4.3 `wind_dl_tuned_patchtst_train.py`
 
 负责 tuned PatchTST、自蒸馏和前五轮消融实验。
@@ -204,6 +210,9 @@ round 1～5 的执行开关默认全部为关闭状态。
 patchtst
 tuned_patchtst
 tuned_patchtst_external_teacher
+tuned_patchtst_ramp_trajectory
+tuned_patchtst_ramp_gated
+tuned_patchtst_ramp_persistence_gated
 bilstm
 cnn_lstm
 cnn_resnet_gru
@@ -252,6 +261,20 @@ tuned_patchtst_external_teacher
 ```
 
 因此不会覆盖第六轮 tuned PatchTST 模型和历史结果。
+
+### 4.6 CNN ramp expert 结构消融
+
+新增独立入口：
+
+```text
+wind_dl_ramp_expert_ablation_train.py
+```
+
+该入口只读复用前五轮 `revin_balanced_loss` 的验证指标，不提供父模型
+重训开关；也不使用补充风场预训练、多 seed、SWA、滚动验证、第六轮 NRMSE
+checkpoint / baseline 回退或验证集加权集成。三个新候选固定使用 seed
+`2026`，并分别保存到独立模型命名空间，因此不会覆盖 `tuned_patchtst`
+或第六轮产物。
 
 ## 5. 原生 PatchTST 的保存产物
 
@@ -823,6 +846,63 @@ WIND_EXTERNAL_TEACHER_ENABLE_TRAINING=1 \
 
 滚动验证、双 checkpoint 和 champion fallback 可以作为新结构的稳健训练框架，而不是论文唯一创新。
 
+### 15.1 已实现的 CNN ramp expert 消融
+
+这不是先前 CNN Adapter 的重复实验。旧 Adapter 对完整历史做普通卷积后
+使用全局平均池化，只生成一个经标量门控注入共享 head 的静态表示；新的
+ramp expert 则保留最近 32 点的时间位置，使用 dilation `1/2/4/8` 的 causal
+CNN，直接预测未来 16 步功率增量，再累加为完整轨迹。
+
+本轮按以下增量链比较：
+
+```text
+A  revin_balanced_loss（前五轮完成结果，只读复用）
+B  A + causal/dilated CNN ramp trajectory residual
+C  B + PatchTST/ramp 的样本级、逐 horizon gating
+D  C + persistence 第三 expert 的逐 horizon gating
+```
+
+为隔离结构变量，B～D 保留 A 已有的 RevIN、balanced loss 和自蒸馏训练
+协议；它们不是本轮新增贡献。本轮不再叠加新的训练或部署 trick。
+
+三种新候选分别用于预测：
+
+```text
+tuned_patchtst_ramp_trajectory
+tuned_patchtst_ramp_gated
+tuned_patchtst_ramp_persistence_gated
+```
+
+总训练开关默认关闭。训练缺失的新结构：
+
+```bash
+WIND_RAMP_EXPERT_ENABLE_TRAINING=1 \
+  /home/samlai/anaconda3/envs/deeplearning/bin/python \
+  wind_dl_ramp_expert_ablation_train.py
+```
+
+候选级开关为：
+
+```text
+WIND_RAMP_EXPERT_TRAIN_TRAJECTORY
+WIND_RAMP_EXPERT_TRAIN_GATED
+WIND_RAMP_EXPERT_TRAIN_PERSISTENCE_GATED
+```
+
+已完成候选会在检查这些开关之前优先复用；因此完成后可将相应候选开关设为
+`0`，不会重复训练。`WIND_RAMP_EXPERT_REUSE_COMPLETED=1` 为默认值。
+
+只预测三个结构候选：
+
+```bash
+WIND_DL_MODEL_NAMES=tuned_patchtst_ramp_trajectory,tuned_patchtst_ramp_gated,tuned_patchtst_ramp_persistence_gated \
+  /home/samlai/anaconda3/envs/deeplearning/bin/python \
+  wind_dl_model_predict.py
+```
+
+该实验可以解释 B、C、D 相对各自直接父项的增量差异；正式结论仍必须基于
+五个场站统一验证和测试结果，不能仅凭模型结构设计宣称提升。
+
 ## 16. 关键结果文件
 
 前五轮消融：
@@ -864,6 +944,19 @@ WIND_EXTERNAL_TEACHER_ENABLE_TRAINING=1 \
   preprocess/
   selection/
   testdata_predict_output/
+```
+
+CNN ramp expert 结构消融：
+
+```text
+./wind_results/ramp_expert_ablation/
+  ramp_expert_ablation_metrics_all_farms.csv
+  ramp_expert_ablation_summary.csv
+  ramp_expert_promoted_models.csv
+
+./wind_results/tuned_patchtst_ramp_trajectory/
+./wind_results/tuned_patchtst_ramp_gated/
+./wind_results/tuned_patchtst_ramp_persistence_gated/
 ```
 
 此前全部深度学习模型比较：

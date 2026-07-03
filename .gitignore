@@ -9,6 +9,7 @@
 !/wind_dl_tuned_patchtst_train.py
 !/wind_supplementary_preprocess.py
 !/wind_dl_external_teacher_train.py
+!/wind_dl_ramp_expert_ablation_train.py
 !/docs/
 /docs/*
 !/docs/WIND_FORECASTING_PROJECT_CONTEXT.md

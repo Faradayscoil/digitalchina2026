@@ -161,6 +161,22 @@ EXP_WEIGHT_HALFLIFE_STEPS = float(
 
 REVIN_EPSILON = float(os.getenv('WIND_TUNED_REVIN_EPSILON', '1e-5'))
 CNN_ADAPTER_FILTERS = int(os.getenv('WIND_TUNED_ADAPTER_FILTERS', '32'))
+RAMP_EXPERT_CONTEXT_LEN = int(os.getenv(
+    'WIND_TUNED_RAMP_CONTEXT_LEN',
+    '32',
+))
+RAMP_EXPERT_FILTERS = int(os.getenv(
+    'WIND_TUNED_RAMP_FILTERS',
+    '48',
+))
+RAMP_EXPERT_DILATIONS = tuple(
+    int(value.strip())
+    for value in os.getenv(
+        'WIND_TUNED_RAMP_DILATIONS',
+        '1,2,4,8',
+    ).split(',')
+    if value.strip()
+)
 NEW_RAMP_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RAMP_WEIGHT', '0.03'))
 NEW_RELATIVE_LOSS_WEIGHT = float(os.getenv('WIND_TUNED_NEW_RELATIVE_WEIGHT', '0.03'))
 NEW_PHYSICAL_PENALTY_WEIGHT = float(os.getenv('WIND_TUNED_NEW_PHYSICAL_WEIGHT', '0.01'))
@@ -540,6 +556,8 @@ def load_saved_seed_member_result(farm_id, variant, member_seed):
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_ramp_expert': variant.get('use_ramp_expert', False),
+        'ramp_fusion_mode': variant.get('ramp_fusion_mode', 'none'),
         'use_balanced_loss': variant['use_balanced_loss'],
         'use_rmse_balanced_loss': variant.get(
             'use_rmse_balanced_loss',
@@ -957,6 +975,89 @@ class ZeroInitResidualAdapter(layers.Layer):
 
 
 @keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class TakeRecentTimesteps(layers.Layer):
+    def __init__(self, context_len, **kwargs):
+        super().__init__(**kwargs)
+        self.context_len = int(context_len)
+
+    def call(self, inputs):
+        return inputs[:, -self.context_len:, :]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], self.context_len, input_shape[2]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'context_len': self.context_len})
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class CumulativeRampForecast(layers.Layer):
+    """Convert horizon increments into a trajectory around persistence."""
+
+    def call(self, inputs):
+        persistence, increments = inputs
+        return persistence + tf.cumsum(increments, axis=1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
+class HorizonExpertFusion(layers.Layer):
+    """Sample- and horizon-specific convex fusion of forecast experts."""
+
+    def __init__(self, forecast_len, num_experts, initial_logits,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.forecast_len = int(forecast_len)
+        self.num_experts = int(num_experts)
+        self.initial_logits = [
+            float(value) for value in initial_logits
+        ]
+        if len(self.initial_logits) != self.num_experts:
+            raise ValueError('initial_logits长度必须等于num_experts')
+        bias_values = np.tile(
+            np.asarray(self.initial_logits, dtype=np.float32),
+            self.forecast_len,
+        )
+        self.gate_projection = layers.Dense(
+            self.forecast_len * self.num_experts,
+            kernel_initializer='zeros',
+            bias_initializer=keras.initializers.Constant(bias_values),
+            name='gate_projection',
+        )
+
+    def call(self, inputs):
+        context = inputs[0]
+        experts = inputs[1:]
+        if len(experts) != self.num_experts:
+            raise ValueError('输入expert数量与num_experts不一致')
+        logits = self.gate_projection(context)
+        logits = tf.reshape(
+            logits,
+            [-1, self.forecast_len, self.num_experts],
+        )
+        weights = tf.nn.softmax(logits, axis=-1)
+        stacked = tf.stack(experts, axis=-1)
+        weights = tf.cast(weights, stacked.dtype)
+        return tf.reduce_sum(weights * stacked, axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[1]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'forecast_len': self.forecast_len,
+            'num_experts': self.num_experts,
+            'initial_logits': self.initial_logits,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindTunedPatchTST')
 class TunedPatchTSTLoss(keras.losses.Loss):
     def __init__(self, forecast_len=FORECAST_LEN, horizon_weight_values=None,
                  distill_alpha=DISTILL_ALPHA, zero_scaled=0.0, capacity_scaled=None,
@@ -1316,12 +1417,113 @@ def pretrain_teacher_with_supplementary(
     return history
 
 
-def build_tuned_patchtst_model(input_dim, target_channel_index, use_revin=False,
-                               use_cnn_adapter=False, adapter_channel_indices=None):
+def build_cnn_ramp_expert(x_input, baseline, channel_indices):
+    if not channel_indices:
+        raise ValueError('CNN ramp expert需要功率/风速通道索引')
+    if RAMP_EXPERT_CONTEXT_LEN > HISTORY_LEN:
+        raise ValueError('CNN ramp context不能超过历史窗口长度')
+
+    ramp = SelectInputChannels(
+        channel_indices,
+        name='ramp_expert_input_channels',
+    )(x_input)
+    ramp = TakeRecentTimesteps(
+        RAMP_EXPERT_CONTEXT_LEN,
+        name='ramp_expert_recent_context',
+    )(ramp)
+    ramp = layers.Conv1D(
+        RAMP_EXPERT_FILTERS,
+        kernel_size=1,
+        padding='same',
+        name='ramp_expert_input_projection',
+    )(ramp)
+    for block_index, dilation in enumerate(RAMP_EXPERT_DILATIONS, start=1):
+        shortcut = ramp
+        block = layers.SeparableConv1D(
+            RAMP_EXPERT_FILTERS,
+            kernel_size=3,
+            padding='causal',
+            dilation_rate=dilation,
+            activation='gelu',
+            name=f'ramp_expert_block_{block_index}_conv1',
+        )(ramp)
+        block = layers.Dropout(
+            DROPOUT,
+            name=f'ramp_expert_block_{block_index}_dropout',
+        )(block)
+        block = layers.SeparableConv1D(
+            RAMP_EXPERT_FILTERS,
+            kernel_size=3,
+            padding='causal',
+            dilation_rate=dilation,
+            name=f'ramp_expert_block_{block_index}_conv2',
+        )(block)
+        ramp = layers.Add(
+            name=f'ramp_expert_block_{block_index}_add',
+        )([shortcut, block])
+        ramp = layers.LayerNormalization(
+            epsilon=1e-6,
+            name=f'ramp_expert_block_{block_index}_norm',
+        )(ramp)
+        ramp = layers.Activation(
+            'gelu',
+            name=f'ramp_expert_block_{block_index}_activation',
+        )(ramp)
+
+    # Flatten preserves the location of recent ramp events; unlike the old
+    # CNN Adapter, no global time averaging is used.
+    ramp_context = layers.Flatten(name='ramp_expert_temporal_flatten')(ramp)
+    ramp_context = layers.Dense(
+        D_FF,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-4),
+        name='ramp_expert_context',
+    )(ramp_context)
+    ramp_context = layers.Dropout(
+        HEAD_DROPOUT,
+        name='ramp_expert_context_dropout',
+    )(ramp_context)
+    increments = layers.Dense(
+        FORECAST_LEN,
+        kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+        bias_initializer='zeros',
+        dtype='float32',
+        name='ramp_expert_horizon_increments',
+    )(ramp_context)
+    ramp_forecast = CumulativeRampForecast(
+        name='ramp_expert_forecast',
+    )([baseline, increments])
+    ramp_residual = layers.Subtract(
+        name='ramp_expert_cumulative_residual',
+    )([ramp_forecast, baseline])
+    return ramp_forecast, ramp_residual, ramp_context
+
+
+def build_tuned_patchtst_model(
+        input_dim, target_channel_index, use_revin=False,
+        use_cnn_adapter=False, adapter_channel_indices=None,
+        use_ramp_expert=False, ramp_fusion_mode='none'):
     if target_channel_index is None:
         raise ValueError('Tuned PatchTST 需要将历史功率作为输入通道')
     if use_cnn_adapter and not adapter_channel_indices:
         raise ValueError('启用CNN Adapter时必须提供功率/风速通道索引')
+    valid_fusion_modes = {
+        'none',
+        'residual',
+        'two_expert_gating',
+        'three_expert_gating',
+    }
+    if ramp_fusion_mode not in valid_fusion_modes:
+        raise ValueError(
+            f'未知ramp_fusion_mode={ramp_fusion_mode}; '
+            f'可选={sorted(valid_fusion_modes)}'
+        )
+    if use_ramp_expert != (ramp_fusion_mode != 'none'):
+        raise ValueError(
+            'use_ramp_expert与ramp_fusion_mode必须同步启用或关闭'
+        )
+    if use_ramp_expert and not adapter_channel_indices:
+        raise ValueError('启用CNN ramp expert时必须提供功率/风速通道索引')
 
     patch_num = compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)
     inputs = keras.Input(shape=(HISTORY_LEN, input_dim), name='history_features')
@@ -1405,7 +1607,47 @@ def build_tuned_patchtst_model(input_dim, target_channel_index, use_revin=False,
         name='persistence_baseline',
     )(model_input)
     forecast_name = 'forecast_power_normalized' if use_revin else 'forecast_power'
-    outputs = layers.Add(name=forecast_name)([baseline, residual])
+    if not use_ramp_expert:
+        outputs = layers.Add(name=forecast_name)([baseline, residual])
+    else:
+        long_forecast = layers.Add(
+            name='long_patchtst_forecast',
+        )([baseline, residual])
+        ramp_forecast, ramp_residual, ramp_context = build_cnn_ramp_expert(
+            x_input,
+            baseline,
+            adapter_channel_indices,
+        )
+        fusion_context = layers.Concatenate(
+            name='ramp_fusion_context',
+        )([head, ramp_context])
+        if ramp_fusion_mode == 'residual':
+            outputs = ZeroInitResidualAdapter(
+                name='zero_init_ramp_trajectory_adapter',
+            )([long_forecast, ramp_residual])
+        elif ramp_fusion_mode == 'two_expert_gating':
+            outputs = HorizonExpertFusion(
+                FORECAST_LEN,
+                2,
+                initial_logits=[4.0, 0.0],
+                name='long_ramp_horizon_fusion',
+            )([fusion_context, long_forecast, ramp_forecast])
+        else:
+            outputs = HorizonExpertFusion(
+                FORECAST_LEN,
+                3,
+                initial_logits=[4.0, 0.0, 0.0],
+                name='long_ramp_persistence_horizon_fusion',
+            )([
+                fusion_context,
+                long_forecast,
+                ramp_forecast,
+                baseline,
+            ])
+        outputs = layers.Activation(
+            'linear',
+            name=forecast_name,
+        )(outputs)
     if use_revin:
         outputs = PowerRevINDenormalize(
             dtype='float32',
@@ -1707,6 +1949,9 @@ def save_config():
         'ablation_execution_plan': get_ablation_execution_plan(),
         'revin_epsilon': REVIN_EPSILON,
         'cnn_adapter_filters': CNN_ADAPTER_FILTERS,
+        'ramp_expert_context_len': RAMP_EXPERT_CONTEXT_LEN,
+        'ramp_expert_filters': RAMP_EXPERT_FILTERS,
+        'ramp_expert_dilations': list(RAMP_EXPERT_DILATIONS),
         'new_ramp_loss_weight': NEW_RAMP_LOSS_WEIGHT,
         'new_relative_loss_weight': NEW_RELATIVE_LOSS_WEIGHT,
         'new_physical_penalty_weight': NEW_PHYSICAL_PENALTY_WEIGHT,
@@ -1756,6 +2001,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         f'\n--- 消融variant={variant_name}, seed={training_seed}: '
         f"RevIN={variant['use_revin']}, "
         f"CNN Adapter={variant['use_cnn_adapter']}, "
+        f"CNN ramp expert={variant.get('use_ramp_expert', False)}, "
+        f"Ramp fusion={variant.get('ramp_fusion_mode', 'none')}, "
         f"Balanced loss={variant['use_balanced_loss']}, "
         f"RMSE loss={variant.get('use_rmse_balanced_loss', False)}, "
         f"External teacher={variant.get('use_supplementary_teacher_pretraining', False)}, "
@@ -1788,6 +2035,8 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         use_revin=variant['use_revin'],
         use_cnn_adapter=variant['use_cnn_adapter'],
         adapter_channel_indices=adapter_channel_indices,
+        use_ramp_expert=variant.get('use_ramp_expert', False),
+        ramp_fusion_mode=variant.get('ramp_fusion_mode', 'none'),
     )
     print(f'variant={variant_name}, parameters={model.count_params():,}')
 
@@ -2089,6 +2338,11 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_ramp_expert': variant.get('use_ramp_expert', False),
+        'ramp_fusion_mode': variant.get('ramp_fusion_mode', 'none'),
+        'ramp_expert_context_len': RAMP_EXPERT_CONTEXT_LEN,
+        'ramp_expert_filters': RAMP_EXPERT_FILTERS,
+        'ramp_expert_dilations': list(RAMP_EXPERT_DILATIONS),
         'use_balanced_loss': variant['use_balanced_loss'],
         'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],
@@ -2175,6 +2429,11 @@ def train_ablation_variant(farm_id, variant, features, y_train, y_val,
         'added_module': variant['added_module'],
         'use_revin': variant['use_revin'],
         'use_cnn_adapter': variant['use_cnn_adapter'],
+        'use_ramp_expert': variant.get('use_ramp_expert', False),
+        'ramp_fusion_mode': variant.get('ramp_fusion_mode', 'none'),
+        'ramp_expert_context_len': RAMP_EXPERT_CONTEXT_LEN,
+        'ramp_expert_filters': RAMP_EXPERT_FILTERS,
+        'ramp_expert_dilations': list(RAMP_EXPERT_DILATIONS),
         'use_balanced_loss': variant['use_balanced_loss'],
         'use_rmse_balanced_loss': variant.get('use_rmse_balanced_loss', False),
         'use_swa': variant['use_swa'],

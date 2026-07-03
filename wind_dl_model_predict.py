@@ -52,11 +52,14 @@ from wind_dl_tuned_patchtst_train import (
     SAVED_MODEL_DIR as TUNED_SAVED_MODEL_DIR,
     WEIGHTS_DIR as TUNED_WEIGHTS_DIR,
     BalancedTunedPatchTSTLoss,
+    CumulativeRampForecast,
+    HorizonExpertFusion,
     PowerRevIN,
     PowerRevINDenormalize,
     RMSEBalancedTunedPatchTSTLoss,
     RepeatLastTarget,
     SelectInputChannels,
+    TakeRecentTimesteps,
     TunedPatchTSTLoss,
     ZeroInitResidualAdapter,
     actual_mae,
@@ -71,10 +74,25 @@ TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
 EXTERNAL_TEACHER_MODEL_NAME = 'tuned_patchtst_external_teacher'
+RAMP_TRAJECTORY_MODEL_NAME = 'tuned_patchtst_ramp_trajectory'
+RAMP_GATED_MODEL_NAME = 'tuned_patchtst_ramp_gated'
+RAMP_PERSISTENCE_GATED_MODEL_NAME = (
+    'tuned_patchtst_ramp_persistence_gated'
+)
+TUNED_DERIVED_MODEL_NAMES = {
+    TUNED_MODEL_NAME,
+    EXTERNAL_TEACHER_MODEL_NAME,
+    RAMP_TRAJECTORY_MODEL_NAME,
+    RAMP_GATED_MODEL_NAME,
+    RAMP_PERSISTENCE_GATED_MODEL_NAME,
+}
 ALL_MODEL_NAMES = [
     PATCHTST_MODEL_NAME,
     TUNED_MODEL_NAME,
     EXTERNAL_TEACHER_MODEL_NAME,
+    RAMP_TRAJECTORY_MODEL_NAME,
+    RAMP_GATED_MODEL_NAME,
+    RAMP_PERSISTENCE_GATED_MODEL_NAME,
 ] + OTHER_MODEL_NAMES
 OUTPUT_SUBDIR = 'testdata_predict_output'
 PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
@@ -158,6 +176,14 @@ def get_custom_objects():
         'WindTunedPatchTST>SelectInputChannels': SelectInputChannels,
         'ZeroInitResidualAdapter': ZeroInitResidualAdapter,
         'WindTunedPatchTST>ZeroInitResidualAdapter': ZeroInitResidualAdapter,
+        'TakeRecentTimesteps': TakeRecentTimesteps,
+        'WindTunedPatchTST>TakeRecentTimesteps': TakeRecentTimesteps,
+        'CumulativeRampForecast': CumulativeRampForecast,
+        'WindTunedPatchTST>CumulativeRampForecast': (
+            CumulativeRampForecast
+        ),
+        'HorizonExpertFusion': HorizonExpertFusion,
+        'WindTunedPatchTST>HorizonExpertFusion': HorizonExpertFusion,
         'actual_mae': actual_mae,
         'WindTunedPatchTST>actual_mae': actual_mae,
         'actual_rmse': actual_rmse,
@@ -212,10 +238,7 @@ def load_artifact(model_name, farm_id):
 
 
 def get_tuned_ablation_trace_fields(model_name, artifact):
-    if model_name not in {
-        TUNED_MODEL_NAME,
-        EXTERNAL_TEACHER_MODEL_NAME,
-    }:
+    if model_name not in TUNED_DERIVED_MODEL_NAMES:
         return {}
     multi_seed_values = artifact.get('multi_seed_values')
     if isinstance(multi_seed_values, (list, tuple)):
@@ -236,6 +259,21 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
         'selected_weight_source': artifact.get('selected_weight_source'),
         'use_revin': artifact.get('use_revin', False),
         'use_cnn_adapter': artifact.get('use_cnn_adapter', False),
+        'use_ramp_expert': artifact.get('use_ramp_expert', False),
+        'ramp_fusion_mode': artifact.get('ramp_fusion_mode', 'none'),
+        'ramp_expert_context_len': artifact.get(
+            'ramp_expert_context_len'
+        ),
+        'ramp_expert_filters': artifact.get('ramp_expert_filters'),
+        'ramp_expert_dilations': artifact.get(
+            'ramp_expert_dilations'
+        ),
+        'structural_ablation_step': artifact.get(
+            'structural_ablation_step'
+        ),
+        'structural_parent_variant': artifact.get(
+            'structural_parent_variant'
+        ),
         'use_balanced_loss': artifact.get('use_balanced_loss', False),
         'use_rmse_balanced_loss': artifact.get(
             'use_rmse_balanced_loss',
@@ -296,13 +334,15 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
-    if model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}:
+    if model_name in TUNED_DERIVED_MODEL_NAMES:
         return build_tuned_patchtst_model(
             len(artifact['input_cols']),
             artifact['target_index'],
             use_revin=artifact.get('use_revin', False),
             use_cnn_adapter=artifact.get('use_cnn_adapter', False),
             adapter_channel_indices=artifact.get('adapter_channel_indices'),
+            use_ramp_expert=artifact.get('use_ramp_expert', False),
+            ramp_fusion_mode=artifact.get('ramp_fusion_mode', 'none'),
         )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
@@ -314,7 +354,7 @@ def build_model_from_weights(model_name, artifact):
 
 def load_trained_model(model_name, farm_id, artifact):
     if (
-        model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}
+        model_name in TUNED_DERIVED_MODEL_NAMES
         and artifact.get('use_seed_ensemble', False)
     ):
         ensemble_paths = artifact.get('ensemble_model_paths') or []
@@ -350,18 +390,15 @@ def load_trained_model(model_name, farm_id, artifact):
             PATCHTST_MODEL_DIR,
             f'patchtst_farm_{farm_id}_best.weights.h5',
         )
-    elif model_name in {TUNED_MODEL_NAME, EXTERNAL_TEACHER_MODEL_NAME}:
+    elif model_name in TUNED_DERIVED_MODEL_NAMES:
         if model_name == TUNED_MODEL_NAME:
             default_model_dir = TUNED_SAVED_MODEL_DIR
             default_weights_dir = TUNED_WEIGHTS_DIR
         else:
-            default_model_dir = os.path.join(
-                './models',
-                EXTERNAL_TEACHER_MODEL_NAME,
-            )
+            default_model_dir = os.path.join('./models', model_name)
             default_weights_dir = os.path.join(
                 BASE_RESULT_DIR,
-                EXTERNAL_TEACHER_MODEL_NAME,
+                model_name,
                 'weights',
             )
         model_path = artifact.get('model_path') or os.path.join(
