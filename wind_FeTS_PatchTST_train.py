@@ -24,13 +24,22 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from wind_dl_model_train import (
+    BATCH_SIZE as BASELINE_BATCH_SIZE,
     DATA_DIR,
+    DROPOUT as BASELINE_DROPOUT,
+    EPOCHS as BASELINE_EPOCHS,
     FORECAST_LEN,
+    HEAD_DROPOUT as BASELINE_HEAD_DROPOUT,
     HISTORY_LEN,
+    LEARNING_RATE as BASELINE_LEARNING_RATE,
+    PATCH_LEN as BASELINE_PATCH_LEN,
+    PATCH_STRIDE as BASELINE_PATCH_STRIDE,
     TARGET_COL,
     TIME_FREQ,
+    VALIDATION_SPLIT as BASELINE_VALIDATION_SPLIT,
     build_scaled_arrays,
     load_and_preprocess,
+    make_window_dataset,
 )
 
 warnings.filterwarnings('ignore')
@@ -49,17 +58,21 @@ HISTORY_DIR = os.path.join(MODEL_DIR, 'history')
 TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
 TAIL_DIR = os.path.join(MODEL_DIR, 'tails')
 
-BATCH_SIZE = int(os.getenv('WIND_FETS_BATCH_SIZE', '256'))
-EPOCHS = int(os.getenv('WIND_FETS_EPOCHS', '80'))
-VALIDATION_SPLIT = float(os.getenv('WIND_FETS_VALIDATION_SPLIT', '0.15'))
-LEARNING_RATE = float(os.getenv('WIND_FETS_LEARNING_RATE', '5e-4'))
+BATCH_SIZE = int(os.getenv('WIND_FETS_BATCH_SIZE', str(BASELINE_BATCH_SIZE)))
+EPOCHS = int(os.getenv('WIND_FETS_EPOCHS', str(BASELINE_EPOCHS)))
+VALIDATION_SPLIT = float(
+    os.getenv('WIND_FETS_VALIDATION_SPLIT', str(BASELINE_VALIDATION_SPLIT))
+)
+LEARNING_RATE = float(
+    os.getenv('WIND_FETS_LEARNING_RATE', str(BASELINE_LEARNING_RATE))
+)
 
 # 与 817fe4... 原生 PatchTST 保持一致，避免同时改变 patch 和表示宽度。
-PATCH_LEN = 16
-PATCH_STRIDE = 8
+PATCH_LEN = BASELINE_PATCH_LEN
+PATCH_STRIDE = BASELINE_PATCH_STRIDE
 D_MODEL = 64
-DROPOUT = 0.15
-HEAD_DROPOUT = 0.2
+DROPOUT = BASELINE_DROPOUT
+HEAD_DROPOUT = BASELINE_HEAD_DROPOUT
 
 # FeTS 官方 Fourier/polynomial mask 和 DSFFN 配置。
 FOURIER_DEGREE = 2
@@ -67,6 +80,8 @@ POLYNOMIAL_DEGREE = 2
 ADAFE_KERNEL_SIZE = 5
 ADAFE_PADDING = 2
 FFN_RATIO = 2
+# 仅限制直通估计器的反向代理幅度；官方二值 mask 的前向结果不变。
+SOFT_MASK_LOGIT_CLIP = 20.0
 
 
 def discover_train_files(data_dir=DATA_DIR):
@@ -137,7 +152,14 @@ class FeTSPatchExtract(layers.Layer):
 class FourierPolynomialMask(layers.Layer):
     """Fourier 与 polynomial 基函数生成的 FeTS 可学习 mask。"""
 
-    def __init__(self, input_dim, output_dim, fourier_degree, poly_degree, **kwargs):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        fourier_degree,
+        poly_degree,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         if input_dim <= 0 or output_dim <= 0:
             raise ValueError('input_dim 和 output_dim 必须为正整数')
@@ -189,12 +211,19 @@ class FourierPolynomialMask(layers.Layer):
         pi = tf.cast(np.pi, dtype)
         k_cos = tf.cast(tf.range(self.fourier_degree + 1), dtype)
         k_sin = tf.cast(tf.range(1, self.fourier_degree + 1), dtype)
-        k_poly = tf.cast(tf.range(self.poly_degree + 1), dtype)
 
         expanded = inputs[..., None]
         x_cos = tf.cos(expanded * k_cos * pi)
         x_sin = tf.sin(expanded * k_sin * pi)
-        x_poly = tf.pow(expanded, k_poly)
+        # 不使用 tf.pow(x, 0)：TensorFlow 在 x == 0 时对该表达式的反向
+        # 梯度是 NaN。逐次乘法与 [x^0, x^1, ..., x^p] 前向等价，且零点
+        # 梯度有限。
+        poly_terms = [tf.ones_like(inputs)]
+        current_power = tf.ones_like(inputs)
+        for _ in range(self.poly_degree):
+            current_power = current_power * inputs
+            poly_terms.append(current_power)
+        x_poly = tf.stack(poly_terms, axis=-1)
 
         y_cos = tf.einsum('bid,iod->bo', x_cos, self.cos_coeffs)
         y_sin = tf.einsum('bid,iod->bo', x_sin, self.sin_coeffs)
@@ -224,6 +253,7 @@ class AdaptiveFeatureExtraction(layers.Layer):
         poly_degree,
         kernel_size=5,
         padding=2,
+        soft_mask_logit_clip=SOFT_MASK_LOGIT_CLIP,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -231,12 +261,15 @@ class AdaptiveFeatureExtraction(layers.Layer):
             raise ValueError('kernel_size 必须为正，padding 不能为负')
         if 2 * padding != kernel_size - 1:
             raise ValueError('AdaFE 需要 2 * padding == kernel_size - 1 以保持维度')
+        if soft_mask_logit_clip <= 0:
+            raise ValueError('soft_mask_logit_clip 必须为正数')
 
         self.d_model = int(d_model)
         self.fourier_degree = int(fourier_degree)
         self.poly_degree = int(poly_degree)
         self.kernel_size = int(kernel_size)
         self.padding = int(padding)
+        self.soft_mask_logit_clip = float(soft_mask_logit_clip)
         self.mask = FourierPolynomialMask(
             self.d_model,
             self.d_model,
@@ -261,7 +294,12 @@ class AdaptiveFeatureExtraction(layers.Layer):
         hard_active = tf.cast(mask > threshold, inputs.dtype)
         # 前向仍是官方二值 mask；直通估计器让 Fourier/polynomial 参数能够
         # 获得梯度，避免框架迁移后这些“可学习”参数实际被冻结。
-        soft_active = tf.sigmoid(mask - threshold)
+        centered_mask = tf.clip_by_value(
+            mask - threshold,
+            tf.cast(-self.soft_mask_logit_clip, inputs.dtype),
+            tf.cast(self.soft_mask_logit_clip, inputs.dtype),
+        )
+        soft_active = tf.sigmoid(centered_mask)
         active = soft_active + tf.stop_gradient(hard_active - soft_active)
 
         paddings = [[0, 0], [self.padding, self.padding]]
@@ -289,6 +327,7 @@ class AdaptiveFeatureExtraction(layers.Layer):
             'poly_degree': self.poly_degree,
             'kernel_size': self.kernel_size,
             'padding': self.padding,
+            'soft_mask_logit_clip': self.soft_mask_logit_clip,
         })
         return config
 
@@ -525,50 +564,78 @@ def build_fets_patchtst_model(
     return model
 
 
-def make_window_datasets(
+def validate_preprocessed_data(
+    train_df,
     features,
     target,
-    history_len,
-    forecast_len,
-    batch_size,
-    validation_split,
+    input_cols,
+    target_index,
 ):
-    """按时间顺序切分训练/验证窗口，不设置固定随机种子。"""
-    n_samples = len(features) - history_len - forecast_len + 1
-    if n_samples <= 1:
-        raise ValueError('数据量不足，无法构造训练和验证窗口')
-    if not 0 < validation_split < 1:
-        raise ValueError('validation_split 必须位于 (0, 1)')
-
-    target_windows = np.lib.stride_tricks.sliding_window_view(
-        target,
-        forecast_len,
-    )
-    target_windows = target_windows[
-        history_len:history_len + n_samples
-    ].astype(np.float32)
-
-    split_idx = int(n_samples * (1 - validation_split))
-    split_idx = max(1, min(split_idx, n_samples - 1))
-
-    def _make_dataset(start, sample_count, shuffle):
-        data_slice = features[
-            start:start + sample_count + history_len - 1
-        ]
-        target_slice = target_windows[start:start + sample_count]
-        dataset = keras.utils.timeseries_dataset_from_array(
-            data=data_slice,
-            targets=target_slice,
-            sequence_length=history_len,
-            sequence_stride=1,
-            shuffle=shuffle,
-            batch_size=batch_size,
+    """在进入模型前校验公共预处理结果，避免把数据错误误判为模型发散。"""
+    if TARGET_COL not in train_df.columns:
+        raise ValueError(f"预处理结果缺少目标列 '{TARGET_COL}'")
+    if target_index is None or input_cols[target_index] != TARGET_COL:
+        raise ValueError('历史功率通道索引与公共预处理结果不一致')
+    if features.ndim != 2 or features.shape[1] != len(input_cols):
+        raise ValueError(
+            f'特征形状与列数不一致: features={features.shape}, '
+            f'input_cols={len(input_cols)}'
         )
-        return dataset.prefetch(tf.data.AUTOTUNE)
+    if target.ndim != 1 or len(target) != len(features):
+        raise ValueError(
+            f'目标形状与特征长度不一致: target={target.shape}, '
+            f'features={features.shape}'
+        )
+    if not np.isfinite(features).all():
+        bad_count = int((~np.isfinite(features)).sum())
+        raise ValueError(f'公共预处理后的输入包含 {bad_count} 个非有限值')
+    if not np.isfinite(target).all():
+        bad_count = int((~np.isfinite(target)).sum())
+        raise ValueError(f'公共预处理后的目标包含 {bad_count} 个非有限值')
 
-    train_ds = _make_dataset(0, split_idx, True)
-    val_ds = _make_dataset(split_idx, n_samples - split_idx, False)
-    return train_ds, val_ds, split_idx, n_samples
+
+class NonFiniteTrainingGuard(keras.callbacks.Callback):
+    """检测到非有限训练指标后停止，防止保存损坏模型。"""
+
+    def __init__(self):
+        super().__init__()
+        self.failure = None
+
+    def on_train_batch_end(self, batch, logs=None):
+        logs = logs or {}
+        bad_metrics = {}
+        for name, value in logs.items():
+            if value is None:
+                continue
+            numeric_value = float(value)
+            if not np.isfinite(numeric_value):
+                bad_metrics[name] = numeric_value
+        if bad_metrics:
+            self.failure = {
+                'batch': int(batch),
+                'metrics': bad_metrics,
+            }
+            self.model.stop_training = True
+            print(
+                '\n检测到非有限训练指标，已停止当前场站训练: '
+                f'batch={batch}, metrics={bad_metrics}'
+            )
+
+
+def ensure_finite_training_history(history, guard):
+    if guard.failure is not None:
+        raise FloatingPointError(
+            'FeTS-PatchTST 训练发生数值发散，未保存模型。'
+            f"首个异常 batch={guard.failure['batch']}, "
+            f"metrics={guard.failure['metrics']}"
+        )
+
+    for metric_name, values in history.history.items():
+        numeric_values = np.asarray(values, dtype=float)
+        if not np.isfinite(numeric_values).all():
+            raise FloatingPointError(
+                f'FeTS-PatchTST 的 {metric_name} 包含非有限值，未保存模型'
+            )
 
 
 def inverse_power(scaler_y, values):
@@ -585,6 +652,11 @@ def evaluate_model(model, val_ds, scaler_y, capacity=None):
 
     y_true = inverse_power(scaler_y, y_true_scaled)
     y_pred = inverse_power(scaler_y, y_pred_scaled)
+    if not np.isfinite(y_pred).all():
+        bad_count = int((~np.isfinite(y_pred)).sum())
+        raise FloatingPointError(
+            f'验证集预测包含 {bad_count} 个非有限值，未保存模型'
+        )
     y_pred = np.clip(y_pred, 0, capacity if capacity is not None else None)
 
     mae = float(mean_absolute_error(y_true, y_pred))
@@ -697,7 +769,15 @@ def train_one_farm(train_file):
         scaler_x,
         scaler_y,
     ) = build_scaled_arrays(train_df, feature_cols)
-    train_ds, val_ds, train_samples, total_samples = make_window_datasets(
+    validate_preprocessed_data(
+        train_df,
+        features,
+        target,
+        input_cols,
+        target_index,
+    )
+    # 与 wind_dl_model_train.py 使用完全相同的滑窗及时间顺序验证切分。
+    train_ds, val_ds, train_samples, total_samples = make_window_dataset(
         features,
         target,
         HISTORY_LEN,
@@ -736,7 +816,9 @@ def train_one_farm(train_file):
         f'farm_{farm_id}',
         datetime.now().strftime('%Y%m%d-%H%M%S'),
     )
+    non_finite_guard = NonFiniteTrainingGuard()
     callbacks = [
+        non_finite_guard,
         keras.callbacks.TensorBoard(
             log_dir=tensorboard_log_dir,
             histogram_freq=0,
@@ -773,12 +855,17 @@ def train_one_farm(train_file):
         callbacks=callbacks,
         verbose=1,
     )
-    if os.path.exists(best_weights_path):
-        model.load_weights(best_weights_path)
-    model.save(model_path)
-
     history_path, history_plot_path = save_history_artifacts(history, farm_id)
+    ensure_finite_training_history(history, non_finite_guard)
+
+    if not os.path.exists(best_weights_path):
+        raise FileNotFoundError(
+            f'训练完成但未生成最佳权重，未保存模型: {best_weights_path}'
+        )
+    model.load_weights(best_weights_path)
+
     metrics = evaluate_model(model, val_ds, scaler_y, capacity)
+    model.save(model_path)
     print(
         f"验证集反归一化 MAE: {metrics['val_mae']:.4f}, "
         f"RMSE: {metrics['val_rmse']:.4f}"
