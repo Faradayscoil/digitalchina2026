@@ -1,0 +1,9 @@
+# Ignore every root-level file and directory by default.
+/*
+
+# Keep Git rules and the source files used by this branch visible to Git.
+!/.gitignore
+!/wind_dl_model_predict.py
+!/wind_dl_model_train.py
+!/wind_dl_other_models_train.py
+!/wind_FeTS_PatchTST_train.py

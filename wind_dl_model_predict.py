@@ -10,6 +10,19 @@ import tensorflow as tf
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow import keras
 
+from wind_FeTS_PatchTST_train import (
+    BATCH_SIZE as FETS_PATCHTST_BATCH_SIZE,
+    PREPROCESS_DIR as FETS_PATCHTST_PREPROCESS_DIR,
+    SAVED_MODEL_DIR as FETS_PATCHTST_SAVED_MODEL_DIR,
+    WEIGHTS_DIR as FETS_PATCHTST_WEIGHTS_DIR,
+    AdaptiveFeatureExtraction,
+    DualScaleFeedForward,
+    FeTSFeatureBlock,
+    FeTSPatchExtract,
+    FourierPolynomialMask,
+    SelectChannel,
+    build_fets_patchtst_model,
+)
 from wind_dl_model_train import (
     BATCH_SIZE as PATCHTST_BATCH_SIZE,
     DATA_DIR,
@@ -53,9 +66,18 @@ warnings.filterwarnings('ignore')
 TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
-ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME] + OTHER_MODEL_NAMES
+FETS_PATCHTST_MODEL_NAME = 'fets_patchtst'
+ALL_MODEL_NAMES = [
+    PATCHTST_MODEL_NAME,
+    FETS_PATCHTST_MODEL_NAME,
+] + OTHER_MODEL_NAMES
 OUTPUT_SUBDIR = 'testdata_predict_output'
-PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
+PRED_BATCH_SIZE = max(
+    256,
+    PATCHTST_BATCH_SIZE,
+    FETS_PATCHTST_BATCH_SIZE,
+    OTHER_BATCH_SIZE,
+)
 EXP_WEIGHT_HALFLIFE_STEPS = 4.0
 PREDICT_VERBOSE = int(os.getenv('WIND_DL_PREDICT_VERBOSE', '1'))
 
@@ -114,6 +136,18 @@ def get_custom_objects():
         'WindPatchTST>LearnablePositionEmbedding': LearnablePositionEmbedding,
         'TakeChannel': TakeChannel,
         'WindPatchTST>TakeChannel': TakeChannel,
+        'FeTSPatchExtract': FeTSPatchExtract,
+        'WindFeTSPatchTST>FeTSPatchExtract': FeTSPatchExtract,
+        'FourierPolynomialMask': FourierPolynomialMask,
+        'WindFeTSPatchTST>FourierPolynomialMask': FourierPolynomialMask,
+        'AdaptiveFeatureExtraction': AdaptiveFeatureExtraction,
+        'WindFeTSPatchTST>AdaptiveFeatureExtraction': AdaptiveFeatureExtraction,
+        'DualScaleFeedForward': DualScaleFeedForward,
+        'WindFeTSPatchTST>DualScaleFeedForward': DualScaleFeedForward,
+        'FeTSFeatureBlock': FeTSFeatureBlock,
+        'WindFeTSPatchTST>FeTSFeatureBlock': FeTSFeatureBlock,
+        'SelectChannel': SelectChannel,
+        'WindFeTSPatchTST>SelectChannel': SelectChannel,
         'FixedPositionEmbedding': FixedPositionEmbedding,
         'WindInformer>FixedPositionEmbedding': FixedPositionEmbedding,
         'CircularTokenEmbedding': CircularTokenEmbedding,
@@ -147,6 +181,11 @@ def load_artifact(model_name, farm_id):
             PATCHTST_MODEL_DIR,
             f'patchtst_farm_{farm_id}_preprocess.pkl',
         )
+    elif model_name == FETS_PATCHTST_MODEL_NAME:
+        artifact_path = os.path.join(
+            FETS_PATCHTST_PREPROCESS_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_preprocess.pkl',
+        )
     else:
         artifact_path = os.path.join(
             BASE_RESULT_DIR,
@@ -166,6 +205,21 @@ def load_artifact(model_name, farm_id):
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+    if model_name == FETS_PATCHTST_MODEL_NAME:
+        return build_fets_patchtst_model(
+            len(artifact['input_cols']),
+            artifact['target_index'],
+            history_len=artifact.get('history_len', HISTORY_LEN),
+            forecast_len=artifact.get('forecast_len', FORECAST_LEN),
+            patch_len=artifact.get('patch_len', 16),
+            patch_stride=artifact.get('patch_stride', 8),
+            d_model=artifact.get('d_model', 64),
+            dropout=artifact.get('dropout', 0.15),
+            head_dropout=artifact.get('head_dropout', 0.2),
+            fourier_degree=artifact.get('fourier_degree', 2),
+            poly_degree=artifact.get('poly_degree', 2),
+            ffn_ratio=artifact.get('ffn_ratio', 2),
+        )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
     builder = MODEL_BUILDERS[model_name]
@@ -183,6 +237,15 @@ def load_trained_model(model_name, farm_id, artifact):
         best_weights_path = artifact.get('best_weights_path') or os.path.join(
             PATCHTST_MODEL_DIR,
             f'patchtst_farm_{farm_id}_best.weights.h5',
+        )
+    elif model_name == FETS_PATCHTST_MODEL_NAME:
+        model_path = artifact.get('model_path') or os.path.join(
+            FETS_PATCHTST_SAVED_MODEL_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}.keras',
+        )
+        best_weights_path = artifact.get('best_weights_path') or os.path.join(
+            FETS_PATCHTST_WEIGHTS_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_best.weights.h5',
         )
     else:
         model_path = artifact.get('model_path') or os.path.join(
