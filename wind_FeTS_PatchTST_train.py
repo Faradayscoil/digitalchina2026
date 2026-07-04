@@ -1,12 +1,16 @@
 """FeTS-PatchTST 在风电超短期功率预测任务上的训练入口。
 
-模型主干按 lllucky111/FeTS 官方 PyTorch 实现重写为 TensorFlow/Keras：
+模型在原生 PatchTST 上接入按 lllucky111/FeTS 官方张量逻辑重写的模块：
 
-    patch embedding -> AdaFE -> LayerNorm -> DSFFN -> residual -> flatten head
+    patch embedding
+    -> batch-independent AdaFE -> DSFFN
+    -> per-patch cross-channel attention
+    -> PatchTST positional embedding + Transformer encoders
+    -> target/global-context MLP head
 
-风电适配仅保留目标功率通道的 16 步输出，并复用原生 PatchTST 基线的数据
-预处理、历史窗口、时间顺序验证划分、优化器和损失。此文件不包含 k-fold、
-多随机种子、RevIN、自蒸馏、外部 teacher 或输出专家等额外策略。
+模型复用原生 PatchTST 基线的数据预处理、历史窗口、时序编码器、预测 head、
+验证划分、优化器和损失。此文件不包含 k-fold、多随机种子、RevIN、
+自蒸馏、外部 teacher 或输出专家等额外策略。
 """
 
 import glob
@@ -21,31 +25,41 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, regularizers
 
 from wind_dl_model_train import (
     BATCH_SIZE as BASELINE_BATCH_SIZE,
     DATA_DIR,
+    D_FF as BASELINE_D_FF,
+    D_MODEL as BASELINE_D_MODEL,
     DROPOUT as BASELINE_DROPOUT,
     EPOCHS as BASELINE_EPOCHS,
     FORECAST_LEN,
     HEAD_DROPOUT as BASELINE_HEAD_DROPOUT,
     HISTORY_LEN,
     LEARNING_RATE as BASELINE_LEARNING_RATE,
+    N_HEADS as BASELINE_N_HEADS,
+    N_LAYERS as BASELINE_N_LAYERS,
     PATCH_LEN as BASELINE_PATCH_LEN,
     PATCH_STRIDE as BASELINE_PATCH_STRIDE,
     TARGET_COL,
     TIME_FREQ,
     VALIDATION_SPLIT as BASELINE_VALIDATION_SPLIT,
+    LearnablePositionEmbedding,
+    MergeChannels,
+    RestoreChannels,
+    TakeChannel,
     build_scaled_arrays,
     load_and_preprocess,
     make_window_dataset,
+    transformer_encoder,
 )
 
 warnings.filterwarnings('ignore')
 
 
 MODEL_NAME = 'fets_patchtst'
+ARCHITECTURE_VERSION = 'fets_patchtst_hybrid_v2'
 OFFICIAL_REPOSITORY = 'https://github.com/lllucky111/FeTS'
 OFFICIAL_REVISION = 'd908e434b70f3cf69065004e295db13cdb9790b2'
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
@@ -70,9 +84,13 @@ LEARNING_RATE = float(
 # 与 817fe4... 原生 PatchTST 保持一致，避免同时改变 patch 和表示宽度。
 PATCH_LEN = BASELINE_PATCH_LEN
 PATCH_STRIDE = BASELINE_PATCH_STRIDE
-D_MODEL = 64
+D_MODEL = BASELINE_D_MODEL
+N_HEADS = BASELINE_N_HEADS
+N_LAYERS = BASELINE_N_LAYERS
+D_FF = BASELINE_D_FF
 DROPOUT = BASELINE_DROPOUT
 HEAD_DROPOUT = BASELINE_HEAD_DROPOUT
+CROSS_CHANNEL_HEADS = N_HEADS
 
 # FeTS 官方 Fourier/polynomial mask 和 DSFFN 配置。
 FOURIER_DEGREE = 2
@@ -289,8 +307,9 @@ class AdaptiveFeatureExtraction(layers.Layer):
 
     def call(self, inputs):
         mask = self.mask(inputs)
-        # 官方实现使用整个当前 batch/token 集合的 mask 均值作为单一阈值。
-        threshold = tf.reduce_mean(mask)
+        # inputs 的每一行对应一个独立 patch；只在该 patch 的表示维度内计算
+        # 阈值，避免同一样本的预测随 batch 组成或 batch size 改变。
+        threshold = tf.reduce_mean(mask, axis=-1, keepdims=True)
         hard_active = tf.cast(mask > threshold, inputs.dtype)
         # 前向仍是官方二值 mask；直通估计器让 Fourier/polynomial 参数能够
         # 获得梯度，避免框架迁移后这些“可学习”参数实际被冻结。
@@ -467,6 +486,95 @@ class FeTSFeatureBlock(layers.Layer):
 
 
 @keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class FeTSChannelPatchTranspose(layers.Layer):
+    """[batch, channel, d_model, patch] -> [batch, channel, patch, d_model]。"""
+
+    def call(self, inputs):
+        return tf.transpose(inputs, [0, 1, 3, 2])
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], input_shape[1], input_shape[3], input_shape[2]
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class PatchCrossChannelAttention(layers.Layer):
+    """在每个 temporal patch 内对所有变量执行跨通道自注意力。"""
+
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        if d_model % n_heads != 0:
+            raise ValueError('d_model 必须能被 cross-channel n_heads 整除')
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.d_ff = int(d_ff)
+        self.dropout_rate = float(dropout)
+
+        self.attention = layers.MultiHeadAttention(
+            num_heads=self.n_heads,
+            key_dim=self.d_model // self.n_heads,
+            dropout=self.dropout_rate,
+            name='channel_mha',
+        )
+        self.attention_dropout = layers.Dropout(self.dropout_rate)
+        self.attention_norm = layers.LayerNormalization(
+            epsilon=1e-6,
+            name='channel_attention_norm',
+        )
+        self.ff_in = layers.Dense(
+            self.d_ff,
+            activation='gelu',
+            name='channel_ff_in',
+        )
+        self.ff_dropout = layers.Dropout(self.dropout_rate)
+        self.ff_out = layers.Dense(self.d_model, name='channel_ff_out')
+        self.output_dropout = layers.Dropout(self.dropout_rate)
+        self.output_norm = layers.LayerNormalization(
+            epsilon=1e-6,
+            name='channel_output_norm',
+        )
+
+    def call(self, inputs, training=None):
+        # [B, C, N, D] -> [B*N, C, D]，每个 patch 独立沿 C 维注意力。
+        shape = tf.shape(inputs)
+        batch_size, n_channels, patch_num = shape[0], shape[1], shape[2]
+        x = tf.transpose(inputs, [0, 2, 1, 3])
+        x = tf.reshape(
+            x,
+            [batch_size * patch_num, n_channels, self.d_model],
+        )
+
+        attention = self.attention(x, x, training=training)
+        x = self.attention_norm(
+            x + self.attention_dropout(attention, training=training)
+        )
+        ff = self.ff_in(x)
+        ff = self.ff_dropout(ff, training=training)
+        ff = self.ff_out(ff)
+        x = self.output_norm(
+            x + self.output_dropout(ff, training=training)
+        )
+
+        x = tf.reshape(
+            x,
+            [batch_size, patch_num, n_channels, self.d_model],
+        )
+        return tf.transpose(x, [0, 2, 1, 3])
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'd_ff': self.d_ff,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
 class SelectChannel(layers.Layer):
     """从 [batch, channel, ...] 中选择目标功率通道。"""
 
@@ -499,12 +607,20 @@ def build_fets_patchtst_model(
     fourier_degree=FOURIER_DEGREE,
     poly_degree=POLYNOMIAL_DEGREE,
     ffn_ratio=FFN_RATIO,
+    n_heads=N_HEADS,
+    n_layers=N_LAYERS,
+    d_ff=D_FF,
+    cross_channel_heads=CROSS_CHANNEL_HEADS,
 ):
-    """构建官方 FeTS 主干的单目标风电预测模型。"""
+    """构建 FeTS patch 增强 + 跨变量融合 + PatchTST 时序主干。"""
     if target_channel_index is None:
         raise ValueError('FeTS-PatchTST 需要将历史功率作为输入通道')
     if not 0 <= target_channel_index < input_dim:
         raise ValueError('target_channel_index 超出输入通道范围')
+    if d_model % n_heads != 0:
+        raise ValueError('d_model 必须能被 PatchTST n_heads 整除')
+    if d_model % cross_channel_heads != 0:
+        raise ValueError('d_model 必须能被 cross_channel_heads 整除')
 
     patch_num = compute_patch_num(history_len, patch_len, patch_stride)
     inputs = keras.Input(
@@ -527,22 +643,71 @@ def build_fets_patchtst_model(
         padding=ADAFE_PADDING,
         name='fets_feature_block',
     )(x)
+    x = FeTSChannelPatchTranspose(
+        name='restore_patch_order',
+    )(x)
+    x = PatchCrossChannelAttention(
+        d_model=d_model,
+        n_heads=cross_channel_heads,
+        d_ff=d_ff,
+        dropout=dropout,
+        name='cross_channel_attention',
+    )(x)
 
-    # 官方共享 Flatten_Head 在 MS 单目标任务上仅由目标通道产生损失；
-    # 因而先选目标功率通道再使用同构的 Flatten -> Linear -> Dropout。
-    x = SelectChannel(
+    # 恢复 817fe4... 原生 PatchTST 的 patch 时序建模主干。
+    x = MergeChannels(name='merge_channels')(x)
+    x = LearnablePositionEmbedding(
+        patch_num,
+        d_model,
+        name='position_embedding',
+    )(x)
+    x = layers.Dropout(dropout, name='patch_dropout')(x)
+    for idx in range(n_layers):
+        x = transformer_encoder(
+            x,
+            d_model,
+            n_heads,
+            d_ff,
+            dropout,
+            name=f'encoder_{idx + 1}',
+        )
+
+    x = RestoreChannels(
+        input_dim,
+        patch_num,
+        d_model,
+        name='restore_channels',
+    )(x)
+    target_repr = TakeChannel(
         target_channel_index,
         name='target_power_channel',
     )(x)
-    x = layers.Reshape(
-        (d_model * patch_num,),
-        name='flatten_head',
+    target_repr = layers.Flatten(name='target_flatten')(target_repr)
+    global_context = layers.GlobalAveragePooling2D(
+        name='channel_context_pool',
     )(x)
-    x = layers.Dense(forecast_len, name='forecast_linear')(x)
-    outputs = layers.Dropout(
+
+    head = layers.Concatenate(
+        name='forecast_context',
+    )([target_repr, global_context])
+    head = layers.Dropout(
+        head_dropout,
+        name='head_dropout',
+    )(head)
+    head = layers.Dense(
+        d_ff,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-4),
+        name='forecast_ff',
+    )(head)
+    head = layers.Dropout(
         head_dropout,
         name='forecast_dropout',
-    )(x)
+    )(head)
+    outputs = layers.Dense(
+        forecast_len,
+        name='forecast_power',
+    )(head)
 
     model = keras.Model(
         inputs=inputs,
@@ -873,6 +1038,7 @@ def train_one_farm(train_file):
 
     artifact = {
         'model_name': MODEL_NAME,
+        'architecture_version': ARCHITECTURE_VERSION,
         'farm_id': farm_id,
         'feature_cols': feature_cols,
         'input_cols': input_cols,
@@ -892,6 +1058,12 @@ def train_one_farm(train_file):
         'fourier_degree': FOURIER_DEGREE,
         'poly_degree': POLYNOMIAL_DEGREE,
         'ffn_ratio': FFN_RATIO,
+        'n_heads': N_HEADS,
+        'n_layers': N_LAYERS,
+        'd_ff': D_FF,
+        'cross_channel_heads': CROSS_CHANNEL_HEADS,
+        'adafe_threshold': 'per_patch',
+        'cross_channel_attention': True,
         'official_repository': OFFICIAL_REPOSITORY,
         'official_revision': OFFICIAL_REVISION,
         'model_path': model_path,

@@ -11,15 +11,18 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow import keras
 
 from wind_FeTS_PatchTST_train import (
+    ARCHITECTURE_VERSION as FETS_PATCHTST_ARCHITECTURE_VERSION,
     BATCH_SIZE as FETS_PATCHTST_BATCH_SIZE,
     PREPROCESS_DIR as FETS_PATCHTST_PREPROCESS_DIR,
     SAVED_MODEL_DIR as FETS_PATCHTST_SAVED_MODEL_DIR,
     WEIGHTS_DIR as FETS_PATCHTST_WEIGHTS_DIR,
     AdaptiveFeatureExtraction,
     DualScaleFeedForward,
+    FeTSChannelPatchTranspose,
     FeTSFeatureBlock,
     FeTSPatchExtract,
     FourierPolynomialMask,
+    PatchCrossChannelAttention,
     SelectChannel,
     build_fets_patchtst_model,
 )
@@ -146,6 +149,10 @@ def get_custom_objects():
         'WindFeTSPatchTST>DualScaleFeedForward': DualScaleFeedForward,
         'FeTSFeatureBlock': FeTSFeatureBlock,
         'WindFeTSPatchTST>FeTSFeatureBlock': FeTSFeatureBlock,
+        'FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
+        'WindFeTSPatchTST>FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
+        'PatchCrossChannelAttention': PatchCrossChannelAttention,
+        'WindFeTSPatchTST>PatchCrossChannelAttention': PatchCrossChannelAttention,
         'SelectChannel': SelectChannel,
         'WindFeTSPatchTST>SelectChannel': SelectChannel,
         'FixedPositionEmbedding': FixedPositionEmbedding,
@@ -198,6 +205,16 @@ def load_artifact(model_name, farm_id):
         raise FileNotFoundError(
             f'未找到 {model_name} 场站 {farm_id} 的预处理文件: {artifact_path}')
     artifact = joblib.load(artifact_path)
+    if (
+        model_name == FETS_PATCHTST_MODEL_NAME
+        and artifact.get('architecture_version')
+        != FETS_PATCHTST_ARCHITECTURE_VERSION
+    ):
+        raise FileNotFoundError(
+            f'场站 {farm_id} 的 FeTS-PatchTST artifact 属于旧版 standalone '
+            f"结构（{artifact.get('architecture_version', 'unknown')}），"
+            '请使用当前训练脚本重新训练后再预测'
+        )
     artifact['artifact_path'] = artifact_path
     return artifact
 
@@ -219,6 +236,10 @@ def build_model_from_weights(model_name, artifact):
             fourier_degree=artifact.get('fourier_degree', 2),
             poly_degree=artifact.get('poly_degree', 2),
             ffn_ratio=artifact.get('ffn_ratio', 2),
+            n_heads=artifact.get('n_heads', 4),
+            n_layers=artifact.get('n_layers', 3),
+            d_ff=artifact.get('d_ff', 128),
+            cross_channel_heads=artifact.get('cross_channel_heads', 4),
         )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
