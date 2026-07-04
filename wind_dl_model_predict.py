@@ -243,6 +243,16 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
     multi_seed_values = artifact.get('multi_seed_values')
     if isinstance(multi_seed_values, (list, tuple)):
         multi_seed_values = ','.join(str(value) for value in multi_seed_values)
+    ramp_expert_dilations = artifact.get('ramp_expert_dilations')
+    if isinstance(ramp_expert_dilations, np.ndarray):
+        ramp_expert_dilations = ramp_expert_dilations.tolist()
+    if isinstance(ramp_expert_dilations, (list, tuple, dict)):
+        # DataFrame column assignment treats a list as row-wise data.  Keep
+        # structured artifact metadata as one scalar value per metric row.
+        ramp_expert_dilations = json.dumps(
+            ramp_expert_dilations,
+            ensure_ascii=False,
+        )
     return {
         'selected_ablation_variant': artifact.get(
             'selected_ablation_variant',
@@ -265,9 +275,7 @@ def get_tuned_ablation_trace_fields(model_name, artifact):
             'ramp_expert_context_len'
         ),
         'ramp_expert_filters': artifact.get('ramp_expert_filters'),
-        'ramp_expert_dilations': artifact.get(
-            'ramp_expert_dilations'
-        ),
+        'ramp_expert_dilations': ramp_expert_dilations,
         'structural_ablation_step': artifact.get(
             'structural_ablation_step'
         ),
