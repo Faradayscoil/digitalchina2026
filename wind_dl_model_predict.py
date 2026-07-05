@@ -17,13 +17,17 @@ from wind_FeTS_PatchTST_train import (
     SAVED_MODEL_DIR as FETS_PATCHTST_SAVED_MODEL_DIR,
     WEIGHTS_DIR as FETS_PATCHTST_WEIGHTS_DIR,
     AdaptiveFeatureExtraction,
+    ChannelIdentityEmbedding,
     DualScaleFeedForward,
     FeTSChannelPatchTranspose,
     FeTSFeatureBlock,
     FeTSPatchExtract,
     FourierPolynomialMask,
+    LayerScaleFeTSFeatureBlock,
     PatchCrossChannelAttention,
     SelectChannel,
+    TakeLastToken,
+    TargetWeatherCrossAttention,
     build_fets_patchtst_model,
 )
 from wind_dl_model_train import (
@@ -149,10 +153,18 @@ def get_custom_objects():
         'WindFeTSPatchTST>DualScaleFeedForward': DualScaleFeedForward,
         'FeTSFeatureBlock': FeTSFeatureBlock,
         'WindFeTSPatchTST>FeTSFeatureBlock': FeTSFeatureBlock,
+        'ChannelIdentityEmbedding': ChannelIdentityEmbedding,
+        'WindFeTSPatchTST>ChannelIdentityEmbedding': ChannelIdentityEmbedding,
+        'LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
+        'WindFeTSPatchTST>LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
         'FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'WindFeTSPatchTST>FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'PatchCrossChannelAttention': PatchCrossChannelAttention,
         'WindFeTSPatchTST>PatchCrossChannelAttention': PatchCrossChannelAttention,
+        'TargetWeatherCrossAttention': TargetWeatherCrossAttention,
+        'WindFeTSPatchTST>TargetWeatherCrossAttention': TargetWeatherCrossAttention,
+        'TakeLastToken': TakeLastToken,
+        'WindFeTSPatchTST>TakeLastToken': TakeLastToken,
         'SelectChannel': SelectChannel,
         'WindFeTSPatchTST>SelectChannel': SelectChannel,
         'FixedPositionEmbedding': FixedPositionEmbedding,
@@ -211,8 +223,9 @@ def load_artifact(model_name, farm_id):
         != FETS_PATCHTST_ARCHITECTURE_VERSION
     ):
         raise FileNotFoundError(
-            f'场站 {farm_id} 的 FeTS-PatchTST artifact 属于旧版 standalone '
-            f"结构（{artifact.get('architecture_version', 'unknown')}），"
+            f'场站 {farm_id} 的 FeTS-PatchTST artifact 结构版本为 '
+            f"{artifact.get('architecture_version', 'unknown')}，"
+            f'当前预测代码要求 {FETS_PATCHTST_ARCHITECTURE_VERSION}；'
             '请使用当前训练脚本重新训练后再预测'
         )
     artifact['artifact_path'] = artifact_path
@@ -239,7 +252,11 @@ def build_model_from_weights(model_name, artifact):
             n_heads=artifact.get('n_heads', 4),
             n_layers=artifact.get('n_layers', 3),
             d_ff=artifact.get('d_ff', 128),
-            cross_channel_heads=artifact.get('cross_channel_heads', 4),
+            local_patch_len=artifact.get('local_patch_len', 4),
+            local_patch_stride=artifact.get('local_patch_stride', 2),
+            local_n_layers=artifact.get('local_n_layers', 2),
+            target_weather_heads=artifact.get('target_weather_heads', 4),
+            layer_scale_init=artifact.get('layer_scale_init', 1e-3),
         )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))

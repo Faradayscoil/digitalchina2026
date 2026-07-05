@@ -1,12 +1,13 @@
 """FeTS-PatchTST 在风电超短期功率预测任务上的训练入口。
 
-模型在原生 PatchTST 上接入按 lllucky111/FeTS 官方张量逻辑重写的模块：
+模型完整保留原生 PatchTST 长尺度分支，并增加面向局部爬坡的 FeTS 分支：
 
-    patch embedding
-    -> batch-independent AdaFE -> DSFFN
-    -> per-patch cross-channel attention
-    -> PatchTST positional embedding + Transformer encoders
-    -> target/global-context MLP head
+    原生长分支: patch(16, 8) -> PatchTST -> baseline forecast
+    局部 FeTS: patch(4, 2) -> channel embedding
+               -> AdaFE/DSFFN LayerScale residual
+               -> power-query/weather-key-value attention
+               -> local temporal encoder -> zero-init correction
+    最终输出: baseline forecast + local correction
 
 模型复用原生 PatchTST 基线的数据预处理、历史窗口、时序编码器、预测 head、
 验证划分、优化器和损失。此文件不包含 k-fold、多随机种子、RevIN、
@@ -47,6 +48,7 @@ from wind_dl_model_train import (
     VALIDATION_SPLIT as BASELINE_VALIDATION_SPLIT,
     LearnablePositionEmbedding,
     MergeChannels,
+    PatchExtract,
     RestoreChannels,
     TakeChannel,
     build_scaled_arrays,
@@ -59,7 +61,7 @@ warnings.filterwarnings('ignore')
 
 
 MODEL_NAME = 'fets_patchtst'
-ARCHITECTURE_VERSION = 'fets_patchtst_hybrid_v2'
+ARCHITECTURE_VERSION = 'fets_patchtst_multiscale_target_aware_v3'
 OFFICIAL_REPOSITORY = 'https://github.com/lllucky111/FeTS'
 OFFICIAL_REVISION = 'd908e434b70f3cf69065004e295db13cdb9790b2'
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
@@ -90,7 +92,13 @@ N_LAYERS = BASELINE_N_LAYERS
 D_FF = BASELINE_D_FF
 DROPOUT = BASELINE_DROPOUT
 HEAD_DROPOUT = BASELINE_HEAD_DROPOUT
-CROSS_CHANNEL_HEADS = N_HEADS
+
+# 局部分支使用 1 小时 patch、30 分钟步长，保留 patch 内 15 分钟细节。
+LOCAL_PATCH_LEN = 4
+LOCAL_PATCH_STRIDE = 2
+LOCAL_N_LAYERS = 2
+TARGET_WEATHER_HEADS = N_HEADS
+LAYER_SCALE_INIT = 1e-3
 
 # FeTS 官方 Fourier/polynomial mask 和 DSFFN 配置。
 FOURIER_DEGREE = 2
@@ -413,7 +421,7 @@ class DualScaleFeedForward(layers.Layer):
 
 @keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
 class FeTSFeatureBlock(layers.Layer):
-    """官方 AdaFE + LayerNorm + DSFFN + residual 完整处理块。"""
+    """第一轮模型的 FeTS 处理块，仅用于旧模型反序列化兼容。"""
 
     def __init__(
         self,
@@ -486,6 +494,153 @@ class FeTSFeatureBlock(layers.Layer):
 
 
 @keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class ChannelIdentityEmbedding(layers.Layer):
+    """为每个输入变量添加可学习身份，避免跨变量注意力丢失特征语义。"""
+
+    def __init__(self, n_channels, d_model, init_stddev=0.02, **kwargs):
+        super().__init__(**kwargs)
+        if n_channels <= 0 or d_model <= 0:
+            raise ValueError('n_channels 和 d_model 必须为正整数')
+        self.n_channels = int(n_channels)
+        self.d_model = int(d_model)
+        self.init_stddev = float(init_stddev)
+
+    def build(self, input_shape):
+        if input_shape[1] is not None and int(input_shape[1]) != self.n_channels:
+            raise ValueError(
+                f'输入通道数 {input_shape[1]} 与配置 {self.n_channels} 不一致'
+            )
+        if input_shape[-1] is not None and int(input_shape[-1]) != self.d_model:
+            raise ValueError(
+                f'输入表示维度 {input_shape[-1]} 与配置 {self.d_model} 不一致'
+            )
+        self.channel_embedding = self.add_weight(
+            name='channel_embedding',
+            shape=(1, self.n_channels, 1, self.d_model),
+            initializer=keras.initializers.RandomNormal(
+                stddev=self.init_stddev,
+            ),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        return inputs + tf.cast(self.channel_embedding, inputs.dtype)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'n_channels': self.n_channels,
+            'd_model': self.d_model,
+            'init_stddev': self.init_stddev,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class LayerScaleFeTSFeatureBlock(layers.Layer):
+    """AdaFE/DSFFN 适配器，以小幅 LayerScale 残差保护原始 patch 表示。"""
+
+    def __init__(
+        self,
+        d_model,
+        fourier_degree,
+        poly_degree,
+        ffn_ratio,
+        dropout,
+        layer_scale_init=1e-3,
+        kernel_size=5,
+        padding=2,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if layer_scale_init < 0:
+            raise ValueError('layer_scale_init 不能为负数')
+        self.d_model = int(d_model)
+        self.fourier_degree = int(fourier_degree)
+        self.poly_degree = int(poly_degree)
+        self.ffn_ratio = int(ffn_ratio)
+        self.dropout_rate = float(dropout)
+        self.layer_scale_init = float(layer_scale_init)
+        self.kernel_size = int(kernel_size)
+        self.padding = int(padding)
+
+        self.adafe = AdaptiveFeatureExtraction(
+            self.d_model,
+            self.fourier_degree,
+            self.poly_degree,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            name='adafe',
+        )
+        self.layer_norm = layers.LayerNormalization(
+            epsilon=1e-5,
+            name='feature_layer_norm',
+        )
+        self.dsffn = DualScaleFeedForward(
+            self.d_model,
+            self.ffn_ratio,
+            dropout=self.dropout_rate,
+            name='dsffn',
+        )
+
+    def build(self, input_shape):
+        if input_shape[-1] is not None and int(input_shape[-1]) != self.d_model:
+            raise ValueError(
+                f'输入表示维度 {input_shape[-1]} 与配置 {self.d_model} 不一致'
+            )
+        self.layer_scale = self.add_weight(
+            name='layer_scale',
+            shape=(self.d_model,),
+            initializer=keras.initializers.Constant(self.layer_scale_init),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        # inputs/residual: [batch, channel, patch_num, d_model]
+        shape = tf.shape(inputs)
+        batch_size, n_channels, patch_num = shape[0], shape[1], shape[2]
+
+        x = tf.reshape(inputs, [-1, self.d_model])
+        x = self.adafe(x)
+        x = self.layer_norm(x)
+        x = tf.reshape(
+            x,
+            [batch_size, n_channels, patch_num, self.d_model],
+        )
+        x = tf.transpose(x, [0, 1, 3, 2])
+        x = self.dsffn(x, training=training)
+        x = tf.transpose(x, [0, 1, 3, 2])
+
+        scale = tf.reshape(
+            tf.cast(self.layer_scale, inputs.dtype),
+            [1, 1, 1, self.d_model],
+        )
+        return inputs + scale * x
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'fourier_degree': self.fourier_degree,
+            'poly_degree': self.poly_degree,
+            'ffn_ratio': self.ffn_ratio,
+            'dropout': self.dropout_rate,
+            'layer_scale_init': self.layer_scale_init,
+            'kernel_size': self.kernel_size,
+            'padding': self.padding,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
 class FeTSChannelPatchTranspose(layers.Layer):
     """[batch, channel, d_model, patch] -> [batch, channel, patch, d_model]。"""
 
@@ -498,7 +653,7 @@ class FeTSChannelPatchTranspose(layers.Layer):
 
 @keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
 class PatchCrossChannelAttention(layers.Layer):
-    """在每个 temporal patch 内对所有变量执行跨通道自注意力。"""
+    """第一轮全通道自注意力，仅用于旧模型反序列化兼容。"""
 
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
@@ -575,6 +730,142 @@ class PatchCrossChannelAttention(layers.Layer):
 
 
 @keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class TargetWeatherCrossAttention(layers.Layer):
+    """每个 patch 内以历史功率为 Query、其它变量为 Key/Value。"""
+
+    def __init__(
+        self,
+        n_channels,
+        target_channel_index,
+        d_model,
+        n_heads,
+        d_ff,
+        dropout=0.1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if n_channels < 2:
+            raise ValueError('目标-气象交叉注意力至少需要两个输入通道')
+        if not 0 <= target_channel_index < n_channels:
+            raise ValueError('target_channel_index 超出输入通道范围')
+        if d_model % n_heads != 0:
+            raise ValueError('d_model 必须能被 target-weather n_heads 整除')
+        self.n_channels = int(n_channels)
+        self.target_channel_index = int(target_channel_index)
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.d_ff = int(d_ff)
+        self.dropout_rate = float(dropout)
+
+        self.attention = layers.MultiHeadAttention(
+            num_heads=self.n_heads,
+            key_dim=self.d_model // self.n_heads,
+            dropout=self.dropout_rate,
+            name='power_to_weather_mha',
+        )
+        self.attention_dropout = layers.Dropout(self.dropout_rate)
+        self.attention_norm = layers.LayerNormalization(
+            epsilon=1e-6,
+            name='power_weather_attention_norm',
+        )
+        self.ff_in = layers.Dense(
+            self.d_ff,
+            activation='gelu',
+            name='power_weather_ff_in',
+        )
+        self.ff_dropout = layers.Dropout(self.dropout_rate)
+        self.ff_out = layers.Dense(
+            self.d_model,
+            name='power_weather_ff_out',
+        )
+        self.output_dropout = layers.Dropout(self.dropout_rate)
+        self.output_norm = layers.LayerNormalization(
+            epsilon=1e-6,
+            name='power_weather_output_norm',
+        )
+
+    def call(self, inputs, training=None):
+        # inputs: [B, C, N, D]。每个 patch 的功率 token 只读取非功率变量。
+        shape = tf.shape(inputs)
+        batch_size, patch_num = shape[0], shape[2]
+
+        power = inputs[
+            :,
+            self.target_channel_index:self.target_channel_index + 1,
+            :,
+            :,
+        ]
+        if self.target_channel_index == 0:
+            weather = inputs[:, 1:, :, :]
+        elif self.target_channel_index == self.n_channels - 1:
+            weather = inputs[:, :-1, :, :]
+        else:
+            weather = tf.concat(
+                [
+                    inputs[:, :self.target_channel_index, :, :],
+                    inputs[:, self.target_channel_index + 1:, :, :],
+                ],
+                axis=1,
+            )
+
+        power = tf.transpose(power, [0, 2, 1, 3])
+        weather = tf.transpose(weather, [0, 2, 1, 3])
+        power = tf.reshape(
+            power,
+            [batch_size * patch_num, 1, self.d_model],
+        )
+        weather = tf.reshape(
+            weather,
+            [batch_size * patch_num, self.n_channels - 1, self.d_model],
+        )
+
+        attention = self.attention(
+            query=power,
+            value=weather,
+            key=weather,
+            training=training,
+        )
+        x = self.attention_norm(
+            power + self.attention_dropout(attention, training=training)
+        )
+        ff = self.ff_in(x)
+        ff = self.ff_dropout(ff, training=training)
+        ff = self.ff_out(ff)
+        x = self.output_norm(
+            x + self.output_dropout(ff, training=training)
+        )
+
+        x = tf.reshape(x, [batch_size, patch_num, self.d_model])
+        return x
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], input_shape[2], input_shape[3]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'n_channels': self.n_channels,
+            'target_channel_index': self.target_channel_index,
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'd_ff': self.d_ff,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class TakeLastToken(layers.Layer):
+    """选择局部 patch 序列的最后一个 token。"""
+
+    def call(self, inputs):
+        return inputs[:, -1, :]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], input_shape[2]
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
 class SelectChannel(layers.Layer):
     """从 [batch, channel, ...] 中选择目标功率通道。"""
 
@@ -610,104 +901,197 @@ def build_fets_patchtst_model(
     n_heads=N_HEADS,
     n_layers=N_LAYERS,
     d_ff=D_FF,
-    cross_channel_heads=CROSS_CHANNEL_HEADS,
+    local_patch_len=LOCAL_PATCH_LEN,
+    local_patch_stride=LOCAL_PATCH_STRIDE,
+    local_n_layers=LOCAL_N_LAYERS,
+    target_weather_heads=TARGET_WEATHER_HEADS,
+    layer_scale_init=LAYER_SCALE_INIT,
 ):
-    """构建 FeTS patch 增强 + 跨变量融合 + PatchTST 时序主干。"""
+    """构建原生长尺度 PatchTST + 目标感知局部 FeTS 修正分支。"""
     if target_channel_index is None:
         raise ValueError('FeTS-PatchTST 需要将历史功率作为输入通道')
     if not 0 <= target_channel_index < input_dim:
         raise ValueError('target_channel_index 超出输入通道范围')
+    if input_dim < 2:
+        raise ValueError('目标-气象交叉注意力至少需要两个输入通道')
     if d_model % n_heads != 0:
         raise ValueError('d_model 必须能被 PatchTST n_heads 整除')
-    if d_model % cross_channel_heads != 0:
-        raise ValueError('d_model 必须能被 cross_channel_heads 整除')
+    if d_model % target_weather_heads != 0:
+        raise ValueError('d_model 必须能被 target_weather_heads 整除')
+    if local_n_layers <= 0:
+        raise ValueError('local_n_layers 必须为正整数')
 
-    patch_num = compute_patch_num(history_len, patch_len, patch_stride)
+    long_patch_num = compute_patch_num(
+        history_len,
+        patch_len,
+        patch_stride,
+    )
+    local_patch_num = compute_patch_num(
+        history_len,
+        local_patch_len,
+        local_patch_stride,
+    )
     inputs = keras.Input(
         shape=(history_len, input_dim),
         name='history_features',
     )
-    x = FeTSPatchExtract(
+
+    # 长尺度分支逐层保留 817fe4... 的原生 PatchTST 结构。FeTS 模块不会
+    # 改写这条路径，便于把新增局部分支解释为对原生预测的显式修正。
+    long_x = PatchExtract(
         patch_len,
         patch_stride,
-        name='patch_extract',
+        name='long_patch_extract',
     )(inputs)
-    x = layers.Dense(d_model, name='patch_embedding')(x)
-    x = FeTSFeatureBlock(
+    long_x = layers.Dense(
+        d_model,
+        name='long_patch_projection',
+    )(long_x)
+    long_x = MergeChannels(name='long_merge_channels')(long_x)
+    long_x = LearnablePositionEmbedding(
+        long_patch_num,
+        d_model=d_model,
+        name='long_position_embedding',
+    )(long_x)
+    long_x = layers.Dropout(
+        dropout,
+        name='long_patch_dropout',
+    )(long_x)
+    for idx in range(n_layers):
+        long_x = transformer_encoder(
+            long_x,
+            d_model,
+            n_heads,
+            d_ff,
+            dropout,
+            name=f'long_encoder_{idx + 1}',
+        )
+
+    long_x = RestoreChannels(
+        input_dim,
+        long_patch_num,
+        d_model,
+        name='long_restore_channels',
+    )(long_x)
+    long_target_repr = TakeChannel(
+        target_channel_index,
+        name='long_target_power_channel',
+    )(long_x)
+    long_target_repr = layers.Flatten(
+        name='long_target_flatten',
+    )(long_target_repr)
+    long_global_context = layers.GlobalAveragePooling2D(
+        name='long_channel_context_pool',
+    )(long_x)
+
+    baseline_head = layers.Concatenate(
+        name='long_forecast_context',
+    )([long_target_repr, long_global_context])
+    baseline_head = layers.Dropout(
+        head_dropout,
+        name='long_head_dropout',
+    )(baseline_head)
+    baseline_head = layers.Dense(
+        d_ff,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(1e-4),
+        name='long_forecast_ff',
+    )(baseline_head)
+    baseline_head = layers.Dropout(
+        head_dropout,
+        name='long_forecast_dropout',
+    )(baseline_head)
+    baseline_forecast = layers.Dense(
+        forecast_len,
+        name='baseline_forecast_power',
+    )(baseline_head)
+
+    # 局部分支保留 4 个原始 15 分钟点/patch，以 2 点步长建模快速爬坡。
+    local_x = FeTSPatchExtract(
+        local_patch_len,
+        local_patch_stride,
+        name='local_patch_extract',
+    )(inputs)
+    local_x = layers.Dense(
+        d_model,
+        name='local_patch_embedding',
+    )(local_x)
+    local_x = ChannelIdentityEmbedding(
+        input_dim,
+        d_model,
+        name='local_channel_embedding',
+    )(local_x)
+    local_x = LayerScaleFeTSFeatureBlock(
         d_model=d_model,
         fourier_degree=fourier_degree,
         poly_degree=poly_degree,
         ffn_ratio=ffn_ratio,
         dropout=dropout,
+        layer_scale_init=layer_scale_init,
         kernel_size=ADAFE_KERNEL_SIZE,
         padding=ADAFE_PADDING,
-        name='fets_feature_block',
-    )(x)
-    x = FeTSChannelPatchTranspose(
-        name='restore_patch_order',
-    )(x)
-    x = PatchCrossChannelAttention(
+        name='local_fets_feature_block',
+    )(local_x)
+    local_x = TargetWeatherCrossAttention(
+        n_channels=input_dim,
+        target_channel_index=target_channel_index,
         d_model=d_model,
-        n_heads=cross_channel_heads,
+        n_heads=target_weather_heads,
         d_ff=d_ff,
         dropout=dropout,
-        name='cross_channel_attention',
-    )(x)
-
-    # 恢复 817fe4... 原生 PatchTST 的 patch 时序建模主干。
-    x = MergeChannels(name='merge_channels')(x)
-    x = LearnablePositionEmbedding(
-        patch_num,
+        name='local_power_to_weather_attention',
+    )(local_x)
+    local_x = LearnablePositionEmbedding(
+        local_patch_num,
         d_model,
-        name='position_embedding',
-    )(x)
-    x = layers.Dropout(dropout, name='patch_dropout')(x)
-    for idx in range(n_layers):
-        x = transformer_encoder(
-            x,
+        name='local_position_embedding',
+    )(local_x)
+    local_x = layers.Dropout(
+        dropout,
+        name='local_patch_dropout',
+    )(local_x)
+    for idx in range(local_n_layers):
+        local_x = transformer_encoder(
+            local_x,
             d_model,
             n_heads,
             d_ff,
             dropout,
-            name=f'encoder_{idx + 1}',
+            name=f'local_encoder_{idx + 1}',
         )
 
-    x = RestoreChannels(
-        input_dim,
-        patch_num,
-        d_model,
-        name='restore_channels',
-    )(x)
-    target_repr = TakeChannel(
-        target_channel_index,
-        name='target_power_channel',
-    )(x)
-    target_repr = layers.Flatten(name='target_flatten')(target_repr)
-    global_context = layers.GlobalAveragePooling2D(
-        name='channel_context_pool',
-    )(x)
-
-    head = layers.Concatenate(
-        name='forecast_context',
-    )([target_repr, global_context])
-    head = layers.Dropout(
+    local_recent = TakeLastToken(
+        name='local_recent_token',
+    )(local_x)
+    local_global = layers.GlobalAveragePooling1D(
+        name='local_global_pool',
+    )(local_x)
+    local_head = layers.Concatenate(
+        name='local_forecast_context',
+    )([local_recent, local_global])
+    local_head = layers.Dropout(
         head_dropout,
-        name='head_dropout',
-    )(head)
-    head = layers.Dense(
+        name='local_head_dropout',
+    )(local_head)
+    local_head = layers.Dense(
         d_ff,
         activation='gelu',
-        kernel_regularizer=regularizers.l2(1e-4),
-        name='forecast_ff',
-    )(head)
-    head = layers.Dropout(
+        name='local_forecast_ff',
+    )(local_head)
+    local_head = layers.Dropout(
         head_dropout,
-        name='forecast_dropout',
-    )(head)
-    outputs = layers.Dense(
+        name='local_forecast_dropout',
+    )(local_head)
+    local_correction = layers.Dense(
         forecast_len,
+        kernel_initializer='zeros',
+        bias_initializer='zeros',
+        name='local_forecast_correction',
+    )(local_head)
+
+    outputs = layers.Add(
         name='forecast_power',
-    )(head)
+    )([baseline_forecast, local_correction])
 
     model = keras.Model(
         inputs=inputs,
@@ -951,15 +1335,28 @@ def train_one_farm(train_file):
         VALIDATION_SPLIT,
     )
 
-    patch_num = compute_patch_num(HISTORY_LEN, PATCH_LEN, PATCH_STRIDE)
+    long_patch_num = compute_patch_num(
+        HISTORY_LEN,
+        PATCH_LEN,
+        PATCH_STRIDE,
+    )
+    local_patch_num = compute_patch_num(
+        HISTORY_LEN,
+        LOCAL_PATCH_LEN,
+        LOCAL_PATCH_STRIDE,
+    )
     print(f'原始/重采样后数据形状: {train_df.shape}')
     print(
         f'输入通道数: {len(input_cols)}，样本数: {total_samples}，'
         f'训练/验证: {train_samples}/{total_samples - train_samples}'
     )
     print(
-        f'Patch设置: patch_len={PATCH_LEN}, stride={PATCH_STRIDE}, '
-        f'patch_num={patch_num}'
+        f'长尺度Patch: patch_len={PATCH_LEN}, stride={PATCH_STRIDE}, '
+        f'patch_num={long_patch_num}'
+    )
+    print(
+        f'局部FeTS Patch: patch_len={LOCAL_PATCH_LEN}, '
+        f'stride={LOCAL_PATCH_STRIDE}, patch_num={local_patch_num}'
     )
 
     model = build_fets_patchtst_model(
@@ -1052,6 +1449,9 @@ def train_one_farm(train_file):
         'time_freq': TIME_FREQ,
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
+        'local_patch_len': LOCAL_PATCH_LEN,
+        'local_patch_stride': LOCAL_PATCH_STRIDE,
+        'local_n_layers': LOCAL_N_LAYERS,
         'd_model': D_MODEL,
         'dropout': DROPOUT,
         'head_dropout': HEAD_DROPOUT,
@@ -1061,9 +1461,14 @@ def train_one_farm(train_file):
         'n_heads': N_HEADS,
         'n_layers': N_LAYERS,
         'd_ff': D_FF,
-        'cross_channel_heads': CROSS_CHANNEL_HEADS,
+        'target_weather_heads': TARGET_WEATHER_HEADS,
+        'layer_scale_init': LAYER_SCALE_INIT,
         'adafe_threshold': 'per_patch',
-        'cross_channel_attention': True,
+        'channel_identity_embedding': True,
+        'cross_channel_attention': False,
+        'cross_channel_fusion': 'power_query_weather_key_value',
+        'long_branch': 'original_patchtst',
+        'local_correction_initializer': 'zeros',
         'official_repository': OFFICIAL_REPOSITORY,
         'official_revision': OFFICIAL_REVISION,
         'model_path': model_path,
