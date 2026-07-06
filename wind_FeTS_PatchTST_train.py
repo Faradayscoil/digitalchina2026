@@ -1,18 +1,21 @@
 """FeTS-PatchTST 在风电超短期功率预测任务上的训练入口。
 
-模型完整保留原生 PatchTST 长尺度分支，并增加面向局部爬坡的 FeTS 分支：
+模型完整保留原生 PatchTST 长尺度分支，并增加中尺度 PatchTST 与局部 FeTS
+两个候选专家：
 
     原生长分支: patch(16, 8) -> PatchTST -> baseline forecast
+    中尺度分支: patch(8, 4) -> PatchTST -> baseline + mid residual
     局部 FeTS: patch(4, 2) -> channel embedding
                -> AdaFE/DSFFN LayerScale residual
                -> power-query/weather-key-value attention
                -> local temporal encoder
-               -> long-context fusion -> regularized correction
-    最终输出: baseline forecast + learnable horizon scale * local correction
+               -> long-context fusion -> baseline + local residual
+    持续性专家: 最后历史功率在目标标准化空间重复 16 步
+    最终输出: 输入状态与 horizon 条件化的 softmax router 对四个专家凸融合
 
 模型复用原生 PatchTST 基线的数据预处理、历史窗口、时序编码器、预测 head、
 验证划分、优化器和损失。此文件不包含 k-fold、多随机种子、RevIN、
-自蒸馏、外部 teacher 或输出专家等额外策略。
+自蒸馏、外部 teacher、频谱路由、尺度相似度、top-k 稀疏化或双向尺度交互。
 """
 
 import glob
@@ -62,7 +65,7 @@ warnings.filterwarnings('ignore')
 
 
 MODEL_NAME = 'fets_patchtst'
-ARCHITECTURE_VERSION = 'fets_patchtst_multiscale_context_scaled_v4'
+ARCHITECTURE_VERSION = 'fets_patchtst_horizon_regime_moe_v5ab'
 OFFICIAL_REPOSITORY = 'https://github.com/lllucky111/FeTS'
 OFFICIAL_REVISION = 'd908e434b70f3cf69065004e295db13cdb9790b2'
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
@@ -98,15 +101,24 @@ HEAD_DROPOUT = BASELINE_HEAD_DROPOUT
 LOCAL_PATCH_LEN = 4
 LOCAL_PATCH_STRIDE = 2
 LOCAL_N_LAYERS = 2
+
+# 中尺度专家填补局部 4/2 与长尺度 16/8 之间的表示空白。
+MID_PATCH_LEN = 8
+MID_PATCH_STRIDE = 4
+MID_N_LAYERS = 2
+
 TARGET_WEATHER_HEADS = N_HEADS
 LAYER_SCALE_INIT = 1e-3
 LONG_CONTEXT_DIM = D_MODEL
 
-# 局部修正按 horizon 独立缩放。非零初始值确保 zero-init 修正头仍能获得梯度；
-# 上界和 L2 共同限制局部分支通过放大权重覆盖长尺度基线。
-CORRECTION_SCALE_INIT = 0.1
-CORRECTION_SCALE_MAX = 1.0
-CORRECTION_SCALE_L2 = 1e-3
+# v5-A 使用样本状态与 horizon 共同决定四个专家的凸融合权重。router 输出层
+# zero-init，使初始权重严格由 bias 控制并以原生长尺度专家为主。
+EXPERT_NAMES = ('long', 'mid', 'short', 'persistence')
+ROUTER_HIDDEN_DIM = 64
+HORIZON_EMBEDDING_DIM = 16
+ROUTER_DROPOUT = 0.1
+ROUTER_INITIAL_BIAS = (2.0, 0.0, 0.0, -2.0)
+
 CORRECTION_KERNEL_L2 = 1e-4
 
 # FeTS 官方 Fourier/polynomial mask 和 DSFFN 配置。
@@ -961,6 +973,215 @@ class HorizonScaledResidualAdd(layers.Layer):
         return config
 
 
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class PersistenceForecast(layers.Layer):
+    """将最后历史功率转换到目标标准化空间并重复到所有 horizon。"""
+
+    def __init__(
+        self,
+        target_channel_index,
+        forecast_len,
+        scale_ratio=1.0,
+        scale_offset=0.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if target_channel_index < 0:
+            raise ValueError('target_channel_index 不能为负数')
+        if forecast_len <= 0:
+            raise ValueError('forecast_len 必须为正整数')
+        if not np.isfinite(scale_ratio) or scale_ratio <= 0:
+            raise ValueError('scale_ratio 必须为有限正数')
+        if not np.isfinite(scale_offset):
+            raise ValueError('scale_offset 必须为有限数')
+        self.target_channel_index = int(target_channel_index)
+        self.forecast_len = int(forecast_len)
+        self.scale_ratio = float(scale_ratio)
+        self.scale_offset = float(scale_offset)
+
+    def call(self, inputs):
+        last_power_x_scaled = inputs[:, -1, self.target_channel_index]
+        last_power_y_scaled = (
+            last_power_x_scaled
+            * tf.cast(self.scale_ratio, inputs.dtype)
+            + tf.cast(self.scale_offset, inputs.dtype)
+        )
+        return tf.repeat(
+            last_power_y_scaled[:, tf.newaxis],
+            repeats=self.forecast_len,
+            axis=1,
+        )
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], self.forecast_len
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'target_channel_index': self.target_channel_index,
+            'forecast_len': self.forecast_len,
+            'scale_ratio': self.scale_ratio,
+            'scale_offset': self.scale_offset,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class HorizonRegimeRouter(layers.Layer):
+    """根据当前窗口上下文和预测步长生成逐样本专家权重。"""
+
+    def __init__(
+        self,
+        forecast_len,
+        n_experts,
+        hidden_dim=64,
+        horizon_embedding_dim=16,
+        dropout=0.1,
+        initial_bias=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if forecast_len <= 0 or n_experts <= 1:
+            raise ValueError('forecast_len 必须为正且 n_experts 必须大于 1')
+        if hidden_dim <= 0 or horizon_embedding_dim <= 0:
+            raise ValueError('router 表示维度必须为正整数')
+        if not 0 <= dropout < 1:
+            raise ValueError('router dropout 必须位于 [0, 1)')
+        if initial_bias is None:
+            initial_bias = [0.0] * int(n_experts)
+        if len(initial_bias) != int(n_experts):
+            raise ValueError('initial_bias 长度必须等于 n_experts')
+        if not np.isfinite(np.asarray(initial_bias, dtype=float)).all():
+            raise ValueError('initial_bias 必须全部为有限数')
+
+        self.forecast_len = int(forecast_len)
+        self.n_experts = int(n_experts)
+        self.hidden_dim = int(hidden_dim)
+        self.horizon_embedding_dim = int(horizon_embedding_dim)
+        self.dropout_rate = float(dropout)
+        self.initial_bias = tuple(float(value) for value in initial_bias)
+
+        self.context_norm = layers.LayerNormalization(
+            epsilon=1e-6,
+            name='context_norm',
+        )
+        self.context_projection = layers.Dense(
+            self.hidden_dim,
+            activation='gelu',
+            name='context_projection',
+        )
+        self.context_dropout = layers.Dropout(
+            self.dropout_rate,
+            name='context_dropout',
+        )
+        self.horizon_embedding = layers.Embedding(
+            input_dim=self.forecast_len,
+            output_dim=self.horizon_embedding_dim,
+            name='horizon_embedding',
+        )
+        self.router_hidden = layers.Dense(
+            self.hidden_dim,
+            activation='gelu',
+            name='router_hidden',
+        )
+        self.router_dropout = layers.Dropout(
+            self.dropout_rate,
+            name='router_dropout',
+        )
+        self.router_logits = layers.Dense(
+            self.n_experts,
+            kernel_initializer='zeros',
+            bias_initializer=keras.initializers.Constant(self.initial_bias),
+            name='router_logits',
+        )
+
+    def call(self, inputs, training=None):
+        context = self.context_norm(inputs)
+        context = self.context_projection(context)
+        context = self.context_dropout(context, training=training)
+        context = tf.repeat(
+            context[:, tf.newaxis, :],
+            repeats=self.forecast_len,
+            axis=1,
+        )
+
+        horizon_ids = tf.range(self.forecast_len)
+        horizon = self.horizon_embedding(horizon_ids)
+        horizon = tf.broadcast_to(
+            horizon[tf.newaxis, :, :],
+            [
+                tf.shape(context)[0],
+                self.forecast_len,
+                self.horizon_embedding_dim,
+            ],
+        )
+        router_input = tf.concat([context, horizon], axis=-1)
+        router_hidden = self.router_hidden(router_input)
+        router_hidden = self.router_dropout(router_hidden, training=training)
+        logits = self.router_logits(router_hidden)
+        return tf.nn.softmax(logits, axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], self.forecast_len, self.n_experts
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'forecast_len': self.forecast_len,
+            'n_experts': self.n_experts,
+            'hidden_dim': self.hidden_dim,
+            'horizon_embedding_dim': self.horizon_embedding_dim,
+            'dropout': self.dropout_rate,
+            'initial_bias': list(self.initial_bias),
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class ExpertConvexFusion(layers.Layer):
+    """使用逐样本、逐 horizon 的 softmax 权重融合完整预测专家。"""
+
+    def __init__(self, n_experts, **kwargs):
+        super().__init__(**kwargs)
+        if n_experts <= 1:
+            raise ValueError('n_experts 必须大于 1')
+        self.n_experts = int(n_experts)
+
+    def build(self, input_shape):
+        if (
+            not isinstance(input_shape, (list, tuple))
+            or len(input_shape) != self.n_experts + 1
+        ):
+            raise ValueError(
+                'ExpertConvexFusion 需要 n_experts 个预测和一个 router 权重'
+            )
+        reference_shape = input_shape[0]
+        for expert_shape in input_shape[1:self.n_experts]:
+            if tuple(expert_shape[1:]) != tuple(reference_shape[1:]):
+                raise ValueError('所有专家预测形状必须一致')
+        router_shape = input_shape[-1]
+        if (
+            router_shape[-1] is not None
+            and int(router_shape[-1]) != self.n_experts
+        ):
+            raise ValueError('router 最后一维必须等于 n_experts')
+        super().build(input_shape)
+
+    def call(self, inputs):
+        expert_predictions = inputs[:self.n_experts]
+        router_weights = inputs[-1]
+        expert_stack = tf.stack(expert_predictions, axis=-1)
+        return tf.reduce_sum(expert_stack * router_weights, axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'n_experts': self.n_experts})
+        return config
+
+
 def build_fets_patchtst_model(
     input_dim,
     target_channel_index,
@@ -977,18 +1198,24 @@ def build_fets_patchtst_model(
     n_heads=N_HEADS,
     n_layers=N_LAYERS,
     d_ff=D_FF,
+    mid_patch_len=MID_PATCH_LEN,
+    mid_patch_stride=MID_PATCH_STRIDE,
+    mid_n_layers=MID_N_LAYERS,
     local_patch_len=LOCAL_PATCH_LEN,
     local_patch_stride=LOCAL_PATCH_STRIDE,
     local_n_layers=LOCAL_N_LAYERS,
     target_weather_heads=TARGET_WEATHER_HEADS,
     layer_scale_init=LAYER_SCALE_INIT,
     long_context_dim=LONG_CONTEXT_DIM,
-    correction_scale_init=CORRECTION_SCALE_INIT,
-    correction_scale_max=CORRECTION_SCALE_MAX,
-    correction_scale_l2=CORRECTION_SCALE_L2,
+    router_hidden_dim=ROUTER_HIDDEN_DIM,
+    horizon_embedding_dim=HORIZON_EMBEDDING_DIM,
+    router_dropout=ROUTER_DROPOUT,
+    router_initial_bias=ROUTER_INITIAL_BIAS,
+    power_scale_ratio=1.0,
+    power_scale_offset=0.0,
     correction_kernel_l2=CORRECTION_KERNEL_L2,
 ):
-    """构建长上下文协调、按 horizon 约束修正的 FeTS-PatchTST。"""
+    """构建长/中/短/持续性专家动态凸融合的 FeTS-PatchTST。"""
     if target_channel_index is None:
         raise ValueError('FeTS-PatchTST 需要将历史功率作为输入通道')
     if not 0 <= target_channel_index < input_dim:
@@ -999,10 +1226,14 @@ def build_fets_patchtst_model(
         raise ValueError('d_model 必须能被 PatchTST n_heads 整除')
     if d_model % target_weather_heads != 0:
         raise ValueError('d_model 必须能被 target_weather_heads 整除')
-    if local_n_layers <= 0:
-        raise ValueError('local_n_layers 必须为正整数')
+    if mid_n_layers <= 0 or local_n_layers <= 0:
+        raise ValueError('mid_n_layers 和 local_n_layers 必须为正整数')
     if long_context_dim <= 0:
         raise ValueError('long_context_dim 必须为正整数')
+    if router_hidden_dim <= 0 or horizon_embedding_dim <= 0:
+        raise ValueError('router 表示维度必须为正整数')
+    if len(router_initial_bias) != len(EXPERT_NAMES):
+        raise ValueError('router_initial_bias 长度必须等于专家数量')
     if correction_kernel_l2 < 0:
         raise ValueError('correction_kernel_l2 不能为负数')
 
@@ -1010,6 +1241,11 @@ def build_fets_patchtst_model(
         history_len,
         patch_len,
         patch_stride,
+    )
+    mid_patch_num = compute_patch_num(
+        history_len,
+        mid_patch_len,
+        mid_patch_stride,
     )
     local_patch_num = compute_patch_num(
         history_len,
@@ -1021,8 +1257,8 @@ def build_fets_patchtst_model(
         name='history_features',
     )
 
-    # 长尺度分支逐层保留 817fe4... 的原生 PatchTST 结构。FeTS 模块不会
-    # 改写这条路径，便于把新增局部分支解释为对原生预测的显式修正。
+    # 长尺度分支逐层保留 817fe4... 的原生 PatchTST 结构，并作为动态
+    # 专家融合的安全基线。新增分支不会改写这条前向路径。
     long_x = PatchExtract(
         patch_len,
         patch_stride,
@@ -1104,6 +1340,88 @@ def build_fets_patchtst_model(
         name='long_to_local_context_projection',
     )(long_local_context)
 
+    # 中尺度专家使用 8/4 PatchTST，覆盖局部 4/2 与长尺度 16/8 之间的
+    # 约 1--2 小时状态。其预测以原生长尺度输出为锚点并学习零初始化残差。
+    mid_x = PatchExtract(
+        mid_patch_len,
+        mid_patch_stride,
+        name='mid_patch_extract',
+    )(inputs)
+    mid_x = layers.Dense(
+        d_model,
+        name='mid_patch_projection',
+    )(mid_x)
+    mid_x = MergeChannels(name='mid_merge_channels')(mid_x)
+    mid_x = LearnablePositionEmbedding(
+        mid_patch_num,
+        d_model=d_model,
+        name='mid_position_embedding',
+    )(mid_x)
+    mid_x = layers.Dropout(
+        dropout,
+        name='mid_patch_dropout',
+    )(mid_x)
+    for idx in range(mid_n_layers):
+        mid_x = transformer_encoder(
+            mid_x,
+            d_model,
+            n_heads,
+            d_ff,
+            dropout,
+            name=f'mid_encoder_{idx + 1}',
+        )
+
+    mid_x = RestoreChannels(
+        input_dim,
+        mid_patch_num,
+        d_model,
+        name='mid_restore_channels',
+    )(mid_x)
+    mid_target_repr = TakeChannel(
+        target_channel_index,
+        name='mid_target_power_channel',
+    )(mid_x)
+    mid_target_repr = layers.Flatten(
+        name='mid_target_flatten',
+    )(mid_target_repr)
+    mid_global_context = layers.GlobalAveragePooling2D(
+        name='mid_channel_context_pool',
+    )(mid_x)
+    mid_context_features = layers.Concatenate(
+        name='mid_forecast_context',
+    )([mid_target_repr, mid_global_context])
+    mid_router_context = layers.Dense(
+        long_context_dim,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
+        name='mid_router_context_projection',
+    )(mid_context_features)
+
+    mid_head = layers.Dropout(
+        head_dropout,
+        name='mid_head_dropout',
+    )(mid_context_features)
+    mid_head = layers.Dense(
+        d_ff,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
+        name='mid_forecast_ff',
+    )(mid_head)
+    mid_head = layers.Dropout(
+        head_dropout,
+        name='mid_forecast_dropout',
+    )(mid_head)
+    mid_residual = layers.Dense(
+        forecast_len,
+        kernel_initializer='zeros',
+        bias_initializer='zeros',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
+        name='mid_forecast_residual',
+    )(mid_head)
+    mid_forecast = layers.Add(
+        name='mid_forecast_candidate',
+    )([baseline_forecast, mid_residual])
+
     # 局部分支保留 4 个原始 15 分钟点/patch，以 2 点步长建模快速爬坡。
     local_x = FeTSPatchExtract(
         local_patch_len,
@@ -1164,6 +1482,15 @@ def build_fets_patchtst_model(
     local_global = layers.GlobalAveragePooling1D(
         name='local_global_pool',
     )(local_x)
+    local_router_context = layers.Concatenate(
+        name='local_router_context_features',
+    )([local_recent, local_global])
+    local_router_context = layers.Dense(
+        long_context_dim,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
+        name='local_router_context_projection',
+    )(local_router_context)
     local_head = layers.Concatenate(
         name='local_forecast_context',
     )([
@@ -1184,21 +1511,58 @@ def build_fets_patchtst_model(
         head_dropout,
         name='local_forecast_dropout',
     )(local_head)
-    local_correction = layers.Dense(
+    local_residual = layers.Dense(
         forecast_len,
         kernel_initializer='zeros',
         bias_initializer='zeros',
         kernel_regularizer=regularizers.l2(correction_kernel_l2),
-        name='local_forecast_correction',
+        name='local_forecast_residual',
     )(local_head)
+    local_forecast = layers.Add(
+        name='local_forecast_candidate',
+    )([baseline_forecast, local_residual])
 
-    outputs = HorizonScaledResidualAdd(
+    persistence_forecast = PersistenceForecast(
+        target_channel_index=target_channel_index,
         forecast_len=forecast_len,
-        initial_scale=correction_scale_init,
-        max_scale=correction_scale_max,
-        scale_l2=correction_scale_l2,
+        scale_ratio=power_scale_ratio,
+        scale_offset=power_scale_offset,
+        name='persistence_forecast_candidate',
+    )(inputs)
+
+    # v5-A 暂不引入显式频谱/尺度相似度特征。router 只读取三个分支已经
+    # 学到的历史上下文以及最后时刻全部已观测输入，不接触未来真实功率。
+    last_history_features = TakeLastToken(
+        name='router_last_history_features',
+    )(inputs)
+    router_context = layers.Concatenate(
+        name='router_context_features',
+    )([
+        long_local_context,
+        mid_router_context,
+        local_router_context,
+        last_history_features,
+    ])
+    router_weights = HorizonRegimeRouter(
+        forecast_len=forecast_len,
+        n_experts=len(EXPERT_NAMES),
+        hidden_dim=router_hidden_dim,
+        horizon_embedding_dim=horizon_embedding_dim,
+        dropout=router_dropout,
+        initial_bias=router_initial_bias,
+        name='horizon_regime_router',
+    )(router_context)
+
+    outputs = ExpertConvexFusion(
+        n_experts=len(EXPERT_NAMES),
         name='forecast_power',
-    )([baseline_forecast, local_correction])
+    )([
+        baseline_forecast,
+        mid_forecast,
+        local_forecast,
+        persistence_forecast,
+        router_weights,
+    ])
 
     model = keras.Model(
         inputs=inputs,
@@ -1248,6 +1612,62 @@ def validate_preprocessed_data(
     if not np.isfinite(target).all():
         bad_count = int((~np.isfinite(target)).sum())
         raise ValueError(f'公共预处理后的目标包含 {bad_count} 个非有限值')
+
+
+def compute_power_scale_alignment(scaler_x, scaler_y, target_index):
+    """计算输入目标通道标准分数到输出目标标准分数的仿射变换。"""
+    x_scale = float(scaler_x.scale_[target_index])
+    x_mean = float(scaler_x.mean_[target_index])
+    y_scale = float(scaler_y.scale_[0])
+    y_mean = float(scaler_y.mean_[0])
+    if min(x_scale, y_scale) <= 0:
+        raise ValueError('功率 scaler 的 scale 必须为正数')
+
+    scale_ratio = x_scale / y_scale
+    scale_offset = (x_mean - y_mean) / y_scale
+    if not np.isfinite([scale_ratio, scale_offset]).all():
+        raise ValueError('功率输入/输出标准化对齐参数包含非有限值')
+    return float(scale_ratio), float(scale_offset)
+
+
+def collect_router_statistics(model, dataset):
+    """汇总验证集动态路由权重，不改变训练目标。"""
+    router_model = keras.Model(
+        inputs=model.inputs,
+        outputs=model.get_layer('horizon_regime_router').output,
+        name='WindFeTSPatchTSTRouterDiagnostics',
+    )
+    weights = np.asarray(router_model.predict(dataset, verbose=0), dtype=float)
+    expected_shape = (
+        None,
+        model.output_shape[-1],
+        len(EXPERT_NAMES),
+    )
+    if (
+        weights.ndim != 3
+        or weights.shape[1] != expected_shape[1]
+        or weights.shape[2] != expected_shape[2]
+    ):
+        raise ValueError(
+            f'router 输出形状异常: {weights.shape}, '
+            f'期望 [样本, {expected_shape[1]}, {expected_shape[2]}]'
+        )
+    if not np.isfinite(weights).all():
+        raise FloatingPointError('router 权重包含非有限值')
+    if not np.allclose(weights.sum(axis=-1), 1.0, atol=1e-5):
+        raise ValueError('router 权重之和不为 1')
+
+    entropy = -np.sum(
+        weights * np.log(np.clip(weights, 1e-8, 1.0)),
+        axis=-1,
+    ) / np.log(len(EXPERT_NAMES))
+    return {
+        'overall_mean': weights.mean(axis=(0, 1)),
+        'overall_std': weights.std(axis=(0, 1)),
+        'mean_by_horizon': weights.mean(axis=0),
+        'std_by_horizon': weights.std(axis=0),
+        'normalized_entropy_mean': float(entropy.mean()),
+    }
 
 
 class NonFiniteTrainingGuard(keras.callbacks.Callback):
@@ -1432,6 +1852,11 @@ def train_one_farm(train_file):
         input_cols,
         target_index,
     )
+    power_scale_ratio, power_scale_offset = compute_power_scale_alignment(
+        scaler_x,
+        scaler_y,
+        target_index,
+    )
     # 与 wind_dl_model_train.py 使用完全相同的滑窗及时间顺序验证切分。
     train_ds, val_ds, train_samples, total_samples = make_window_dataset(
         features,
@@ -1446,6 +1871,11 @@ def train_one_farm(train_file):
         HISTORY_LEN,
         PATCH_LEN,
         PATCH_STRIDE,
+    )
+    mid_patch_num = compute_patch_num(
+        HISTORY_LEN,
+        MID_PATCH_LEN,
+        MID_PATCH_STRIDE,
     )
     local_patch_num = compute_patch_num(
         HISTORY_LEN,
@@ -1462,18 +1892,28 @@ def train_one_farm(train_file):
         f'patch_num={long_patch_num}'
     )
     print(
+        f'中尺度Patch: patch_len={MID_PATCH_LEN}, '
+        f'stride={MID_PATCH_STRIDE}, patch_num={mid_patch_num}'
+    )
+    print(
         f'局部FeTS Patch: patch_len={LOCAL_PATCH_LEN}, '
         f'stride={LOCAL_PATCH_STRIDE}, patch_num={local_patch_num}'
     )
     print(
-        f'长上下文融合维度: {LONG_CONTEXT_DIM}；局部修正 scale: '
-        f'init={CORRECTION_SCALE_INIT}, max={CORRECTION_SCALE_MAX}, '
-        f'L2={CORRECTION_SCALE_L2}；修正头 L2={CORRECTION_KERNEL_L2}'
+        f'动态专家: {EXPERT_NAMES}；router hidden={ROUTER_HIDDEN_DIM}, '
+        f'horizon embedding={HORIZON_EMBEDDING_DIM}, '
+        f'initial bias={ROUTER_INITIAL_BIAS}'
+    )
+    print(
+        f'功率标准化对齐: ratio={power_scale_ratio:.8f}, '
+        f'offset={power_scale_offset:.8f}；残差头 L2={CORRECTION_KERNEL_L2}'
     )
 
     model = build_fets_patchtst_model(
         len(input_cols),
         target_index,
+        power_scale_ratio=power_scale_ratio,
+        power_scale_offset=power_scale_offset,
     )
     model.summary()
 
@@ -1539,26 +1979,25 @@ def train_one_farm(train_file):
     model.load_weights(best_weights_path)
 
     metrics = evaluate_model(model, val_ds, scaler_y, capacity)
-    correction_scale_layer = model.get_layer('forecast_power')
-    correction_scale_raw = np.asarray(
-        correction_scale_layer.correction_scale.numpy(),
-        dtype=float,
-    )
-    correction_scale_values = np.clip(
-        correction_scale_raw,
-        0.0,
-        CORRECTION_SCALE_MAX,
-    )
+    router_statistics = collect_router_statistics(model, val_ds)
     model.save(model_path)
     print(
         f"验证集反归一化 MAE: {metrics['val_mae']:.4f}, "
         f"RMSE: {metrics['val_rmse']:.4f}"
     )
     print(
-        '学习后的 horizon 修正 scale: '
-        f'min={correction_scale_values.min():.6f}, '
-        f'mean={correction_scale_values.mean():.6f}, '
-        f'max={correction_scale_values.max():.6f}'
+        '验证集平均专家权重: '
+        + ', '.join(
+            f'{name}={weight:.6f}'
+            for name, weight in zip(
+                EXPERT_NAMES,
+                router_statistics['overall_mean'],
+            )
+        )
+    )
+    print(
+        '验证集归一化路由熵: '
+        f"{router_statistics['normalized_entropy_mean']:.6f}"
     )
 
     artifact = {
@@ -1577,6 +2016,9 @@ def train_one_farm(train_file):
         'time_freq': TIME_FREQ,
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
+        'mid_patch_len': MID_PATCH_LEN,
+        'mid_patch_stride': MID_PATCH_STRIDE,
+        'mid_n_layers': MID_N_LAYERS,
         'local_patch_len': LOCAL_PATCH_LEN,
         'local_patch_stride': LOCAL_PATCH_STRIDE,
         'local_n_layers': LOCAL_N_LAYERS,
@@ -1595,19 +2037,41 @@ def train_one_farm(train_file):
         'long_local_context_fusion': (
             'target_representation+global_context+baseline_forecast'
         ),
-        'correction_scale_type': 'learnable_per_horizon_clipped',
-        'correction_scale_init': CORRECTION_SCALE_INIT,
-        'correction_scale_max': CORRECTION_SCALE_MAX,
-        'correction_scale_l2': CORRECTION_SCALE_L2,
+        'expert_names': list(EXPERT_NAMES),
+        'expert_fusion': 'sample_horizon_conditioned_dense_softmax',
+        'expert_candidate_type': 'baseline_anchored_residual',
+        'router_hidden_dim': ROUTER_HIDDEN_DIM,
+        'horizon_embedding_dim': HORIZON_EMBEDDING_DIM,
+        'router_dropout': ROUTER_DROPOUT,
+        'router_initial_bias': list(ROUTER_INITIAL_BIAS),
+        'router_top_k': None,
+        'router_validation_overall_mean': (
+            router_statistics['overall_mean'].tolist()
+        ),
+        'router_validation_overall_std': (
+            router_statistics['overall_std'].tolist()
+        ),
+        'router_validation_mean_by_horizon': (
+            router_statistics['mean_by_horizon'].tolist()
+        ),
+        'router_validation_std_by_horizon': (
+            router_statistics['std_by_horizon'].tolist()
+        ),
+        'router_validation_normalized_entropy_mean': (
+            router_statistics['normalized_entropy_mean']
+        ),
+        'power_scale_ratio': power_scale_ratio,
+        'power_scale_offset': power_scale_offset,
         'correction_kernel_l2': CORRECTION_KERNEL_L2,
-        'correction_scale_raw_values': correction_scale_raw.tolist(),
-        'correction_scale_values': correction_scale_values.tolist(),
         'adafe_threshold': 'per_patch',
         'channel_identity_embedding': True,
         'cross_channel_attention': False,
         'cross_channel_fusion': 'power_query_weather_key_value',
         'long_branch': 'original_patchtst',
-        'local_correction_initializer': 'zeros',
+        'mid_branch': 'patchtst_8_4',
+        'mid_residual_initializer': 'zeros',
+        'local_residual_initializer': 'zeros',
+        'persistence_expert': True,
         'official_repository': OFFICIAL_REPOSITORY,
         'official_revision': OFFICIAL_REVISION,
         'model_path': model_path,
@@ -1644,9 +2108,16 @@ def train_one_farm(train_file):
         'tensorboard_log_dir': tensorboard_log_dir,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
-        'correction_scale_min': float(correction_scale_values.min()),
-        'correction_scale_mean': float(correction_scale_values.mean()),
-        'correction_scale_max_learned': float(correction_scale_values.max()),
+        'router_normalized_entropy': (
+            router_statistics['normalized_entropy_mean']
+        ),
+        **{
+            f'router_weight_{name}': float(weight)
+            for name, weight in zip(
+                EXPERT_NAMES,
+                router_statistics['overall_mean'],
+            )
+        },
     }
     del model
     keras.backend.clear_session()

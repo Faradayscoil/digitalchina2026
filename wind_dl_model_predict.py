@@ -16,16 +16,20 @@ from wind_FeTS_PatchTST_train import (
     PREPROCESS_DIR as FETS_PATCHTST_PREPROCESS_DIR,
     SAVED_MODEL_DIR as FETS_PATCHTST_SAVED_MODEL_DIR,
     WEIGHTS_DIR as FETS_PATCHTST_WEIGHTS_DIR,
+    EXPERT_NAMES as FETS_PATCHTST_EXPERT_NAMES,
     AdaptiveFeatureExtraction,
     ChannelIdentityEmbedding,
     DualScaleFeedForward,
+    ExpertConvexFusion,
     FeTSChannelPatchTranspose,
     FeTSFeatureBlock,
     FeTSPatchExtract,
     FourierPolynomialMask,
+    HorizonRegimeRouter,
     HorizonScaledResidualAdd,
     LayerScaleFeTSFeatureBlock,
     PatchCrossChannelAttention,
+    PersistenceForecast,
     SelectChannel,
     TakeLastToken,
     TargetWeatherCrossAttention,
@@ -125,6 +129,7 @@ def model_output_dirs(model_name):
         'figures': os.path.join(output_dir, 'figures'),
         'single_windows': os.path.join(output_dir, 'single_window_comparisons'),
         'weighted_curves': os.path.join(output_dir, 'weighted_curves'),
+        'router_diagnostics': os.path.join(output_dir, 'router_diagnostics'),
         'matplotlib_cache': os.path.join(output_dir, 'matplotlib_cache'),
     }
     for path in dirs.values():
@@ -160,6 +165,12 @@ def get_custom_objects():
         'WindFeTSPatchTST>LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
         'HorizonScaledResidualAdd': HorizonScaledResidualAdd,
         'WindFeTSPatchTST>HorizonScaledResidualAdd': HorizonScaledResidualAdd,
+        'PersistenceForecast': PersistenceForecast,
+        'WindFeTSPatchTST>PersistenceForecast': PersistenceForecast,
+        'HorizonRegimeRouter': HorizonRegimeRouter,
+        'WindFeTSPatchTST>HorizonRegimeRouter': HorizonRegimeRouter,
+        'ExpertConvexFusion': ExpertConvexFusion,
+        'WindFeTSPatchTST>ExpertConvexFusion': ExpertConvexFusion,
         'FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'WindFeTSPatchTST>FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'PatchCrossChannelAttention': PatchCrossChannelAttention,
@@ -255,15 +266,24 @@ def build_model_from_weights(model_name, artifact):
             n_heads=artifact.get('n_heads', 4),
             n_layers=artifact.get('n_layers', 3),
             d_ff=artifact.get('d_ff', 128),
+            mid_patch_len=artifact.get('mid_patch_len', 8),
+            mid_patch_stride=artifact.get('mid_patch_stride', 4),
+            mid_n_layers=artifact.get('mid_n_layers', 2),
             local_patch_len=artifact.get('local_patch_len', 4),
             local_patch_stride=artifact.get('local_patch_stride', 2),
             local_n_layers=artifact.get('local_n_layers', 2),
             target_weather_heads=artifact.get('target_weather_heads', 4),
             layer_scale_init=artifact.get('layer_scale_init', 1e-3),
             long_context_dim=artifact.get('long_context_dim', 64),
-            correction_scale_init=artifact.get('correction_scale_init', 0.1),
-            correction_scale_max=artifact.get('correction_scale_max', 1.0),
-            correction_scale_l2=artifact.get('correction_scale_l2', 1e-3),
+            router_hidden_dim=artifact.get('router_hidden_dim', 64),
+            horizon_embedding_dim=artifact.get('horizon_embedding_dim', 16),
+            router_dropout=artifact.get('router_dropout', 0.1),
+            router_initial_bias=artifact.get(
+                'router_initial_bias',
+                [2.0, 0.0, 0.0, -2.0],
+            ),
+            power_scale_ratio=artifact.get('power_scale_ratio', 1.0),
+            power_scale_offset=artifact.get('power_scale_offset', 0.0),
             correction_kernel_l2=artifact.get('correction_kernel_l2', 1e-4),
         )
 
@@ -652,6 +672,89 @@ def save_weighted_full_test_plot(pred_df, model_name, farm_id, dirs, capacity=No
     return weighted_curve_path, figure_path, weighted_metrics
 
 
+def predict_with_router_diagnostics(model_name, model, pred_ds):
+    """FeTS-PatchTST 单次前向同时返回预测和动态路由权重。"""
+    if model_name != FETS_PATCHTST_MODEL_NAME:
+        return model.predict(pred_ds, verbose=PREDICT_VERBOSE), None
+
+    router_layer = model.get_layer('horizon_regime_router')
+    diagnostic_model = keras.Model(
+        inputs=model.inputs,
+        outputs=[model.output, router_layer.output],
+        name='WindFeTSPatchTSTPredictDiagnostics',
+    )
+    predictions, router_weights = diagnostic_model.predict(
+        pred_ds,
+        verbose=PREDICT_VERBOSE,
+    )
+    return predictions, np.asarray(router_weights, dtype=float)
+
+
+def save_router_diagnostics(
+    router_weights,
+    expert_names,
+    model_name,
+    farm_id,
+    dirs,
+):
+    """保存逐 horizon 的路由均值、离散程度和分位数。"""
+    if router_weights is None:
+        return None, {}
+    if router_weights.ndim != 3:
+        raise ValueError(f'router 权重必须为三维，实际为 {router_weights.shape}')
+    if len(expert_names) != router_weights.shape[-1]:
+        raise ValueError('artifact 专家名称数量与 router 输出不一致')
+    if not np.isfinite(router_weights).all():
+        raise FloatingPointError('测试集 router 权重包含非有限值')
+    if not np.allclose(router_weights.sum(axis=-1), 1.0, atol=1e-5):
+        raise ValueError('测试集 router 权重之和不为 1')
+
+    entropy = -np.sum(
+        router_weights
+        * np.log(np.clip(router_weights, 1e-8, 1.0)),
+        axis=-1,
+    ) / np.log(len(expert_names))
+    rows = []
+    for horizon_idx in range(router_weights.shape[1]):
+        horizon_weights = router_weights[:, horizon_idx, :]
+        row = {
+            'model_name': model_name,
+            'farm_id': farm_id,
+            'horizon_step': horizon_idx + 1,
+            'horizon_minutes': (horizon_idx + 1) * 15,
+            'normalized_entropy_mean': float(entropy[:, horizon_idx].mean()),
+        }
+        for expert_idx, expert_name in enumerate(expert_names):
+            values = horizon_weights[:, expert_idx]
+            row.update({
+                f'{expert_name}_weight_mean': float(values.mean()),
+                f'{expert_name}_weight_std': float(values.std()),
+                f'{expert_name}_weight_p10': float(np.quantile(values, 0.10)),
+                f'{expert_name}_weight_p90': float(np.quantile(values, 0.90)),
+            })
+        rows.append(row)
+
+    diagnostics_path = os.path.join(
+        dirs['router_diagnostics'],
+        f'{model_name}_router_weights_farm_{farm_id}.csv',
+    )
+    pd.DataFrame(rows).to_csv(
+        diagnostics_path,
+        index=False,
+        encoding='utf-8-sig',
+    )
+    overall_fields = {
+        'router_diagnostics_path': diagnostics_path,
+        'router_normalized_entropy': float(entropy.mean()),
+    }
+    overall_mean = router_weights.mean(axis=(0, 1))
+    overall_fields.update({
+        f'router_weight_{expert_name}': float(weight)
+        for expert_name, weight in zip(expert_names, overall_mean)
+    })
+    return diagnostics_path, overall_fields
+
+
 def predict_one_farm(model_name, test_file):
     farm_id = get_farm_id(test_file)
     dirs = model_output_dirs(model_name)
@@ -664,11 +767,23 @@ def predict_one_farm(model_name, test_file):
     forecast_len = artifact.get('forecast_len', FORECAST_LEN)
 
     pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
-    y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)
+    y_pred_scaled, router_weights = predict_with_router_diagnostics(
+        model_name,
+        model,
+        pred_ds,
+    )
     y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
     if y_pred.shape[0] != n_samples:
         raise ValueError(
             f'{model_name} 场站 {farm_id} 预测样本数不一致: {y_pred.shape[0]} vs {n_samples}')
+    if router_weights is not None and router_weights.shape[:2] != (
+        n_samples,
+        forecast_len,
+    ):
+        raise ValueError(
+            f'{model_name} 场站 {farm_id} router 形状不一致: '
+            f'{router_weights.shape} vs ({n_samples}, {forecast_len}, 专家数)'
+        )
 
     if capacity is not None:
         y_pred = np.clip(y_pred, 0, capacity)
@@ -699,6 +814,17 @@ def predict_one_farm(model_name, test_file):
     )
     metric_df.to_csv(horizon_metric_path, index=False, encoding='utf-8-sig')
 
+    expert_names = artifact.get(
+        'expert_names',
+        list(FETS_PATCHTST_EXPERT_NAMES),
+    )
+    _, router_metric_fields = save_router_diagnostics(
+        router_weights,
+        expert_names,
+        model_name,
+        farm_id,
+        dirs,
+    )
     single_window_path, single_window_figure_path = save_single_window_plot(
         pred_df,
         model_name,
@@ -728,6 +854,7 @@ def predict_one_farm(model_name, test_file):
         'single_window_figure_path': single_window_figure_path,
         'weighted_curve_path': weighted_curve_path,
         'weighted_curve_figure_path': weighted_curve_figure_path,
+        **router_metric_fields,
         **weighted_metric_fields,
     })
     print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "
