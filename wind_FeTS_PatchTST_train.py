@@ -6,8 +6,9 @@
     局部 FeTS: patch(4, 2) -> channel embedding
                -> AdaFE/DSFFN LayerScale residual
                -> power-query/weather-key-value attention
-               -> local temporal encoder -> zero-init correction
-    最终输出: baseline forecast + local correction
+               -> local temporal encoder
+               -> long-context fusion -> regularized correction
+    最终输出: baseline forecast + learnable horizon scale * local correction
 
 模型复用原生 PatchTST 基线的数据预处理、历史窗口、时序编码器、预测 head、
 验证划分、优化器和损失。此文件不包含 k-fold、多随机种子、RevIN、
@@ -61,7 +62,7 @@ warnings.filterwarnings('ignore')
 
 
 MODEL_NAME = 'fets_patchtst'
-ARCHITECTURE_VERSION = 'fets_patchtst_multiscale_target_aware_v3'
+ARCHITECTURE_VERSION = 'fets_patchtst_multiscale_context_scaled_v4'
 OFFICIAL_REPOSITORY = 'https://github.com/lllucky111/FeTS'
 OFFICIAL_REVISION = 'd908e434b70f3cf69065004e295db13cdb9790b2'
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
@@ -99,6 +100,14 @@ LOCAL_PATCH_STRIDE = 2
 LOCAL_N_LAYERS = 2
 TARGET_WEATHER_HEADS = N_HEADS
 LAYER_SCALE_INIT = 1e-3
+LONG_CONTEXT_DIM = D_MODEL
+
+# 局部修正按 horizon 独立缩放。非零初始值确保 zero-init 修正头仍能获得梯度；
+# 上界和 L2 共同限制局部分支通过放大权重覆盖长尺度基线。
+CORRECTION_SCALE_INIT = 0.1
+CORRECTION_SCALE_MAX = 1.0
+CORRECTION_SCALE_L2 = 1e-3
+CORRECTION_KERNEL_L2 = 1e-4
 
 # FeTS 官方 Fourier/polynomial mask 和 DSFFN 配置。
 FOURIER_DEGREE = 2
@@ -885,6 +894,73 @@ class SelectChannel(layers.Layer):
         return config
 
 
+@keras.utils.register_keras_serializable(package='WindFeTSPatchTST')
+class HorizonScaledResidualAdd(layers.Layer):
+    """用按 horizon 学习的受限 scale 将局部修正添加到长尺度基线。"""
+
+    def __init__(
+        self,
+        forecast_len,
+        initial_scale=0.1,
+        max_scale=1.0,
+        scale_l2=1e-3,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if forecast_len <= 0:
+            raise ValueError('forecast_len 必须为正整数')
+        if max_scale <= 0:
+            raise ValueError('max_scale 必须为正数')
+        if not 0 <= initial_scale <= max_scale:
+            raise ValueError('initial_scale 必须位于 [0, max_scale] 内')
+        if scale_l2 < 0:
+            raise ValueError('scale_l2 不能为负数')
+        self.forecast_len = int(forecast_len)
+        self.initial_scale = float(initial_scale)
+        self.max_scale = float(max_scale)
+        self.scale_l2 = float(scale_l2)
+
+    def build(self, input_shape):
+        if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 2:
+            raise ValueError('HorizonScaledResidualAdd 需要 [baseline, correction]')
+        for shape in input_shape:
+            if shape[-1] is not None and int(shape[-1]) != self.forecast_len:
+                raise ValueError(
+                    f'输入预测长度 {shape[-1]} 与 forecast_len='
+                    f'{self.forecast_len} 不一致'
+                )
+        self.correction_scale = self.add_weight(
+            name='correction_scale',
+            shape=(self.forecast_len,),
+            initializer=keras.initializers.Constant(self.initial_scale),
+            regularizer=regularizers.l2(self.scale_l2),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        baseline, correction = inputs
+        scale = tf.clip_by_value(
+            tf.cast(self.correction_scale, correction.dtype),
+            clip_value_min=0.0,
+            clip_value_max=self.max_scale,
+        )
+        return baseline + correction * scale
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'forecast_len': self.forecast_len,
+            'initial_scale': self.initial_scale,
+            'max_scale': self.max_scale,
+            'scale_l2': self.scale_l2,
+        })
+        return config
+
+
 def build_fets_patchtst_model(
     input_dim,
     target_channel_index,
@@ -906,8 +982,13 @@ def build_fets_patchtst_model(
     local_n_layers=LOCAL_N_LAYERS,
     target_weather_heads=TARGET_WEATHER_HEADS,
     layer_scale_init=LAYER_SCALE_INIT,
+    long_context_dim=LONG_CONTEXT_DIM,
+    correction_scale_init=CORRECTION_SCALE_INIT,
+    correction_scale_max=CORRECTION_SCALE_MAX,
+    correction_scale_l2=CORRECTION_SCALE_L2,
+    correction_kernel_l2=CORRECTION_KERNEL_L2,
 ):
-    """构建原生长尺度 PatchTST + 目标感知局部 FeTS 修正分支。"""
+    """构建长上下文协调、按 horizon 约束修正的 FeTS-PatchTST。"""
     if target_channel_index is None:
         raise ValueError('FeTS-PatchTST 需要将历史功率作为输入通道')
     if not 0 <= target_channel_index < input_dim:
@@ -920,6 +1001,10 @@ def build_fets_patchtst_model(
         raise ValueError('d_model 必须能被 target_weather_heads 整除')
     if local_n_layers <= 0:
         raise ValueError('local_n_layers 必须为正整数')
+    if long_context_dim <= 0:
+        raise ValueError('long_context_dim 必须为正整数')
+    if correction_kernel_l2 < 0:
+        raise ValueError('correction_kernel_l2 不能为负数')
 
     long_patch_num = compute_patch_num(
         history_len,
@@ -1005,6 +1090,19 @@ def build_fets_patchtst_model(
         forecast_len,
         name='baseline_forecast_power',
     )(baseline_head)
+    long_local_context = layers.Concatenate(
+        name='long_local_context_features',
+    )([
+        long_target_repr,
+        long_global_context,
+        baseline_forecast,
+    ])
+    long_local_context = layers.Dense(
+        long_context_dim,
+        activation='gelu',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
+        name='long_to_local_context_projection',
+    )(long_local_context)
 
     # 局部分支保留 4 个原始 15 分钟点/patch，以 2 点步长建模快速爬坡。
     local_x = FeTSPatchExtract(
@@ -1068,7 +1166,11 @@ def build_fets_patchtst_model(
     )(local_x)
     local_head = layers.Concatenate(
         name='local_forecast_context',
-    )([local_recent, local_global])
+    )([
+        local_recent,
+        local_global,
+        long_local_context,
+    ])
     local_head = layers.Dropout(
         head_dropout,
         name='local_head_dropout',
@@ -1086,10 +1188,15 @@ def build_fets_patchtst_model(
         forecast_len,
         kernel_initializer='zeros',
         bias_initializer='zeros',
+        kernel_regularizer=regularizers.l2(correction_kernel_l2),
         name='local_forecast_correction',
     )(local_head)
 
-    outputs = layers.Add(
+    outputs = HorizonScaledResidualAdd(
+        forecast_len=forecast_len,
+        initial_scale=correction_scale_init,
+        max_scale=correction_scale_max,
+        scale_l2=correction_scale_l2,
         name='forecast_power',
     )([baseline_forecast, local_correction])
 
@@ -1358,6 +1465,11 @@ def train_one_farm(train_file):
         f'局部FeTS Patch: patch_len={LOCAL_PATCH_LEN}, '
         f'stride={LOCAL_PATCH_STRIDE}, patch_num={local_patch_num}'
     )
+    print(
+        f'长上下文融合维度: {LONG_CONTEXT_DIM}；局部修正 scale: '
+        f'init={CORRECTION_SCALE_INIT}, max={CORRECTION_SCALE_MAX}, '
+        f'L2={CORRECTION_SCALE_L2}；修正头 L2={CORRECTION_KERNEL_L2}'
+    )
 
     model = build_fets_patchtst_model(
         len(input_cols),
@@ -1427,10 +1539,26 @@ def train_one_farm(train_file):
     model.load_weights(best_weights_path)
 
     metrics = evaluate_model(model, val_ds, scaler_y, capacity)
+    correction_scale_layer = model.get_layer('forecast_power')
+    correction_scale_raw = np.asarray(
+        correction_scale_layer.correction_scale.numpy(),
+        dtype=float,
+    )
+    correction_scale_values = np.clip(
+        correction_scale_raw,
+        0.0,
+        CORRECTION_SCALE_MAX,
+    )
     model.save(model_path)
     print(
         f"验证集反归一化 MAE: {metrics['val_mae']:.4f}, "
         f"RMSE: {metrics['val_rmse']:.4f}"
+    )
+    print(
+        '学习后的 horizon 修正 scale: '
+        f'min={correction_scale_values.min():.6f}, '
+        f'mean={correction_scale_values.mean():.6f}, '
+        f'max={correction_scale_values.max():.6f}'
     )
 
     artifact = {
@@ -1463,6 +1591,17 @@ def train_one_farm(train_file):
         'd_ff': D_FF,
         'target_weather_heads': TARGET_WEATHER_HEADS,
         'layer_scale_init': LAYER_SCALE_INIT,
+        'long_context_dim': LONG_CONTEXT_DIM,
+        'long_local_context_fusion': (
+            'target_representation+global_context+baseline_forecast'
+        ),
+        'correction_scale_type': 'learnable_per_horizon_clipped',
+        'correction_scale_init': CORRECTION_SCALE_INIT,
+        'correction_scale_max': CORRECTION_SCALE_MAX,
+        'correction_scale_l2': CORRECTION_SCALE_L2,
+        'correction_kernel_l2': CORRECTION_KERNEL_L2,
+        'correction_scale_raw_values': correction_scale_raw.tolist(),
+        'correction_scale_values': correction_scale_values.tolist(),
         'adafe_threshold': 'per_patch',
         'channel_identity_embedding': True,
         'cross_channel_attention': False,
@@ -1505,6 +1644,9 @@ def train_one_farm(train_file):
         'tensorboard_log_dir': tensorboard_log_dir,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
+        'correction_scale_min': float(correction_scale_values.min()),
+        'correction_scale_mean': float(correction_scale_values.mean()),
+        'correction_scale_max_learned': float(correction_scale_values.max()),
     }
     del model
     keras.backend.clear_session()

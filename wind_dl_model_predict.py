@@ -23,6 +23,7 @@ from wind_FeTS_PatchTST_train import (
     FeTSFeatureBlock,
     FeTSPatchExtract,
     FourierPolynomialMask,
+    HorizonScaledResidualAdd,
     LayerScaleFeTSFeatureBlock,
     PatchCrossChannelAttention,
     SelectChannel,
@@ -157,6 +158,8 @@ def get_custom_objects():
         'WindFeTSPatchTST>ChannelIdentityEmbedding': ChannelIdentityEmbedding,
         'LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
         'WindFeTSPatchTST>LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
+        'HorizonScaledResidualAdd': HorizonScaledResidualAdd,
+        'WindFeTSPatchTST>HorizonScaledResidualAdd': HorizonScaledResidualAdd,
         'FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'WindFeTSPatchTST>FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
         'PatchCrossChannelAttention': PatchCrossChannelAttention,
@@ -257,6 +260,11 @@ def build_model_from_weights(model_name, artifact):
             local_n_layers=artifact.get('local_n_layers', 2),
             target_weather_heads=artifact.get('target_weather_heads', 4),
             layer_scale_init=artifact.get('layer_scale_init', 1e-3),
+            long_context_dim=artifact.get('long_context_dim', 64),
+            correction_scale_init=artifact.get('correction_scale_init', 0.1),
+            correction_scale_max=artifact.get('correction_scale_max', 1.0),
+            correction_scale_l2=artifact.get('correction_scale_l2', 1e-3),
+            correction_kernel_l2=artifact.get('correction_kernel_l2', 1e-4),
         )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
