@@ -9,7 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from tensorflow import keras
 from tensorflow.keras import layers, regularizers
@@ -18,10 +18,14 @@ warnings.filterwarnings('ignore')
 
 
 DATA_DIR = r'./wind_split'
-MODEL_DIR = r'./wind_results/patchtst'
-SAVED_MODEL_DIR = r'./models'
-TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
+MODEL_NAME = 'patchtst'
+MODEL_DIR = os.path.join(r'./wind_results', MODEL_NAME)
+SAVED_MODEL_DIR = os.path.join(MODEL_DIR, 'models')
+WEIGHTS_DIR = os.path.join(MODEL_DIR, 'weights')
+PREPROCESS_DIR = os.path.join(MODEL_DIR, 'preprocess')
 HISTORY_DIR = os.path.join(MODEL_DIR, 'history')
+TENSORBOARD_LOG_DIR = os.path.join(MODEL_DIR, 'tensorboard')
+TAIL_DIR = os.path.join(MODEL_DIR, 'tails')
 TRAIN_FILE_PATTERN = 'wind_train_*.csv'
 
 seed = 2026
@@ -440,8 +444,29 @@ def evaluate_model(model, val_ds, scaler_y, capacity=None):
         y_pred = np.clip(y_pred, 0, None)
 
     mae = mean_absolute_error(y_true, y_pred)
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    return mae, rmse
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    r2 = np.nan
+    if len(y_true) > 1 and np.nanstd(y_true) > 1e-6:
+        r2 = r2_score(y_true, y_pred)
+
+    norm_mae = np.nan
+    norm_rmse = np.nan
+    if capacity is not None and capacity > 0:
+        norm_mae = float(mae / capacity)
+        norm_rmse = float(rmse / capacity)
+
+    return {
+        'val_inverse_mae': float(mae),
+        'val_inverse_mse': float(mse),
+        'val_inverse_rmse': rmse,
+        'val_inverse_r2': r2,
+        'val_capacity_normalized_mae': norm_mae,
+        'val_capacity_normalized_rmse': norm_rmse,
+        # Backward-compatible aliases used by earlier PatchTST result files.
+        'val_mae': float(mae),
+        'val_rmse': rmse,
+    }
 
 
 def save_history_artifacts(history, farm_id):
@@ -525,9 +550,17 @@ def train_one_farm(train_file):
     model = build_patchtst_model(len(input_cols), target_index)
     model.summary()
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(SAVED_MODEL_DIR, exist_ok=True)
-    best_weights_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_best.weights.h5')
+    for path in [
+        MODEL_DIR,
+        SAVED_MODEL_DIR,
+        WEIGHTS_DIR,
+        PREPROCESS_DIR,
+        HISTORY_DIR,
+        TENSORBOARD_LOG_DIR,
+        TAIL_DIR,
+    ]:
+        os.makedirs(path, exist_ok=True)
+    best_weights_path = os.path.join(WEIGHTS_DIR, f'patchtst_farm_{farm_id}_best.weights.h5')
     model_path = os.path.join(SAVED_MODEL_DIR, f'patchtst_farm_{farm_id}.keras')
     tensorboard_log_dir = os.path.join(
         TENSORBOARD_LOG_DIR,
@@ -577,8 +610,11 @@ def train_one_farm(train_file):
     model.save(model_path)
 
     history_path, history_plot_path = save_history_artifacts(history, farm_id)
-    mae, rmse = evaluate_model(model, val_ds, scaler_y, capacity)
-    print(f'验证集反归一化 MAE: {mae:.4f}, RMSE: {rmse:.4f}')
+    eval_metrics = evaluate_model(model, val_ds, scaler_y, capacity)
+    print(
+        f"验证集反归一化 MAE: {eval_metrics['val_inverse_mae']:.4f}, "
+        f"RMSE: {eval_metrics['val_inverse_rmse']:.4f}"
+    )
     print(f'最终PatchTST模型: {model_path}')
     print(f'最佳checkpoint权重: {best_weights_path}')
     print(f'TensorBoard日志: {tensorboard_log_dir}')
@@ -587,6 +623,7 @@ def train_one_farm(train_file):
         print(f'训练曲线图片: {history_plot_path}')
 
     artifact = {
+        'model_name': MODEL_NAME,
         'farm_id': farm_id,
         'feature_cols': feature_cols,
         'input_cols': input_cols,
@@ -605,17 +642,18 @@ def train_one_farm(train_file):
         'tensorboard_log_dir': tensorboard_log_dir,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
-        'val_mae': mae,
-        'val_rmse': rmse,
+        **eval_metrics,
     }
-    artifact_path = os.path.join(MODEL_DIR, f'patchtst_farm_{farm_id}_preprocess.pkl')
+    artifact_path = os.path.join(PREPROCESS_DIR, f'patchtst_farm_{farm_id}_preprocess.pkl')
     joblib.dump(artifact, artifact_path)
 
-    tail_path = os.path.join(MODEL_DIR, f'patchtst_tail_farm_{farm_id}.csv')
+    tail_path = os.path.join(TAIL_DIR, f'patchtst_tail_farm_{farm_id}.csv')
     train_df.iloc[-HISTORY_LEN:].to_csv(tail_path, index=True)
 
     return {
+        'model_name': MODEL_NAME,
         'farm_id': farm_id,
+        'train_file': train_file,
         'model_path': model_path,
         'best_weights_path': best_weights_path,
         'artifact_path': artifact_path,
@@ -623,9 +661,10 @@ def train_one_farm(train_file):
         'tensorboard_log_dir': tensorboard_log_dir,
         'history_path': history_path,
         'history_plot_path': history_plot_path,
+        'train_samples': train_samples,
+        'val_samples': total_samples - train_samples,
         'history': history.history,
-        'val_mae': mae,
-        'val_rmse': rmse,
+        **eval_metrics,
     }
 
 
@@ -633,8 +672,11 @@ if __name__ == '__main__':
     set_global_seed(seed)
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(SAVED_MODEL_DIR, exist_ok=True)
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    os.makedirs(PREPROCESS_DIR, exist_ok=True)
     os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
     os.makedirs(HISTORY_DIR, exist_ok=True)
+    os.makedirs(TAIL_DIR, exist_ok=True)
 
     train_files = discover_train_files(DATA_DIR)
     if not train_files:
@@ -647,7 +689,17 @@ if __name__ == '__main__':
 
     metrics = pd.DataFrame([
         {
+            'model_name': item['model_name'],
             'farm_id': item['farm_id'],
+            'train_file': item['train_file'],
+            'train_samples': item['train_samples'],
+            'val_samples': item['val_samples'],
+            'val_inverse_mae': item['val_inverse_mae'],
+            'val_inverse_mse': item['val_inverse_mse'],
+            'val_inverse_rmse': item['val_inverse_rmse'],
+            'val_inverse_r2': item['val_inverse_r2'],
+            'val_capacity_normalized_mae': item['val_capacity_normalized_mae'],
+            'val_capacity_normalized_rmse': item['val_capacity_normalized_rmse'],
             'val_mae': item['val_mae'],
             'val_rmse': item['val_rmse'],
             'model_path': item['model_path'],
