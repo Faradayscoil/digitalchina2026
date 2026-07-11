@@ -7,6 +7,8 @@
 !/wind_dl_model_train.py
 !/wind_dl_other_models_train.py
 !/wind_FeTS_PatchTST_train.py
+!/wind_FeTS_PatchTST_min_train.py
+!/wind_FeTS_PatchTST_min_predict.py
 
 # Keep the current FeTS-PatchTST model handoff document on this branch.
 !/docs/
