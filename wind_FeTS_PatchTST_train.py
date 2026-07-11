@@ -58,6 +58,7 @@ from wind_dl_model_train import (
     build_scaled_arrays,
     load_and_preprocess,
     make_window_dataset,
+    set_global_seed,
     transformer_encoder,
 )
 
@@ -86,6 +87,10 @@ VALIDATION_SPLIT = float(
 LEARNING_RATE = float(
     os.getenv('WIND_FETS_LEARNING_RATE', str(BASELINE_LEARNING_RATE))
 )
+
+# 与上一轮 PatchTST/FeTS 实验口径保持一致。每个场站在构建模型前都会重新
+# 设置该种子，使单场站重训不依赖此前已训练场站消耗过的随机状态。
+RANDOM_SEED = 2026
 
 # 与 817fe4... 原生 PatchTST 保持一致，避免同时改变 patch 和表示宽度。
 PATCH_LEN = BASELINE_PATCH_LEN
@@ -1829,9 +1834,22 @@ def ensure_output_dirs():
         os.makedirs(path, exist_ok=True)
 
 
+def configure_reproducibility():
+    """固定模型初始化、Dropout 和数据 shuffle 使用的随机状态。"""
+    set_global_seed(RANDOM_SEED)
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except (AttributeError, RuntimeError):
+        # 兼容未提供该接口或已经完成设备初始化的 TensorFlow 版本；全局随机
+        # 状态仍保持固定，但旧版本/GPU 算子的逐位确定性取决于运行环境。
+        pass
+
+
 def train_one_farm(train_file):
+    configure_reproducibility()
     farm_id = get_farm_id(train_file)
     print(f'\n===== 训练 FeTS-PatchTST / 风电场 {farm_id} =====')
+    print(f'固定随机种子: {RANDOM_SEED}')
 
     train_df, feature_cols, capacity = load_and_preprocess(
         train_file,
@@ -2014,6 +2032,8 @@ def train_one_farm(train_file):
         'history_len': HISTORY_LEN,
         'forecast_len': FORECAST_LEN,
         'time_freq': TIME_FREQ,
+        'random_seed': RANDOM_SEED,
+        'deterministic_ops_requested': True,
         'patch_len': PATCH_LEN,
         'patch_stride': PATCH_STRIDE,
         'mid_patch_len': MID_PATCH_LEN,
@@ -2101,6 +2121,7 @@ def train_one_farm(train_file):
     result = {
         **metrics,
         'farm_id': farm_id,
+        'random_seed': RANDOM_SEED,
         'model_path': model_path,
         'best_weights_path': best_weights_path,
         'artifact_path': artifact_path,
