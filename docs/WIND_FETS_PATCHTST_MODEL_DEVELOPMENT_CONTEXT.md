@@ -480,11 +480,11 @@ top-k 稀疏路由
 | Round 01 | 16.581046 | 0.123932 | `archive/round_01_original_fets_patchtst_hybrid_v2_20260705` |
 | Round 02 | 17.209558 | 0.121722 | `archive/round_02_fets_patchtst_multiscale_target_aware_v3_20260706` |
 | Round 03 | 15.171212 | 0.119122 | `archive/round_03_fets_patchtst_multiscale_context_scaled_v4_20260706` |
-| 当前 v5-A/B | 14.172754 | 0.116478 | `wind_results/fets_patchtst` 活动目录 |
+| 当前 v5-A/B | 14.172754 | 0.116478 | `archive/round_04_fets_patchtst_horizon_regime_moe_v5ab_20260710` |
 
-三轮归档都包含完整模型、最佳权重、预处理 artifact、训练历史、测试预测、
-逐 horizon 指标、汇总指标、可视化、`ARCHIVE_INFO.md` 和 `SHA256SUMS`。
-当前 v5-A/B 尚未单独建立 Round 04 归档，仍位于活动结果目录。
+四轮归档都包含模型、最佳权重、预处理 artifact、训练历史、测试预测、逐
+horizon 指标、汇总指标、可视化、`ARCHIVE_INFO.md` 和 `SHA256SUMS`。当前
+v5-A/B 已建立 Round 04 只读快照；活动目录仍作为后续实验的输出位置。
 
 ### 7.3 早期“场站间零和”证据
 
@@ -788,7 +788,7 @@ FeTS 预测时会校验 artifact 的 `architecture_version` 与当前训练代�
 │  ├─ weighted_curves/
 │  ├─ router_diagnostics/
 │  └─ figures/
-└─ archive/                已冻结的前三轮结果
+└─ archive/                已冻结的四轮结果
 ```
 
 五个 `preprocess/*.pkl` artifact 均记录当前架构版本
@@ -805,10 +805,13 @@ CSV 为准。
 ./wind_results/fets_patchtst/archive/
 ├─ round_01_original_fets_patchtst_hybrid_v2_20260705/
 ├─ round_02_fets_patchtst_multiscale_target_aware_v3_20260706/
-└─ round_03_fets_patchtst_multiscale_context_scaled_v4_20260706/
+├─ round_03_fets_patchtst_multiscale_context_scaled_v4_20260706/
+└─ round_04_fets_patchtst_horizon_regime_moe_v5ab_20260710/
 ```
 
-归档是结构谱系证据，不应被后续活动目录同名结果覆盖或与当前模型混用。
+Round 04 只收录五个最终 artifact 对应的 TensorBoard 日志，并根据这些 artifact
+重建五场站统一训练指标，排除了旧轮次和被替代的训练记录。归档是结构谱系
+证据，不应被后续活动目录同名结果覆盖或与其它轮次模型混用。
 
 ### 15.4 PatchTST 与其它基线
 
