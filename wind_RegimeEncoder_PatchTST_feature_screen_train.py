@@ -1,4 +1,4 @@
-"""RegimeEncoder-PatchTST 第二阶段显式工况特征筛选 F0--F7。
+"""RegimeEncoder-PatchTST 第二阶段显式工况特征筛选 F0--F8。
 
 本脚本只改变 R4 显式工况编码器送入门控 MLP 的特征组，B2 两候选主干、
 门控结构、损失函数、训练轮数和随机种子均保持一致。43 维特征按物理含义分为：
@@ -9,19 +9,28 @@
     D: 风向变化（4）
     C: 功率--风速一致性（4）
 
-固定矩阵：
+原始矩阵与本次补充：
 
     F0=P, F1=P+H, F2=P+H+M, F3=P+H+M+D,
     F4=P+H+M+D+C（直接引用既有 R4，不训练、不复制模型），
-    F5=H+M+D, F6=P+M+D, F7=P+H+D。
+    F5=H+M+D, F6=P+M+D, F7=P+H+D,
+    F8=P+H+D+C（无M条件下检验C）。
+
+为排除联合微调造成的 corrected candidate drift，另设两个不参与最终模型排名的
+冻结候选探针：FP0=P+H+D、FP4=P+H+D+C。两者都复制并冻结同一场站的
+Stage-1 B2 persistence/corrected candidate，只训练显式工况编码器和门控。
+因此 FP0--FP4 的差异可归因于4个C特征对路由的作用。
+
+默认运行只新增 F8/FP0/FP4 共15个场站模型；F0--F7训练结果从既有汇总只读
+复用，绝不再次训练。不会执行多seed实验。
 
 所有新增产物写入
 ``wind_results/regime_encoder_patchtst/stage2_feature_screening_f0_f7``，
 不会写入原 R2--R5 目录或原 ``testdata_predict_output``。
 
-可选环境变量：
+变体/场站可筛选；训练超参数被协议锁定（偏离下列值会拒绝运行）：
 
-    WIND_FEATURE_SCREEN_VARIANTS=f0,f1,...,f7
+    WIND_FEATURE_SCREEN_VARIANTS=f0,...,f8,fp0,fp4
     WIND_FEATURE_SCREEN_FARMS=<farm_id,...>
     WIND_FEATURE_SCREEN_BATCH_SIZE=192
     WIND_FEATURE_SCREEN_EPOCHS=60
@@ -34,7 +43,7 @@ import json
 import os
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 
 import joblib
 import numpy as np
@@ -66,10 +75,12 @@ warnings.filterwarnings("ignore")
 MODEL_FAMILY = "regime_encoder_patchtst_feature_screen"
 ARCHITECTURE_VERSION = "regime_encoder_patchtst_stage2_feature_screen_v1"
 ARTIFACT_SCHEMA_VERSION = 1
+SUPPLEMENT_PROTOCOL_VERSION = "feature_screen_f8_fp_frozen_b2_v1"
 EXPERIMENT_DIRNAME = "stage2_feature_screening_f0_f7"
 RESULT_ROOT = os.path.join(regime_train.RESULT_ROOT, EXPERIMENT_DIRNAME)
 R4_SOURCE_VARIANT = "r4_explicit_regime_gate"
 RANDOM_SEED = 2026
+EXPECTED_FARM_COUNT = 5
 
 BATCH_SIZE = int(os.getenv("WIND_FEATURE_SCREEN_BATCH_SIZE", "192"))
 EPOCHS = int(os.getenv("WIND_FEATURE_SCREEN_EPOCHS", "60"))
@@ -83,6 +94,14 @@ CANDIDATE_LOSS_WEIGHT = float(
         "0.50",
     )
 )
+LEGACY_JOINT_PROTOCOL = {
+    "batch_size": 192,
+    "epochs": 60,
+    "validation_split": 0.15,
+    "learning_rate": 1e-4,
+    "candidate_supervision_loss_weight": 0.50,
+    "random_seed": RANDOM_SEED,
+}
 IDEAL_PARAMETER_LIMIT = int(os.getenv("WIND_FEATURE_SCREEN_IDEAL_PARAMS", "30000"))
 HARD_PARAMETER_LIMIT = int(os.getenv("WIND_FEATURE_SCREEN_MAX_PARAMS", "100000"))
 
@@ -102,7 +121,42 @@ EXPECTED_PARAMETER_COUNTS = {
     "f5": 20527,
     "f6": 20735,
     "f7": 20969,
+    "f8": 21073,
+    "fp0": 20969,
+    "fp4": 21073,
 }
+
+EXPECTED_TRAINABLE_PARAMETER_COUNTS = {
+    **EXPECTED_PARAMETER_COUNTS,
+    "fp0": 2553,
+    "fp4": 2657,
+}
+
+LEGACY_SELECTION_VARIANTS = tuple(f"f{index}" for index in range(8))
+SELECTION_VARIANTS = tuple(f"f{index}" for index in range(9))
+PROBE_VARIANTS = ("fp0", "fp4")
+NEW_TRAINING_VARIANTS = ("f8", *PROBE_VARIANTS)
+REUSED_TRAINING_VARIANTS = LEGACY_SELECTION_VARIANTS
+FROZEN_B2_PARAMETER_COUNT = 18416
+LEGACY_TRAINING_SUMMARY = os.path.join(
+    RESULT_ROOT,
+    "feature_screening_training_metrics.csv",
+)
+EXTENDED_TRAINING_SUMMARY_NAME = (
+    "feature_screening_f0_f8_probe_training_metrics.csv"
+)
+EXTENDED_MANIFEST_NAME = "feature_screening_f0_f8_probe_experiment_manifest.csv"
+EXTENDED_VALIDATION_NAME = (
+    "feature_screening_f0_f8_probe_validation_descriptive.csv"
+)
+EXTENDED_PROGRESS_PREFIX = "feature_screening_f0_f8_probe_training_progress"
+TRAINING_COMPLETION_NAME = (
+    "feature_screening_f0_f8_probe_training_bundle_complete.json"
+)
+PREDICTION_COMPLETION_RELATIVE_PATH = os.path.join(
+    "f0_f8_probe_analysis_output",
+    "feature_screening_f0_f8_fp_bundle_complete.json",
+)
 
 FULL_FEATURE_NAMES = tuple(regime_train.explicit_regime_feature_names())
 
@@ -219,7 +273,46 @@ VARIANT_SPECS = {
         "requires_training": True,
         "description": "无多高度风速特征的反向消融",
     },
+    "f8": {
+        "directory_name": "f8_no_multiheight_with_consistency",
+        "label": "F8 power + hub + direction + consistency (no multi-height)",
+        "groups": ("P", "H", "D", "C"),
+        "requires_training": True,
+        "freeze_candidates": False,
+        "selection_eligible": True,
+        "experiment_role": "feature_candidate",
+        "description": "在F7上加入C，检验无M条件下一致性特征的独立贡献",
+    },
+    "fp0": {
+        "directory_name": "fp0_frozen_candidate_phd",
+        "label": "FP0 frozen B2 candidate + P+H+D gate",
+        "groups": ("P", "H", "D"),
+        "requires_training": True,
+        "freeze_candidates": True,
+        "selection_eligible": False,
+        "experiment_role": "frozen_candidate_probe",
+        "description": "冻结同一B2候选；0个C特征的门控探针",
+    },
+    "fp4": {
+        "directory_name": "fp4_frozen_candidate_phdc",
+        "label": "FP4 frozen B2 candidate + P+H+D+C gate",
+        "groups": ("P", "H", "D", "C"),
+        "requires_training": True,
+        "freeze_candidates": True,
+        "selection_eligible": False,
+        "experiment_role": "frozen_candidate_probe",
+        "description": "冻结同一B2候选；加入4个C特征的门控探针",
+    },
 }
+
+for _variant_id, _spec in VARIANT_SPECS.items():
+    _spec.setdefault("freeze_candidates", False)
+    _spec.setdefault("selection_eligible", _variant_id in SELECTION_VARIANTS)
+    _spec.setdefault("experiment_role", "feature_candidate")
+    _spec.setdefault(
+        "reuse_existing",
+        _variant_id in REUSED_TRAINING_VARIANTS,
+    )
 
 TRAINABLE_VARIANTS = tuple(
     variant_id
@@ -257,6 +350,9 @@ def _validate_feature_matrix():
         "f5": 19,
         "f6": 27,
         "f7": 36,
+        "f8": 40,
+        "fp0": 36,
+        "fp4": 40,
     }
     actual_counts = {
         variant_id: len(selected_feature_names(variant_id))
@@ -264,8 +360,22 @@ def _validate_feature_matrix():
     }
     if actual_counts != expected_counts:
         raise ValueError(
-            f"F0--F7 特征维数异常: {actual_counts} != {expected_counts}"
+            f"F0--F8/FP 特征维数异常: {actual_counts} != {expected_counts}"
         )
+    if set(EXPECTED_PARAMETER_COUNTS) != set(VARIANT_SPECS):
+        raise ValueError("总参数量冻结表没有完整覆盖全部特征变体")
+    if set(EXPECTED_TRAINABLE_PARAMETER_COUNTS) != set(VARIANT_SPECS):
+        raise ValueError("可训练参数量冻结表没有完整覆盖全部特征变体")
+    for variant_id in PROBE_VARIANTS:
+        frozen_count = (
+            EXPECTED_PARAMETER_COUNTS[variant_id]
+            - EXPECTED_TRAINABLE_PARAMETER_COUNTS[variant_id]
+        )
+        if frozen_count != FROZEN_B2_PARAMETER_COUNT:
+            raise ValueError(
+                f"{variant_id}冻结参数量{frozen_count:,}不是Stage-1 B2的"
+                f"{FROZEN_B2_PARAMETER_COUNT:,}"
+            )
 
 
 @keras.utils.register_keras_serializable(package="WindRegimeFeatureScreen")
@@ -319,6 +429,8 @@ def configure_reproducibility():
 
 def _validate_configuration():
     _validate_feature_matrix()
+    if os.getenv("WIND_FEATURE_SCREEN_SAVE_SMOKE_TEST", "1") != "1":
+        raise ValueError("正式F8/FP训练必须启用保存后重载smoke test")
     if BATCH_SIZE <= 0 or EPOCHS <= 0:
         raise ValueError("batch_size 和 epochs 必须为正整数")
     if not 0 < VALIDATION_SPLIT < 1:
@@ -327,6 +439,29 @@ def _validate_configuration():
         raise ValueError("学习率必须为正，候选监督权重不能为负")
     if HARD_PARAMETER_LIMIT < IDEAL_PARAMETER_LIMIT:
         raise ValueError("硬参数上限不能小于理想参数上限")
+    actual_protocol = {
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "validation_split": VALIDATION_SPLIT,
+        "learning_rate": LEARNING_RATE,
+        "candidate_supervision_loss_weight": CANDIDATE_LOSS_WEIGHT,
+        "random_seed": RANDOM_SEED,
+    }
+    mismatched = []
+    for key, expected in LEGACY_JOINT_PROTOCOL.items():
+        actual = actual_protocol[key]
+        if isinstance(expected, float):
+            matches = np.isclose(float(actual), expected, rtol=0.0, atol=1e-12)
+        else:
+            matches = int(actual) == int(expected)
+        if not matches:
+            mismatched.append(f"{key}={actual!r} (expected {expected!r})")
+    if mismatched:
+        raise ValueError(
+            "F8/FP必须与既有F0--F7使用同一训练协议；"
+            "请清除残留的WIND_FEATURE_SCREEN_*训练覆盖: "
+            + "; ".join(mismatched)
+        )
 
 
 def variant_model_name(variant_id):
@@ -381,7 +516,54 @@ def discover_train_files(data_dir=DATA_DIR):
     return [path for path in files if regime_train.get_farm_id(path) in farm_ids]
 
 
-def _compile_model(model):
+def expected_training_farm_ids():
+    if not os.path.isfile(LEGACY_TRAINING_SUMMARY):
+        raise FileNotFoundError(
+            f"无法锁定正式训练场站，缺少旧summary: {LEGACY_TRAINING_SUMMARY}"
+        )
+    frame = pd.read_csv(
+        LEGACY_TRAINING_SUMMARY,
+        usecols=["variant_id", "farm_id"],
+    )
+    frame["variant_id"] = frame["variant_id"].astype(str)
+    frame["farm_id"] = frame["farm_id"].astype(str)
+    expected = None
+    for variant_id in LEGACY_SELECTION_VARIANTS:
+        farms = set(frame.loc[frame["variant_id"] == variant_id, "farm_id"])
+        if expected is None:
+            expected = farms
+        elif farms != expected:
+            raise ValueError("旧F0--F7训练summary场站集合不一致")
+    expected = expected or set()
+    if (
+        len(expected) != EXPECTED_FARM_COUNT
+        or len(frame) != len(LEGACY_SELECTION_VARIANTS) * EXPECTED_FARM_COUNT
+        or frame.duplicated(["variant_id", "farm_id"]).any()
+    ):
+        raise ValueError("旧F0--F7训练summary不是8×5唯一完整矩阵")
+    return tuple(sorted(expected))
+
+
+def candidate_loss_weight_for_variant(variant_id):
+    """冻结候选探针不对不可训练的corrected candidate重复施加常数损失。"""
+    return 0.0 if VARIANT_SPECS[variant_id]["freeze_candidates"] else CANDIDATE_LOSS_WEIGHT
+
+
+def _configure_candidate_trainability(model, variant_id):
+    """在compile前锁定FP候选，并关闭不会受``trainable``影响的Dropout。"""
+    freeze_candidates = bool(VARIANT_SPECS[variant_id]["freeze_candidates"])
+    for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES:
+        model.get_layer(layer_name).trainable = not freeze_candidates
+    residual_dropout = model.get_layer("residual_dropout")
+    if freeze_candidates:
+        # Dropout没有权重；只设置trainable=False并不会阻止fit时随机丢弃。
+        # rate=0使训练期与Stage-1 B2的确定性推理候选完全一致。
+        residual_dropout.rate = 0.0
+        residual_dropout.trainable = False
+    return freeze_candidates
+
+
+def _compile_model(model, candidate_loss_weight=CANDIDATE_LOSS_WEIGHT):
     model.compile(
         optimizer=keras.optimizers.Adam(
             learning_rate=LEARNING_RATE,
@@ -393,7 +575,7 @@ def _compile_model(model):
         },
         loss_weights={
             "forecast_power": 1.0,
-            "candidate_forecast": CANDIDATE_LOSS_WEIGHT,
+            "candidate_forecast": float(candidate_loss_weight),
         },
         metrics={
             "forecast_power": [
@@ -416,7 +598,7 @@ def build_feature_screen_model(
     power_scale_offset=0.0,
     regime_feature_config=None,
 ):
-    """构建F0/F1/F2/F3/F5/F6/F7；F4只能直接引用R4。"""
+    """构建可训练F/FP变体；F4只能直接引用既有R4。"""
     if variant_id not in TRAINABLE_VARIANTS:
         raise ValueError(f"{variant_id} 不是需要训练的特征筛选变体")
     if target_channel_index is None or not 0 <= target_channel_index < input_dim:
@@ -484,7 +666,11 @@ def build_feature_screen_model(
         },
         name=f"WindRegimeEncoderFeatureScreen_{variant_id.upper()}",
     )
-    return _compile_model(model)
+    _configure_candidate_trainability(model, variant_id)
+    return _compile_model(
+        model,
+        candidate_loss_weight=candidate_loss_weight_for_variant(variant_id),
+    )
 
 
 def build_feature_screen_model_from_artifact(artifact):
@@ -494,10 +680,45 @@ def build_feature_screen_model_from_artifact(artifact):
             f"{artifact.get('architecture_version')} != {ARCHITECTURE_VERSION}"
         )
     variant_id = artifact.get("variant_id")
+    if variant_id not in VARIANT_SPECS:
+        raise ValueError(f"artifact包含未知特征变体: {variant_id}")
     if tuple(artifact.get("selected_regime_feature_names", ())) != (
         selected_feature_names(variant_id)
     ):
         raise ValueError(f"artifact 的 {variant_id} 特征子集与当前定义不一致")
+    expected_freeze = bool(VARIANT_SPECS[variant_id]["freeze_candidates"])
+    artifact_freeze = bool(
+        artifact.get(
+            "freeze_candidates",
+            artifact.get("backbone_frozen", False),
+        )
+    )
+    if artifact_freeze != expected_freeze:
+        raise ValueError(
+            f"artifact 的 {variant_id} 冻结协议不一致: "
+            f"{artifact_freeze} != {expected_freeze}"
+        )
+    expected_candidate_weight = candidate_loss_weight_for_variant(variant_id)
+    artifact_candidate_weight = float(
+        artifact.get(
+            "candidate_supervision_loss_weight",
+            CANDIDATE_LOSS_WEIGHT,
+        )
+    )
+    if not np.isclose(
+        artifact_candidate_weight,
+        expected_candidate_weight,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError(
+            f"artifact 的 {variant_id} candidate loss权重不一致: "
+            f"{artifact_candidate_weight} != {expected_candidate_weight}"
+        )
+    if expected_freeze and not bool(
+        artifact.get("residual_dropout_disabled_for_frozen_candidate", False)
+    ):
+        raise ValueError(f"artifact 的 {variant_id} 未声明关闭residual dropout")
     return build_feature_screen_model(
         variant_id=variant_id,
         input_dim=len(artifact["input_cols"]),
@@ -630,7 +851,7 @@ def _train_paths(dirs, model_name, farm_id):
     }
 
 
-def _save_load_smoke_test(model, model_path, val_ds):
+def _save_load_smoke_test(model, model_path, val_ds, variant_id):
     if os.getenv("WIND_FEATURE_SCREEN_SAVE_SMOKE_TEST", "1") == "0":
         return
     sample_x, _ = next(iter(val_ds))
@@ -649,6 +870,16 @@ def _save_load_smoke_test(model, model_path, val_ds):
     actual = np.asarray(restored_diagnostic(sample_x, training=False), dtype=float)
     if not np.allclose(expected, actual, rtol=1e-6, atol=1e-6):
         raise ValueError("保存后重载模型的 forecast 输出不一致")
+    restored_trainable_params = int(
+        sum(int(np.prod(variable.shape)) for variable in restored.trainable_weights)
+    )
+    expected_trainable_params = EXPECTED_TRAINABLE_PARAMETER_COUNTS[variant_id]
+    if restored_trainable_params != expected_trainable_params:
+        raise ValueError(
+            f"保存后重载{variant_id}可训练参数量{restored_trainable_params:,} != "
+            f"{expected_trainable_params:,}"
+        )
+    _validate_frozen_candidate_configuration(restored, variant_id)
     del restored_diagnostic, restored, diagnostic
 
 
@@ -665,9 +896,226 @@ def _file_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
+def _atomic_to_csv(frame, path, **kwargs):
+    temporary = f"{path}.tmp"
+    try:
+        frame.to_csv(
+            temporary,
+            index=False,
+            encoding="utf-8-sig",
+            **kwargs,
+        )
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return path
+
+
+def _atomic_joblib_dump(value, path):
+    temporary = f"{path}.tmp"
+    try:
+        joblib.dump(value, temporary)
+        restored = joblib.load(temporary)
+        if isinstance(value, dict) and not isinstance(restored, dict):
+            raise TypeError(f"joblib临时artifact重载类型异常: {path}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return path
+
+
+def _atomic_write_json(value, path):
+    temporary = f"{path}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(value, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return path
+
+
+def _training_completion_path():
+    return os.path.join(RESULT_ROOT, TRAINING_COMPLETION_NAME)
+
+
+def _clear_training_completion_marker():
+    path = _training_completion_path()
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _clear_downstream_prediction_completion_marker():
+    path = os.path.join(RESULT_ROOT, PREDICTION_COMPLETION_RELATIVE_PATH)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _publish_training_completion_marker(
+    metrics_df,
+    metrics_path,
+    validation_path,
+):
+    expected_new_rows = len(NEW_TRAINING_VARIANTS) * len(
+        expected_training_farm_ids()
+    )
+    new_rows = metrics_df[
+        metrics_df["variant_id"].isin(NEW_TRAINING_VARIANTS)
+    ].copy()
+    if (
+        len(new_rows) != expected_new_rows
+        or new_rows.duplicated(["variant_id", "farm_id"]).any()
+    ):
+        raise ValueError("训练bundle完成标志前，F8/FP0/FP4产物矩阵不完整")
+    files = {
+        "extended_manifest": os.path.join(RESULT_ROOT, EXTENDED_MANIFEST_NAME),
+        "extended_training_summary": metrics_path,
+        "extended_validation_descriptive": validation_path,
+        "legacy_f0_f7_training_summary": LEGACY_TRAINING_SUMMARY,
+    }
+    for _, row in new_rows.iterrows():
+        prefix = f"{row['variant_id']}.{row['farm_id']}"
+        for field in ("model_path", "artifact_path", "best_weights_path"):
+            path = row.get(field)
+            if not isinstance(path, str) or not os.path.isfile(path):
+                raise FileNotFoundError(f"训练bundle缺少{prefix}.{field}: {path}")
+            files[f"{prefix}.{field}"] = path
+        if _file_sha256(row["model_path"]) != row.get("model_sha256"):
+            raise ValueError(f"训练bundle模型hash不一致: {prefix}")
+        if _file_sha256(row["best_weights_path"]) != row.get(
+            "best_weights_sha256"
+        ):
+            raise ValueError(f"训练bundle权重hash不一致: {prefix}")
+        artifact = joblib.load(row["artifact_path"])
+        if (
+            artifact.get("variant_id") != row["variant_id"]
+            or str(artifact.get("farm_id")) != str(row["farm_id"])
+            or artifact.get("model_sha256") != row.get("model_sha256")
+            or artifact.get("best_weights_sha256")
+            != row.get("best_weights_sha256")
+        ):
+            raise ValueError(f"训练bundle artifact身份/hash不一致: {prefix}")
+    hashed_files = {}
+    for name, path in files.items():
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"训练bundle缺少{name}: {path}")
+        hashed_files[name] = {
+            "path": os.path.abspath(path),
+            "sha256": _file_sha256(path),
+            "size_bytes": os.path.getsize(path),
+        }
+    payload = {
+        "status": "complete",
+        "supplement_protocol_version": SUPPLEMENT_PROTOCOL_VERSION,
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "random_seed": RANDOM_SEED,
+        "new_training_variants": list(NEW_TRAINING_VARIANTS),
+        "expected_farm_ids": list(expected_training_farm_ids()),
+        "new_model_count": int(len(new_rows)),
+        "reused_f0_f7_model_count": int(
+            metrics_df["variant_id"].isin(REUSED_TRAINING_VARIANTS).sum()
+        ),
+        "multi_seed_experiment_run": False,
+        "files": hashed_files,
+    }
+    return _atomic_write_json(payload, _training_completion_path())
+
+
+def _numpy_values_sha256(named_values):
+    """对具名numpy数组做包含名称、形状和dtype的稳定哈希。"""
+    digest = hashlib.sha256()
+    for name, values in named_values:
+        value = np.ascontiguousarray(np.asarray(values))
+        digest.update(str(name).encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(json.dumps(list(value.shape)).encode("ascii"))
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _snapshot_b2_weighted_layers(model):
+    snapshot = {}
+    for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES:
+        snapshot[layer_name] = tuple(
+            np.array(value, copy=True)
+            for value in model.get_layer(layer_name).get_weights()
+        )
+    return snapshot
+
+
+def _snapshot_sha256(snapshot):
+    named_values = []
+    for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES:
+        for weight_index, value in enumerate(snapshot[layer_name]):
+            named_values.append((f"{layer_name}:{weight_index}", value))
+    return _numpy_values_sha256(named_values)
+
+
+def _assert_exact_snapshot_match(before, after, variant_id):
+    changed = []
+    for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES:
+        before_values = before.get(layer_name, ())
+        after_values = after.get(layer_name, ())
+        if len(before_values) != len(after_values):
+            changed.append(f"{layer_name}:weight_count")
+            continue
+        for weight_index, (before_value, after_value) in enumerate(
+            zip(before_values, after_values)
+        ):
+            if not np.array_equal(before_value, after_value):
+                changed.append(f"{layer_name}:{weight_index}")
+    if changed:
+        raise ValueError(
+            f"{variant_id}冻结B2权重在训练前后发生变化: {changed}"
+        )
+
+
+def _corrected_candidate_values(model, sample_x):
+    diagnostic = keras.Model(
+        model.inputs,
+        model.get_layer("corrected_forecast_candidate").output,
+    )
+    values = np.asarray(diagnostic(sample_x, training=False))
+    del diagnostic
+    return values
+
+
+def _validate_frozen_candidate_configuration(model, variant_id):
+    if variant_id not in PROBE_VARIANTS:
+        return
+    incorrectly_trainable = [
+        layer_name
+        for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES
+        if model.get_layer(layer_name).trainable
+    ]
+    if incorrectly_trainable:
+        raise ValueError(
+            f"{variant_id}仍有可训练B2层: {incorrectly_trainable}"
+        )
+    residual_dropout = model.get_layer("residual_dropout")
+    if not np.isclose(float(residual_dropout.rate), 0.0, rtol=0.0, atol=0.0):
+        raise ValueError(f"{variant_id}未关闭residual_dropout")
+    frozen_params = sum(
+        int(np.prod(weight.shape))
+        for layer_name in regime_train.B2_WEIGHTED_LAYER_NAMES
+        for weight in model.get_layer(layer_name).weights
+    )
+    if frozen_params != FROZEN_B2_PARAMETER_COUNT:
+        raise ValueError(
+            f"{variant_id}冻结B2参数量{frozen_params:,} != "
+            f"{FROZEN_B2_PARAMETER_COUNT:,}"
+        )
+
+
 def train_variant_for_farm(variant_id, prepared):
-    if variant_id not in TRAINABLE_VARIANTS:
-        raise ValueError(f"引用变体 {variant_id} 不应进入训练函数")
+    if variant_id not in NEW_TRAINING_VARIANTS:
+        raise ValueError(
+            f"补充协议只允许新增训练{NEW_TRAINING_VARIANTS}；"
+            f"{variant_id}必须从既有F0--F7 summary只读复用"
+        )
     keras.backend.clear_session()
     configure_reproducibility()
     spec = VARIANT_SPECS[variant_id]
@@ -695,6 +1143,20 @@ def train_variant_for_farm(variant_id, prepared):
         prepared,
         sample_x[:2],
     )
+    freeze_candidates = bool(spec["freeze_candidates"])
+    candidate_loss_weight = candidate_loss_weight_for_variant(variant_id)
+    _validate_frozen_candidate_configuration(model, variant_id)
+    frozen_snapshot_before = None
+    frozen_weights_sha256_before = None
+    candidate_values_before = None
+    candidate_output_sha256_before = None
+    if freeze_candidates:
+        frozen_snapshot_before = _snapshot_b2_weighted_layers(model)
+        frozen_weights_sha256_before = _snapshot_sha256(frozen_snapshot_before)
+        candidate_values_before = _corrected_candidate_values(model, sample_x[:2])
+        candidate_output_sha256_before = _numpy_values_sha256(
+            [("corrected_candidate", candidate_values_before)]
+        )
     total_params = int(model.count_params())
     trainable_params = int(
         sum(int(np.prod(variable.shape)) for variable in model.trainable_weights)
@@ -713,6 +1175,12 @@ def train_variant_for_farm(variant_id, prepared):
         raise ValueError(
             f"{variant_id}参数量{total_params:,}与冻结实验协议"
             f"{expected_params:,}不一致；请检查输入通道或结构是否漂移"
+        )
+    expected_trainable_params = EXPECTED_TRAINABLE_PARAMETER_COUNTS[variant_id]
+    if trainable_params != expected_trainable_params:
+        raise ValueError(
+            f"{variant_id}可训练参数量{trainable_params:,}与冻结实验协议"
+            f"{expected_trainable_params:,}不一致"
         )
 
     monitor = "val_forecast_power_loss"
@@ -770,29 +1238,76 @@ def train_variant_for_farm(variant_id, prepared):
         prepared["farm_id"],
     )
     model.load_weights(paths["best_weights_path"])
+    frozen_weights_sha256_after = None
+    frozen_weights_exact_match = None
+    candidate_output_sha256_after = None
+    candidate_output_exact_match = None
+    post_training_candidate_max_abs_error = None
+    if freeze_candidates:
+        frozen_snapshot_after = _snapshot_b2_weighted_layers(model)
+        frozen_weights_sha256_after = _snapshot_sha256(frozen_snapshot_after)
+        _assert_exact_snapshot_match(
+            frozen_snapshot_before,
+            frozen_snapshot_after,
+            variant_id,
+        )
+        frozen_weights_exact_match = bool(
+            frozen_weights_sha256_before == frozen_weights_sha256_after
+        )
+        if not frozen_weights_exact_match:
+            raise ValueError(f"{variant_id}冻结B2权重哈希在训练前后不一致")
+        candidate_values_after = _corrected_candidate_values(model, sample_x[:2])
+        candidate_output_sha256_after = _numpy_values_sha256(
+            [("corrected_candidate", candidate_values_after)]
+        )
+        candidate_output_exact_match = bool(
+            np.array_equal(candidate_values_before, candidate_values_after)
+        )
+        post_training_candidate_max_abs_error = float(
+            np.max(np.abs(candidate_values_before - candidate_values_after))
+        )
+        if not candidate_output_exact_match:
+            raise ValueError(
+                f"{variant_id}冻结corrected candidate训练前后不完全一致，"
+                f"最大误差={post_training_candidate_max_abs_error}"
+            )
     diagnostics = _collect_validation_diagnostics(
         model,
         val_ds,
         prepared,
         variant_id,
     )
-    model.save(paths["model_path"])
-    _save_load_smoke_test(model, paths["model_path"], val_ds)
+    model_stem, model_extension = os.path.splitext(paths["model_path"])
+    temporary_model_path = f"{model_stem}.tmp{model_extension}"
+    try:
+        model.save(temporary_model_path)
+        _save_load_smoke_test(
+            model,
+            temporary_model_path,
+            val_ds,
+            variant_id,
+        )
+        os.replace(temporary_model_path, paths["model_path"])
+    finally:
+        if os.path.isfile(temporary_model_path):
+            os.remove(temporary_model_path)
     elapsed_seconds = float(time.monotonic() - start_time)
 
     regime_path = os.path.join(
         dirs["validation_diagnostics"],
         f"{model_name}_validation_regime_metrics_farm_{prepared['farm_id']}.csv",
     )
-    pd.DataFrame(diagnostics["regime_rows"]).to_csv(
-        regime_path, index=False, encoding="utf-8-sig"
+    _atomic_to_csv(
+        pd.DataFrame(diagnostics["regime_rows"]),
+        regime_path,
     )
     gate_path = os.path.join(
         dirs["validation_diagnostics"],
         f"{model_name}_validation_gate_by_horizon_farm_{prepared['farm_id']}.csv",
     )
-    pd.DataFrame(diagnostics["gate_rows"]).to_csv(
-        gate_path, index=False, encoding="utf-8-sig"
+    _atomic_to_csv(
+        pd.DataFrame(diagnostics["gate_rows"]),
+        gate_path,
     )
     prepared["train_df"].iloc[-HISTORY_LEN:].to_csv(paths["tail_path"], index=True)
 
@@ -807,6 +1322,9 @@ def train_variant_for_farm(variant_id, prepared):
         "variant_label": spec["label"],
         "variant_config": dict(spec),
         "architecture_version": ARCHITECTURE_VERSION,
+        "supplement_protocol_version": SUPPLEMENT_PROTOCOL_VERSION,
+        "experiment_role": spec["experiment_role"],
+        "selection_eligible": bool(spec["selection_eligible"]),
         "farm_id": prepared["farm_id"],
         "train_file": prepared["train_file"],
         "feature_cols": prepared["feature_cols"],
@@ -821,7 +1339,25 @@ def train_variant_for_farm(variant_id, prepared):
         "time_freq": TIME_FREQ,
         "random_seed": RANDOM_SEED,
         "deterministic_ops_requested": True,
-        "training_mode": "stage1_b2_warm_start_feature_subset_finetune",
+        "training_mode": (
+            "stage1_b2_frozen_candidate_gate_only_probe"
+            if freeze_candidates
+            else "stage1_b2_warm_start_feature_subset_finetune"
+        ),
+        "freeze_candidates": freeze_candidates,
+        "backbone_frozen": freeze_candidates,
+        "frozen_candidate_layer_names": (
+            list(regime_train.B2_WEIGHTED_LAYER_NAMES)
+            if freeze_candidates
+            else []
+        ),
+        "frozen_candidate_parameter_count": (
+            FROZEN_B2_PARAMETER_COUNT if freeze_candidates else 0
+        ),
+        "residual_dropout_disabled_for_frozen_candidate": freeze_candidates,
+        "residual_dropout_rate_during_training": float(
+            model.get_layer("residual_dropout").rate
+        ),
         "requires_keras_model": True,
         "model_kind": "keras_network",
         "gate_type": "sample_horizon_sigmoid",
@@ -865,7 +1401,7 @@ def train_variant_for_farm(variant_id, prepared):
         "regime_context_dim": REGIME_CONTEXT_DIM,
         "gate_dropout": GATE_DROPOUT,
         "gate_initial_corrected_weight": GATE_INITIAL_CORRECTED_WEIGHT,
-        "candidate_supervision_loss_weight": CANDIDATE_LOSS_WEIGHT,
+        "candidate_supervision_loss_weight": candidate_loss_weight,
         "correction_kernel_l2": CORRECTION_KERNEL_L2,
         "batch_size": BATCH_SIZE,
         "epochs": EPOCHS,
@@ -874,13 +1410,16 @@ def train_variant_for_farm(variant_id, prepared):
         "early_stopping_monitor": monitor,
         "total_params": total_params,
         "expected_total_params": expected_params,
+        "expected_trainable_params": expected_trainable_params,
         "trainable_params": trainable_params,
         "model_size_bytes": model_size_bytes,
         "training_elapsed_seconds": elapsed_seconds,
         "train_samples": train_samples,
         "val_samples": total_samples - train_samples,
         "model_path": paths["model_path"],
+        "model_sha256": _file_sha256(paths["model_path"]),
         "best_weights_path": paths["best_weights_path"],
+        "best_weights_sha256": _file_sha256(paths["best_weights_path"]),
         "artifact_path": paths["artifact_path"],
         "history_path": history_path,
         "history_plot_path": history_plot_path,
@@ -889,14 +1428,34 @@ def train_variant_for_farm(variant_id, prepared):
         "validation_regime_metrics_path": regime_path,
         "validation_gate_diagnostics_path": gate_path,
         "backbone_initialization": backbone_source,
+        "source_model_path": backbone_source["source_model_path"],
+        "source_model_sha256": _file_sha256(
+            backbone_source["source_model_path"]
+        ),
+        "source_artifact_path": backbone_source["source_artifact_path"],
+        "source_artifact_sha256": _file_sha256(
+            backbone_source["source_artifact_path"]
+        ),
         "source_preprocess_compatibility_path": source_preprocess_path,
+        "source_preprocess_compatibility_sha256": _file_sha256(
+            source_preprocess_path
+        ),
+        "frozen_weights_sha256_before_training": frozen_weights_sha256_before,
+        "frozen_weights_sha256_after_training": frozen_weights_sha256_after,
+        "frozen_weights_exact_match_after_training": frozen_weights_exact_match,
+        "candidate_output_sha256_before_training": candidate_output_sha256_before,
+        "candidate_output_sha256_after_training": candidate_output_sha256_after,
+        "candidate_output_exact_match_after_training": candidate_output_exact_match,
+        "post_training_candidate_max_abs_error": (
+            post_training_candidate_max_abs_error
+        ),
         "evaluation_pipeline_version": regime_train.EVALUATION_PIPELINE_VERSION,
         "legacy_bidirectional_weather_imputation": True,
         "scaler_fit_scope": "full_train_file_including_validation",
         "validation_target_overlap_steps": FORECAST_LEN - 1,
         "exploratory_legacy_comparison": True,
         "selection_metric_source": "test_macro_capacity_normalized_rmse",
-        "test_used_for_feature_selection": True,
+        "test_used_for_feature_selection": bool(spec["selection_eligible"]),
         "test_is_final_blind_evaluation": False,
         "training_code_path": os.path.abspath(__file__),
         "training_code_sha256": _file_sha256(os.path.abspath(__file__)),
@@ -909,24 +1468,33 @@ def train_variant_for_farm(variant_id, prepared):
         **diagnostics["persistence_metrics"],
         **diagnostics["gate_fields"],
     }
-    joblib.dump(artifact, paths["artifact_path"])
+    _atomic_joblib_dump(artifact, paths["artifact_path"])
 
     result = {
         "model_family": MODEL_FAMILY,
         "model_name": model_name,
         "variant_id": variant_id,
         "variant_label": spec["label"],
+        "experiment_role": spec["experiment_role"],
+        "selection_eligible": bool(spec["selection_eligible"]),
+        "supplement_protocol_version": SUPPLEMENT_PROTOCOL_VERSION,
         "feature_groups": "+".join(spec["groups"]),
         "feature_count": len(names),
         "feature_names": json.dumps(names, ensure_ascii=False),
         "farm_id": prepared["farm_id"],
         "requires_training": True,
         "result_source": "stage2_feature_screen_trained",
+        "current_run_action": "train_new_supplement_variant",
+        "reused_existing_training_result": False,
         "source_variant": "b2_persistence_residual",
+        "freeze_candidates": freeze_candidates,
+        "backbone_frozen": freeze_candidates,
+        "candidate_supervision_loss_weight": candidate_loss_weight,
         "random_seed": RANDOM_SEED,
         "batch_size": BATCH_SIZE,
         "total_params": total_params,
         "expected_total_params": expected_params,
+        "expected_trainable_params": expected_trainable_params,
         "trainable_params": trainable_params,
         "model_size_bytes": model_size_bytes,
         "training_elapsed_seconds": elapsed_seconds,
@@ -939,13 +1507,32 @@ def train_variant_for_farm(variant_id, prepared):
         "model_path": paths["model_path"],
         "model_sha256": _file_sha256(paths["model_path"]),
         "best_weights_path": paths["best_weights_path"],
+        "best_weights_sha256": _file_sha256(paths["best_weights_path"]),
         "artifact_path": paths["artifact_path"],
         "history_path": history_path,
         "history_plot_path": history_plot_path,
         "validation_regime_metrics_path": regime_path,
         "validation_gate_diagnostics_path": gate_path,
         "source_model_path": backbone_source["source_model_path"],
+        "source_model_sha256": _file_sha256(
+            backbone_source["source_model_path"]
+        ),
         "source_artifact_path": backbone_source["source_artifact_path"],
+        "source_artifact_sha256": _file_sha256(
+            backbone_source["source_artifact_path"]
+        ),
+        "frozen_candidate_parameter_count": (
+            FROZEN_B2_PARAMETER_COUNT if freeze_candidates else 0
+        ),
+        "frozen_weights_sha256_before_training": frozen_weights_sha256_before,
+        "frozen_weights_sha256_after_training": frozen_weights_sha256_after,
+        "frozen_weights_exact_match_after_training": frozen_weights_exact_match,
+        "candidate_output_sha256_before_training": candidate_output_sha256_before,
+        "candidate_output_sha256_after_training": candidate_output_sha256_after,
+        "candidate_output_exact_match_after_training": candidate_output_exact_match,
+        "post_training_candidate_max_abs_error": (
+            post_training_candidate_max_abs_error
+        ),
     }
     print(
         f"{model_name} / {prepared['farm_id']}: "
@@ -1007,6 +1594,36 @@ def validate_r4_reference_artifact(artifact, artifact_path="<memory>"):
         )
 
 
+def validate_feature_training_protocol(
+    artifact,
+    artifact_path="<memory>",
+    candidate_loss_weight=CANDIDATE_LOSS_WEIGHT,
+):
+    """Validate the fixed protocol shared by legacy F models and supplements."""
+    expected = dict(LEGACY_JOINT_PROTOCOL)
+    expected["candidate_supervision_loss_weight"] = float(candidate_loss_weight)
+    mismatched = []
+    for key, expected_value in expected.items():
+        actual = artifact.get(key)
+        if actual is None:
+            matches = False
+        elif isinstance(expected_value, float):
+            matches = np.isclose(
+                float(actual), expected_value, rtol=0.0, atol=1e-12
+            )
+        else:
+            matches = int(actual) == int(expected_value)
+        if not matches:
+            mismatched.append(
+                f"{key}={actual!r} (expected {expected_value!r})"
+            )
+    if mismatched:
+        raise ValueError(
+            f"feature-screen训练协议不一致: {artifact_path}: "
+            + "; ".join(mismatched)
+        )
+
+
 def load_f4_training_reference(farm_ids):
     """只读取R4训练产物；不创建F4模型、权重或副本。"""
     path = _r4_training_summary_path()
@@ -1060,6 +1677,139 @@ def load_f4_training_reference(farm_ids):
     return source
 
 
+def load_reused_f0_f7_training_results(variant_ids, farm_ids):
+    """从既有40行F0--F7汇总只读复用结果，不创建或改写旧模型产物。"""
+    requested_variants = tuple(dict.fromkeys(variant_ids))
+    invalid = sorted(set(requested_variants) - set(REUSED_TRAINING_VARIANTS))
+    if invalid:
+        raise ValueError(f"只读复用函数收到非F0--F7变体: {invalid}")
+    if not requested_variants:
+        return pd.DataFrame()
+    if not os.path.exists(LEGACY_TRAINING_SUMMARY):
+        raise FileNotFoundError(
+            f"缺少F0--F7既有40行训练汇总: {LEGACY_TRAINING_SUMMARY}"
+        )
+    source_all = pd.read_csv(LEGACY_TRAINING_SUMMARY)
+    required_columns = {
+        "variant_id",
+        "farm_id",
+        "total_params",
+        "feature_count",
+        "feature_names",
+        "artifact_path",
+        "model_path",
+    }
+    missing_columns = sorted(required_columns - set(source_all.columns))
+    if missing_columns:
+        raise KeyError(f"F0--F7旧汇总缺少字段: {missing_columns}")
+    source_all["variant_id"] = source_all["variant_id"].astype(str)
+    source_all["farm_id"] = source_all["farm_id"].astype(str)
+    if len(source_all) != 40:
+        raise ValueError(f"F0--F7旧汇总应为40行，实际{len(source_all)}行")
+    if set(source_all["variant_id"]) != set(REUSED_TRAINING_VARIANTS):
+        raise ValueError("F0--F7旧汇总的变体集合不完整")
+    if source_all.duplicated(["variant_id", "farm_id"]).any():
+        raise ValueError("F0--F7旧汇总存在重复variant/farm键")
+    counts = source_all.groupby("variant_id")["farm_id"].nunique()
+    if not (counts == 5).all():
+        raise ValueError(f"F0--F7旧汇总并非每个变体5场站: {counts.to_dict()}")
+
+    requested_farms = tuple(dict.fromkeys(str(value) for value in farm_ids))
+    source = source_all[
+        source_all["variant_id"].isin(requested_variants)
+        & source_all["farm_id"].isin(requested_farms)
+    ].copy()
+    expected_rows = len(requested_variants) * len(requested_farms)
+    if len(source) != expected_rows:
+        raise ValueError(
+            f"F0--F7旧汇总未覆盖请求矩阵: {len(source)} != {expected_rows}"
+        )
+
+    for row_index, row in source.iterrows():
+        variant_id = row["variant_id"]
+        expected_names = selected_feature_names(variant_id)
+        try:
+            stored_names = tuple(json.loads(row["feature_names"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"旧汇总{variant_id}/{row['farm_id']} feature_names非法"
+            ) from exc
+        if stored_names != expected_names:
+            raise ValueError(
+                f"旧汇总{variant_id}/{row['farm_id']}特征子集已漂移"
+            )
+        if int(row["feature_count"]) != len(expected_names):
+            raise ValueError(
+                f"旧汇总{variant_id}/{row['farm_id']}特征数不一致"
+            )
+        if int(row["total_params"]) != EXPECTED_PARAMETER_COUNTS[variant_id]:
+            raise ValueError(
+                f"旧汇总{variant_id}/{row['farm_id']}参数量不一致"
+            )
+        artifact_path = regime_train._resolve_existing_path(row["artifact_path"])
+        model_path = regime_train._resolve_existing_path(row["model_path"])
+        if artifact_path is None or model_path is None:
+            raise FileNotFoundError(
+                f"旧汇总{variant_id}/{row['farm_id']} artifact或model不存在"
+            )
+        artifact = joblib.load(artifact_path)
+        if variant_id == "f4":
+            validate_r4_reference_artifact(artifact, artifact_path)
+        else:
+            if artifact.get("architecture_version") != ARCHITECTURE_VERSION:
+                raise ValueError(f"旧artifact架构版本不匹配: {artifact_path}")
+            if artifact.get("variant_id") != variant_id:
+                raise ValueError(f"旧artifact变体不匹配: {artifact_path}")
+            if tuple(
+                artifact.get("selected_regime_feature_names", ())
+            ) != expected_names:
+                raise ValueError(f"旧artifact特征子集不匹配: {artifact_path}")
+            if int(artifact.get("total_params", -1)) != EXPECTED_PARAMETER_COUNTS[
+                variant_id
+            ]:
+                raise ValueError(f"旧artifact参数量不匹配: {artifact_path}")
+        validate_feature_training_protocol(artifact, artifact_path)
+        stored_model_hash = row.get("model_sha256")
+        actual_model_hash = _file_sha256(model_path)
+        if (
+            isinstance(stored_model_hash, str)
+            and stored_model_hash
+            and stored_model_hash != actual_model_hash
+        ):
+            raise ValueError(
+                f"旧模型SHA256不匹配: {variant_id}/{row['farm_id']}"
+            )
+        source.at[row_index, "resolved_reused_artifact_path"] = os.path.abspath(
+            artifact_path
+        )
+        source.at[row_index, "resolved_reused_model_path"] = os.path.abspath(
+            model_path
+        )
+        source.at[row_index, "resolved_reused_model_sha256"] = actual_model_hash
+
+    source["current_run_action"] = "reuse_existing_f0_f7_result"
+    source["reused_existing_training_result"] = True
+    source["reused_training_summary_path"] = os.path.abspath(
+        LEGACY_TRAINING_SUMMARY
+    )
+    source["reused_training_summary_sha256"] = _file_sha256(
+        LEGACY_TRAINING_SUMMARY
+    )
+    source["supplement_protocol_version"] = SUPPLEMENT_PROTOCOL_VERSION
+    source["experiment_role"] = source["variant_id"].map(
+        {key: value["experiment_role"] for key, value in VARIANT_SPECS.items()}
+    )
+    source["selection_eligible"] = source["variant_id"].map(
+        {key: bool(value["selection_eligible"]) for key, value in VARIANT_SPECS.items()}
+    )
+    source["freeze_candidates"] = False
+    source["backbone_frozen"] = False
+    source["expected_trainable_params"] = source["variant_id"].map(
+        EXPECTED_TRAINABLE_PARAMETER_COUNTS
+    )
+    return source
+
+
 def _write_manifest():
     os.makedirs(RESULT_ROOT, exist_ok=True)
     rows = []
@@ -1082,10 +1832,24 @@ def _write_manifest():
                 "has_direction_group": "D" in spec["groups"],
                 "has_consistency_group": "C" in spec["groups"],
                 "requires_training": spec["requires_training"],
-                "result_source": (
-                    "stage2_feature_screen_trained"
+                "current_run_action": (
+                    "reuse_existing_f0_f7_result"
+                    if variant_id in REUSED_TRAINING_VARIANTS
+                    else "train_new_supplement_variant"
+                ),
+                "reuse_existing": bool(spec["reuse_existing"]),
+                "experiment_role": spec["experiment_role"],
+                "selection_eligible": bool(spec["selection_eligible"]),
+                "freeze_candidates": bool(spec["freeze_candidates"]),
+                "candidate_supervision_loss_weight": (
+                    candidate_loss_weight_for_variant(variant_id)
                     if spec["requires_training"]
-                    else "direct_reference_existing_r4"
+                    else CANDIDATE_LOSS_WEIGHT
+                ),
+                "result_source": (
+                    "reuse_existing_feature_screen_summary"
+                    if variant_id in REUSED_TRAINING_VARIANTS
+                    else "stage2_feature_screen_supplement_trained"
                 ),
                 "source_variant": (
                     "b2_persistence_residual"
@@ -1096,9 +1860,15 @@ def _write_manifest():
                 "random_seed": RANDOM_SEED,
                 "default_batch_size": BATCH_SIZE,
                 "expected_parameter_count": EXPECTED_PARAMETER_COUNTS[variant_id],
+                "expected_trainable_parameter_count": (
+                    EXPECTED_TRAINABLE_PARAMETER_COUNTS[variant_id]
+                ),
+                "supplement_protocol_version": SUPPLEMENT_PROTOCOL_VERSION,
                 "selection_split": "test",
                 "selection_metric": "macro_mean_capacity_normalized_rmse",
-                "test_used_for_feature_selection": True,
+                "test_used_for_feature_selection": bool(
+                    spec["selection_eligible"]
+                ),
                 "test_is_final_blind_evaluation": False,
                 "source_test_reuse_status": "legacy_seen",
                 "training_code_path": os.path.abspath(__file__),
@@ -1110,10 +1880,9 @@ def _write_manifest():
                 ),
             }
         )
-    pd.DataFrame(rows).to_csv(
-        os.path.join(RESULT_ROOT, "feature_screening_experiment_manifest.csv"),
-        index=False,
-        encoding="utf-8-sig",
+    _atomic_to_csv(
+        pd.DataFrame(rows),
+        os.path.join(RESULT_ROOT, EXTENDED_MANIFEST_NAME),
     )
 
 
@@ -1129,6 +1898,13 @@ def _validation_comparison(metrics_df, variants):
                 "variant_id": variant_id,
                 "feature_groups": "+".join(VARIANT_SPECS[variant_id]["groups"]),
                 "feature_count": len(selected_feature_names(variant_id)),
+                "experiment_role": VARIANT_SPECS[variant_id]["experiment_role"],
+                "selection_eligible": bool(
+                    VARIANT_SPECS[variant_id]["selection_eligible"]
+                ),
+                "freeze_candidates": bool(
+                    VARIANT_SPECS[variant_id]["freeze_candidates"]
+                ),
                 "farm_count": int(frame["farm_id"].astype(str).nunique()),
                 "parameter_count_max": (
                     int(params.max()) if params.notna().any() else np.nan
@@ -1152,26 +1928,41 @@ def _partial_tag(variants, farm_ids):
 def main():
     _validate_configuration()
     configure_reproducibility()
-    _write_manifest()
     variants = get_requested_variants()
+    if any(item in NEW_TRAINING_VARIANTS for item in variants):
+        # 新模型可能覆盖正式bundle成员；训练开始前撤销旧完成标志，只有全部
+        # 15个新增模型及汇总再次验收后才重新发布。
+        _clear_training_completion_marker()
+        _clear_downstream_prediction_completion_marker()
+    _write_manifest()
     train_files = discover_train_files(DATA_DIR)
     if not train_files:
         raise FileNotFoundError(f"未在 {DATA_DIR} 找到请求的训练文件")
     farm_ids = [regime_train.get_farm_id(path) for path in train_files]
-    trainable = [variant_id for variant_id in variants if variant_id in TRAINABLE_VARIANTS]
+    reused = [
+        variant_id for variant_id in variants if variant_id in REUSED_TRAINING_VARIANTS
+    ]
+    trainable = [
+        variant_id for variant_id in variants if variant_id in NEW_TRAINING_VARIANTS
+    ]
     print(f"固定随机种子: {RANDOM_SEED}；batch_size={BATCH_SIZE}")
-    print(f"场站数: {len(train_files)}；F矩阵: {variants}")
+    print(f"场站数: {len(train_files)}；F/FP矩阵: {variants}")
+    print(f"只读复用既有训练结果: {reused}")
     print(f"实际新增训练: {trainable}")
-    if "f4" in variants:
-        print("F4直接引用既有R4模型/权重/结果，不重复训练或复制")
+    if reused:
+        print(
+            "F0--F7直接读取既有40行summary；不重新训练、复制或修改旧模型产物"
+        )
 
     results = []
-    if "f4" in variants:
-        results.extend(load_f4_training_reference(farm_ids).to_dict("records"))
+    if reused:
+        results.extend(
+            load_reused_f0_f7_training_results(reused, farm_ids).to_dict("records")
+        )
 
     progress_path = os.path.join(
         RESULT_ROOT,
-        f"feature_screening_training_progress_{_partial_tag(variants, farm_ids)}.csv",
+        f"{EXTENDED_PROGRESS_PREFIX}_{_partial_tag(variants, farm_ids)}.csv",
     )
     for train_file in train_files:
         if not trainable:
@@ -1187,31 +1978,45 @@ def main():
 
     metrics_df = pd.DataFrame(results)
     all_train_files = sorted(glob.glob(os.path.join(DATA_DIR, regime_train.TRAIN_FILE_PATTERN)))
-    expected_rows = len(VARIANT_SPECS) * len(all_train_files)
+    all_train_farm_ids = {
+        str(regime_train.get_farm_id(path)) for path in all_train_files
+    }
+    expected_farm_set = set(expected_training_farm_ids())
+    expected_rows = len(VARIANT_SPECS) * len(expected_farm_set)
     is_complete = (
         set(variants) == set(VARIANT_SPECS)
         and not os.getenv("WIND_FEATURE_SCREEN_FARMS")
+        and all_train_farm_ids == expected_farm_set
         and len(metrics_df) == expected_rows
         and not metrics_df.duplicated(["variant_id", "farm_id"]).any()
     )
-    suffix = "" if is_complete else f"_partial_{_partial_tag(variants, farm_ids)}"
-    metrics_path = os.path.join(
-        RESULT_ROOT,
-        f"feature_screening_training_metrics{suffix}.csv",
-    )
-    metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    partial_tag = _partial_tag(variants, farm_ids)
+    if is_complete:
+        metrics_filename = EXTENDED_TRAINING_SUMMARY_NAME
+        validation_filename = EXTENDED_VALIDATION_NAME
+    else:
+        metrics_stem, _ = os.path.splitext(EXTENDED_TRAINING_SUMMARY_NAME)
+        validation_stem, _ = os.path.splitext(EXTENDED_VALIDATION_NAME)
+        metrics_filename = f"{metrics_stem}_partial_{partial_tag}.csv"
+        validation_filename = f"{validation_stem}_partial_{partial_tag}.csv"
+    metrics_path = os.path.join(RESULT_ROOT, metrics_filename)
+    _atomic_to_csv(metrics_df, metrics_path)
     comparison = _validation_comparison(metrics_df, variants)
-    comparison.to_csv(
-        os.path.join(
-            RESULT_ROOT,
-            f"feature_screening_validation_descriptive{suffix}.csv",
-        ),
-        index=False,
-        encoding="utf-8-sig",
+    validation_path = os.path.join(RESULT_ROOT, validation_filename)
+    _atomic_to_csv(
+        comparison,
+        validation_path,
     )
-    print(f"F0--F7训练/引用汇总已保存: {metrics_path}")
+    print(f"F0--F8/FP训练与只读引用汇总已保存: {metrics_path}")
     if not is_complete:
         print("当前是子集运行；文件名带partial标签，不会覆盖完整F矩阵汇总")
+    else:
+        completion_path = _publish_training_completion_marker(
+            metrics_df,
+            metrics_path,
+            validation_path,
+        )
+        print(f"F8/FP训练bundle完成标志: {completion_path}")
     print("最终模型不在此处按验证集选择；请运行专用预测脚本按测试集宏平均NRMSE筛选")
 
 
