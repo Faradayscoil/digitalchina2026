@@ -1002,12 +1002,26 @@ def predict_one_feature_variant_farm(variant_id, test_file):
         history_len,
         forecast_len,
     )
-    fused = regime_predict._inverse_candidate(artifact, outputs["forecast"], capacity)
-    persistence = regime_predict._inverse_candidate(
-        artifact, outputs["persistence_candidate"], capacity
+    # Use one representation for metrics, CSV and NPZ.  TensorFlow inference is
+    # float32; promoting once here preserves those values exactly while avoiding
+    # a shorter float32 CSV representation than the archive's float64 values.
+    fused = np.asarray(
+        regime_predict._inverse_candidate(
+            artifact, outputs["forecast"], capacity
+        ),
+        dtype=np.float64,
     )
-    corrected = regime_predict._inverse_candidate(
-        artifact, outputs["corrected_candidate"], capacity
+    persistence = np.asarray(
+        regime_predict._inverse_candidate(
+            artifact, outputs["persistence_candidate"], capacity
+        ),
+        dtype=np.float64,
+    )
+    corrected = np.asarray(
+        regime_predict._inverse_candidate(
+            artifact, outputs["corrected_candidate"], capacity
+        ),
+        dtype=np.float64,
     )
     gate = outputs["gate"]
     last_power = persistence[:, 0]
@@ -1651,6 +1665,50 @@ def _load_prediction_truth(path):
         raise KeyError(f"预测文件缺少真值对齐列{sorted(missing)}: {resolved}")
     order = ["sample_id", "horizon_step"]
     return frame.sort_values(order).reset_index(drop=True)
+
+
+def _csv_float_matches_archive(csv_values, archive_values, atol=1e-7):
+    """Compare a numeric CSV column with its source archive safely.
+
+    Older outputs wrote the float32 prediction directly to CSV, while the NPZ
+    archive promoted the same values to float64.  Pandas writes a short decimal
+    that round-trips losslessly to float32, but a comparison after ``read_csv``
+    happens in float64 and can therefore exceed a small absolute tolerance.
+
+    The compatibility path is deliberately strict: it is used only when the
+    archive consists of exact float32 values promoted to float64, and the CSV
+    round-trips to the identical float32 bits.  A genuine prediction mismatch is
+    therefore not hidden behind a wider physical-unit tolerance.
+    """
+    csv_array = pd.to_numeric(csv_values, errors="coerce").to_numpy(
+        dtype=np.float64
+    )
+    archive_array = np.asarray(archive_values, dtype=np.float64).reshape(-1)
+    if csv_array.shape != archive_array.shape:
+        return False
+    if np.allclose(
+        csv_array,
+        archive_array,
+        rtol=0.0,
+        atol=atol,
+        equal_nan=True,
+    ):
+        return True
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        archive_float32 = archive_array.astype(np.float32)
+        archive_roundtrip = archive_float32.astype(np.float64)
+        csv_float32 = csv_array.astype(np.float32)
+    archive_is_promoted_float32 = np.array_equal(
+        archive_array,
+        archive_roundtrip,
+        equal_nan=True,
+    )
+    return archive_is_promoted_float32 and np.array_equal(
+        csv_float32,
+        archive_float32,
+        equal_nan=True,
+    )
 
 
 def validate_truth_alignment(summary, expected_variants=SELECTION_VARIANTS):
@@ -2684,34 +2742,30 @@ def _validate_archive_identity_and_truth(
         raise KeyError(f"{farm_id}预测CSV缺少pred_power")
     expected_sample = np.repeat(sample_id, len(horizon_step))
     expected_horizon = np.tile(horizon_step, len(sample_id))
-    if (
-        len(prediction) != shape[0] * shape[1]
-        or not np.array_equal(
-            prediction["sample_id"].to_numpy(dtype=np.int64),
-            expected_sample,
-        )
-        or not np.array_equal(
-            prediction["horizon_step"].to_numpy(dtype=np.int64),
-            expected_horizon,
-        )
-        or not np.allclose(
-            pd.to_numeric(prediction["actual_power"], errors="coerce"),
-            np.asarray(archive["y_true"], dtype=float).reshape(-1),
-            rtol=0.0,
-            atol=1e-7,
-            equal_nan=True,
-        )
-        or not np.allclose(
-            pd.to_numeric(prediction["pred_power"], errors="coerce"),
-            np.asarray(archive["fused"], dtype=float).reshape(-1),
-            rtol=0.0,
-            atol=1e-7,
-            equal_nan=True,
-        )
-    ):
+    expected_length = shape[0] * shape[1]
+    if len(prediction) != expected_length:
         raise ValueError(
-            f"{farm_id}候选archive与对应预测CSV窗口/真值/fused不一致"
+            f"{farm_id}候选archive与预测CSV行数不一致: "
+            f"{expected_length} != {len(prediction)}"
         )
+    if not np.array_equal(
+        prediction["sample_id"].to_numpy(dtype=np.int64), expected_sample
+    ) or not np.array_equal(
+        prediction["horizon_step"].to_numpy(dtype=np.int64), expected_horizon
+    ):
+        raise ValueError(f"{farm_id}候选archive与预测CSV窗口键不一致")
+    if not np.allclose(
+        pd.to_numeric(prediction["actual_power"], errors="coerce"),
+        np.asarray(archive["y_true"], dtype=float).reshape(-1),
+        rtol=0.0,
+        atol=1e-7,
+        equal_nan=True,
+    ):
+        raise ValueError(f"{farm_id}候选archive与预测CSV真实值不一致")
+    if not _csv_float_matches_archive(
+        prediction["pred_power"], archive["fused"]
+    ):
+        raise ValueError(f"{farm_id}候选archive与预测CSV fused预测不一致")
     if "forecast_origin_time" in prediction and not np.array_equal(
         prediction["forecast_origin_time"].astype(str).to_numpy(),
         np.repeat(origins, len(horizon_step)),
