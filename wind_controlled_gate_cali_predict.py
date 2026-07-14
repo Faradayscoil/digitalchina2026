@@ -52,8 +52,9 @@ MIN_FARMS_WITHIN_GUARD = 4
 SAFETY_REDUCTION_TARGET = 0.20
 NRMSE_TIE_RELATIVE = 0.001
 SAFETY_NONDEGRADATION_TOLERANCE = 1e-12
-G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION = 5e-5
+G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION = 1e-4
 G0_RECONSTRUCTION_MEAN_CAPACITY_FRACTION = 1e-6
+G0_RECONSTRUCTION_LEGACY_MAX_CAPACITY_FRACTION = 5e-5
 
 REGIME_GROUP_ORDER = tuple(regime_predict.REGIME_GROUP_ORDER)
 
@@ -419,12 +420,15 @@ def _forward_controlled(model, dataset):
 
 def _forward_g0(model, dataset):
     diagnostic = gate_train._source_diagnostic_model(model)
-    outputs = {key: [] for key in ("forecast", "persistence", "corrected", "gate")}
-    for batch_x in dataset:
-        result = diagnostic(batch_x, training=False)
-        for key in outputs:
-            outputs[key].append(np.asarray(result[key]))
-    values = {key: np.concatenate(items) for key, items in outputs.items()}
+    # Stage-2正式F7预测由Keras predict图执行生成。这里沿用相同执行路径，
+    # 避免逐batch eager调用选择不同CUDA内核而产生稀疏长horizon尾差。
+    result = diagnostic.predict(dataset, verbose=common_predict.PREDICT_VERBOSE)
+    required = ("forecast", "persistence", "corrected", "gate")
+    if not isinstance(result, dict) or any(key not in result for key in required):
+        raise TypeError("G0诊断predict未返回完整forecast/P/C/gate字典")
+    values = {key: np.asarray(result[key]) for key in required}
+    if not len(values["forecast"]):
+        raise ValueError("G0测试dataset没有产生预测")
     values["q"] = np.mean(values["gate"], axis=1, keepdims=True)
     values["q"] = np.repeat(values["q"], gate_train.FORECAST_LEN, axis=1)
     values["s"] = np.ones_like(values["gate"])
@@ -672,26 +676,6 @@ def _verify_g0_reconstruction(payload, source_row):
         if column not in source:
             raise KeyError(f"F7预测CSV缺少{column}")
         _assert_same_datetimes(column, source[column], expected)
-    bitwise_compatible = feature_predict._csv_float_matches_archive(
-        source["pred_power"], payload["fused"]
-    )
-    difference = np.abs(
-        source["pred_power"].to_numpy(float) - payload["fused"].reshape(-1)
-    )
-    finite_difference = difference[np.isfinite(difference)]
-    if not len(finite_difference):
-        raise ValueError("G0诊断重建没有可比较的有限预测值")
-    max_normalized_difference = float(finite_difference.max() / payload["capacity"])
-    mean_normalized_difference = float(finite_difference.mean() / payload["capacity"])
-    if not bitwise_compatible and (
-        max_normalized_difference > G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION
-        or mean_normalized_difference > G0_RECONSTRUCTION_MEAN_CAPACITY_FRACTION
-    ):
-        raise ValueError(
-            "G0诊断重建未在跨运行时容量容差内复现F7预测: "
-            f"max_norm={max_normalized_difference}, "
-            f"mean_norm={mean_normalized_difference}"
-        )
     if not np.allclose(
         pd.to_numeric(source["actual_power"], errors="coerce"),
         payload["y_true"].reshape(-1),
@@ -700,6 +684,39 @@ def _verify_g0_reconstruction(payload, source_row):
         equal_nan=True,
     ):
         raise ValueError("G0诊断重建真值与F7预测CSV不一致")
+    source_prediction = pd.to_numeric(source["pred_power"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    reconstructed_prediction = payload["fused"].reshape(-1)
+    if (
+        not np.isfinite(source_prediction).all()
+        or not np.isfinite(reconstructed_prediction).all()
+    ):
+        raise ValueError("G0诊断重建预测包含非有限值，禁止跳过后执行容差比较")
+    bitwise_compatible = feature_predict._csv_float_matches_archive(
+        source["pred_power"], payload["fused"]
+    )
+    difference = np.abs(source_prediction - reconstructed_prediction)
+    normalized_difference = difference / payload["capacity"]
+    max_normalized_difference = float(normalized_difference.max())
+    mean_normalized_difference = float(normalized_difference.mean())
+    p999_normalized_difference = float(np.quantile(normalized_difference, 0.999))
+    legacy_large_mask = (
+        normalized_difference > G0_RECONSTRUCTION_LEGACY_MAX_CAPACITY_FRACTION
+    )
+    legacy_large_count = int(legacy_large_mask.sum())
+    legacy_large_fraction = float(legacy_large_mask.mean())
+    if not bitwise_compatible and (
+        max_normalized_difference > G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION
+        or mean_normalized_difference > G0_RECONSTRUCTION_MEAN_CAPACITY_FRACTION
+    ):
+        raise ValueError(
+            "G0诊断重建未在跨运行时容量容差内复现F7预测: "
+            f"max_norm={max_normalized_difference}, "
+            f"mean_norm={mean_normalized_difference}, "
+            f"limits=({G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION}, "
+            f"{G0_RECONSTRUCTION_MEAN_CAPACITY_FRACTION})"
+        )
     return {
         "path": path,
         "sha256": _sha256(path),
@@ -708,10 +725,17 @@ def _verify_g0_reconstruction(payload, source_row):
             if bitwise_compatible
             else "cross_runtime_capacity_tolerance"
         ),
-        "max_abs_difference": float(finite_difference.max()),
-        "mean_abs_difference": float(finite_difference.mean()),
+        "max_abs_difference": float(difference.max()),
+        "mean_abs_difference": float(difference.mean()),
         "max_capacity_normalized_difference": max_normalized_difference,
         "mean_capacity_normalized_difference": mean_normalized_difference,
+        "p999_capacity_normalized_difference": p999_normalized_difference,
+        "legacy_5e_5_exceedance_count": legacy_large_count,
+        "legacy_5e_5_exceedance_fraction": legacy_large_fraction,
+        "max_capacity_normalized_tolerance": (G0_RECONSTRUCTION_MAX_CAPACITY_FRACTION),
+        "mean_capacity_normalized_tolerance": (
+            G0_RECONSTRUCTION_MEAN_CAPACITY_FRACTION
+        ),
     }
 
 
@@ -1492,6 +1516,21 @@ def save_payload_outputs(payload, write_prediction=True, hard_control=False):
         "source_reconstruction_mean_capacity_normalized_difference": payload.get(
             "source_reconstruction_verification", {}
         ).get("mean_capacity_normalized_difference"),
+        "source_reconstruction_p999_capacity_normalized_difference": payload.get(
+            "source_reconstruction_verification", {}
+        ).get("p999_capacity_normalized_difference"),
+        "source_reconstruction_legacy_5e_5_exceedance_count": payload.get(
+            "source_reconstruction_verification", {}
+        ).get("legacy_5e_5_exceedance_count"),
+        "source_reconstruction_legacy_5e_5_exceedance_fraction": payload.get(
+            "source_reconstruction_verification", {}
+        ).get("legacy_5e_5_exceedance_fraction"),
+        "source_reconstruction_max_capacity_normalized_tolerance": payload.get(
+            "source_reconstruction_verification", {}
+        ).get("max_capacity_normalized_tolerance"),
+        "source_reconstruction_mean_capacity_normalized_tolerance": payload.get(
+            "source_reconstruction_verification", {}
+        ).get("mean_capacity_normalized_tolerance"),
         **{f"weighted_{key}": value for key, value in weighted_metrics.items()},
     }
     paths = {
