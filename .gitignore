@@ -17,6 +17,7 @@
 !/wind_controlled_gate_cali_predict.py
 !/wind_time_freq_model_train.py
 !/wind_time_freq_model_predict.py
+!/wind_time_freq_model_visualize.py
 
 # Keep the current FeTS-PatchTST model handoff document on this branch.
 !/docs/
