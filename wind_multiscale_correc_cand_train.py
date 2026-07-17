@@ -1355,6 +1355,15 @@ def _validate_marker(path, expected_protocol, critical_keys):
 
 
 def validate_required_source_bundles():
+    """Validate only the Stage-4B dependencies consumed during training.
+
+    Stage-5A training rebuilds the frozen F7 candidate from the Stage-4B
+    training bundle.  It does not read Stage-4B test predictions.  A formal
+    Stage-4B training rerun deliberately invalidates/removes its downstream
+    prediction marker, so requiring that marker here would incorrectly block
+    otherwise valid Stage-5A training.  The Stage-5A prediction entry point
+    remains responsible for validating the rebuilt Stage-4B test bundle.
+    """
     training_path = os.path.join(stage4b_train.RESULT_ROOT, stage4b_train.TRAINING_MARKER_NAME)
     prediction_path = os.path.join(stage4b_train.RESULT_ROOT, stage4b_train.PREDICTION_MARKER_RELATIVE_PATH)
     _validate_marker(
@@ -1362,20 +1371,48 @@ def validate_required_source_bundles():
         stage4b_train.PROTOCOL_VERSION,
         ("training_summary", "experiment_manifest", "source_stage4_training_marker"),
     )
+    source_identity = {
+        "stage4b_training_marker_path": os.path.abspath(training_path),
+        "stage4b_training_marker_sha256": _sha256(training_path),
+        "stage4b_prediction_marker_expected_path": os.path.abspath(prediction_path),
+        "stage4b_prediction_marker_path": None,
+        "stage4b_prediction_marker_sha256": None,
+        "stage4b_prediction_bundle_status_at_training": (
+            "missing_not_required_for_training_rebuild_before_prediction"
+        ),
+        "stage4b_prediction_bundle_required_for_training": False,
+        "stage4b_prediction_bundle_required_for_test_selection": True,
+    }
+    if not os.path.isfile(prediction_path):
+        print(
+            "提示: Stage-4B预测complete marker当前不存在；这不影响Stage-5A训练。"
+            "正式运行Stage-5A预测前，请先重新运行 "
+            "wind_time_freq_model_stage4b_predict.py 发布与当前训练marker匹配的"
+            "预测bundle。"
+        )
+        return source_identity
+
     prediction = _validate_marker(
         prediction_path,
         stage4b_train.PROTOCOL_VERSION,
         ("training_marker", "formal.summary", "formal.candidate", "formal.final_selection"),
     )
     record = prediction["files"]["training_marker"]
-    if os.path.realpath(record["path"]) != os.path.realpath(training_path) or record["sha256"] != _sha256(training_path):
+    if (
+        os.path.realpath(record["path"]) != os.path.realpath(training_path)
+        or record["sha256"] != _sha256(training_path)
+    ):
         raise ValueError("Stage-4B预测marker没有锁定当前训练marker")
-    return {
-        "stage4b_training_marker_path": os.path.abspath(training_path),
-        "stage4b_training_marker_sha256": _sha256(training_path),
-        "stage4b_prediction_marker_path": os.path.abspath(prediction_path),
-        "stage4b_prediction_marker_sha256": _sha256(prediction_path),
-    }
+    source_identity.update(
+        {
+            "stage4b_prediction_marker_path": os.path.abspath(prediction_path),
+            "stage4b_prediction_marker_sha256": _sha256(prediction_path),
+            "stage4b_prediction_bundle_status_at_training": (
+                "validated_and_locked_to_current_training_marker"
+            ),
+        }
+    )
+    return source_identity
 
 
 def _validate_same_scale_initialization(summary):
@@ -1419,8 +1456,12 @@ def publish_training_marker(summary_path, manifest_path, summary, source_identit
         "experiment_manifest": _file_record(manifest_path),
         "training_code": _file_record(__file__),
         "source_stage4b_training_marker": _file_record(source_identity["stage4b_training_marker_path"]),
-        "source_stage4b_prediction_marker": _file_record(source_identity["stage4b_prediction_marker_path"]),
     }
+    prediction_marker_path = source_identity.get("stage4b_prediction_marker_path")
+    if prediction_marker_path:
+        files["source_stage4b_prediction_marker"] = _file_record(
+            prediction_marker_path
+        )
     for name, record in dependency_code_records().items():
         files[f"dependency.{name}"] = record
     for _, row in new_rows.iterrows():
@@ -1444,6 +1485,14 @@ def publish_training_marker(summary_path, manifest_path, summary, source_identit
         "new_model_count": int(len(new_rows)),
         "x0_reused_model_count": len(expected_farm_ids()),
         "x0_retraining_forbidden": True,
+        "stage4b_prediction_bundle_required_for_training": False,
+        "stage4b_prediction_bundle_required_for_test_selection": True,
+        "stage4b_prediction_bundle_status_at_training": source_identity[
+            "stage4b_prediction_bundle_status_at_training"
+        ],
+        "stage4b_prediction_marker_expected_path": source_identity[
+            "stage4b_prediction_marker_expected_path"
+        ],
         "source_f7_residual_context_g0_gate_frozen_verified": bool(
             (new_rows["persistence_probe_max_abs_drift"] == 0.0).all()
             and (new_rows["g0_gate_probe_max_abs_drift"] == 0.0).all()

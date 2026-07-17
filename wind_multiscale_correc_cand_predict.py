@@ -160,7 +160,12 @@ def _relabel_x0(frame: pd.DataFrame) -> pd.DataFrame:
 def validate_stage4b_x0_source():
     """Hash 校验 Stage-4B bundle，并构造只读 X0/F7 candidate 表。"""
     if not os.path.isfile(STAGE4B_MARKER):
-        raise FileNotFoundError(f"缺少Stage-4B complete marker: {STAGE4B_MARKER}")
+        raise FileNotFoundError(
+            f"缺少Stage-4B complete marker: {STAGE4B_MARKER}。"
+            "Stage-4B正式训练重跑会使旧预测bundle失效；请先运行 "
+            "python wind_time_freq_model_stage4b_predict.py，重新发布与当前"
+            "Stage-4B训练marker匹配的测试预测bundle。"
+        )
     marker = _read_json(STAGE4B_MARKER)
     if marker.get("status") != "complete":
         raise ValueError("Stage-4B source marker不是complete")
@@ -333,6 +338,33 @@ def validate_training_bundle(required_variants):
     for key, record in marker.get("files", {}).items():
         _validate_record(f"Stage-5A training files.{key}", record)
     return path, marker
+
+
+def validate_shared_stage4b_training_identity(stage4b_marker, training_marker):
+    """Require Stage-5A training and X0 test reference to share one Stage-4B run."""
+    if training_marker is None:
+        return True
+    stage4b_training = stage4b_marker.get("files", {}).get("training_marker")
+    stage5a_source = training_marker.get("files", {}).get(
+        "source_stage4b_training_marker"
+    )
+    if not isinstance(stage4b_training, dict) or not isinstance(stage5a_source, dict):
+        raise ValueError("训练/预测marker缺少Stage-4B training identity记录")
+    current_path = _validate_record(
+        "Stage-4B prediction files.training_marker", stage4b_training
+    )
+    source_path = _validate_record(
+        "Stage-5A training files.source_stage4b_training_marker", stage5a_source
+    )
+    if (
+        os.path.realpath(current_path) != os.path.realpath(source_path)
+        or stage4b_training.get("sha256") != stage5a_source.get("sha256")
+    ):
+        raise ValueError(
+            "Stage-5A模型与当前Stage-4B X0测试bundle不是同一训练来源；"
+            "请按顺序重新运行Stage-5A训练和预测。"
+        )
+    return True
 
 
 def _resolve_training_record(marker, variant: str, farm_id: str, kind: str) -> str:
@@ -1611,6 +1643,7 @@ def main(argv=None):
     training_marker_path, training_marker = validate_training_bundle(
         [variant for variant in variants if variant in NEW_VARIANTS]
     )
+    validate_shared_stage4b_training_identity(stage4b_marker, training_marker)
     source_test = {
         str(farm_id): record["path"]
         for farm_id, record in stage4b_marker["test_files"].items()
