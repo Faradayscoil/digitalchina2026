@@ -1,0 +1,32 @@
+# Ignore every root-level file and directory by default.
+/*
+
+# Keep Git rules and the source files used by this branch visible to Git.
+!/.gitignore
+!/wind_dl_model_predict.py
+!/wind_dl_model_train.py
+!/wind_dl_other_models_train.py
+!/wind_FeTS_PatchTST_train.py
+!/wind_FeTS_PatchTST_min_train.py
+!/wind_FeTS_PatchTST_min_predict.py
+!/wind_RegimeEncoder_PatchTST_train.py
+!/wind_RegimeEncoder_PatchTST_predict.py
+!/wind_RegimeEncoder_PatchTST_feature_screen_train.py
+!/wind_RegimeEncoder_PatchTST_feature_screen_predict.py
+!/wind_controlled_gate_cali_train.py
+!/wind_controlled_gate_cali_predict.py
+!/wind_time_freq_model_train.py
+!/wind_time_freq_model_predict.py
+!/wind_time_freq_model_visualize.py
+!/wind_time_freq_model_stage4b_train.py
+!/wind_time_freq_model_stage4b_predict.py
+!/wind_multiscale_correc_cand_train.py
+!/wind_multiscale_correc_cand_predict.py
+!/wind_multiscale_correc_cand_x1r_train.py
+!/wind_multiscale_correc_cand_x1r_predict.py
+
+# Keep the current FeTS-PatchTST model handoff document on this branch.
+!/docs/
+/docs/*
+!/docs/WIND_FETS_PATCHTST_MODEL_DEVELOPMENT_CONTEXT.md
+!/docs/WIND_FETS_PATCHTST_SCI_Q1_EXPERIMENT_ROADMAP_AND_RESULTS.md

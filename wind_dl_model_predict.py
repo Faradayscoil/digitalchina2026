@@ -10,21 +10,58 @@ import tensorflow as tf
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow import keras
 
+from wind_FeTS_PatchTST_train import (
+    ARCHITECTURE_VERSION as FETS_PATCHTST_ARCHITECTURE_VERSION,
+    BATCH_SIZE as FETS_PATCHTST_BATCH_SIZE,
+    PREPROCESS_DIR as FETS_PATCHTST_PREPROCESS_DIR,
+    SAVED_MODEL_DIR as FETS_PATCHTST_SAVED_MODEL_DIR,
+    WEIGHTS_DIR as FETS_PATCHTST_WEIGHTS_DIR,
+    EXPERT_NAMES as FETS_PATCHTST_EXPERT_NAMES,
+    AdaptiveFeatureExtraction,
+    ChannelIdentityEmbedding,
+    DualScaleFeedForward,
+    ExpertConvexFusion,
+    FeTSChannelPatchTranspose,
+    FeTSFeatureBlock,
+    FeTSPatchExtract,
+    FourierPolynomialMask,
+    HorizonRegimeRouter,
+    HorizonScaledResidualAdd,
+    LayerScaleFeTSFeatureBlock,
+    PatchCrossChannelAttention,
+    PersistenceForecast,
+    SelectChannel,
+    TakeLastToken,
+    TargetWeatherCrossAttention,
+    build_fets_patchtst_model,
+)
 from wind_dl_model_train import (
     BATCH_SIZE as PATCHTST_BATCH_SIZE,
+    D_FF as PATCHTST_D_FF,
+    D_MODEL as PATCHTST_D_MODEL,
     DATA_DIR,
+    DROPOUT as PATCHTST_DROPOUT,
     FORECAST_LEN,
+    HEAD_DROPOUT as PATCHTST_HEAD_DROPOUT,
     HISTORY_LEN,
-    MODEL_DIR as PATCHTST_MODEL_DIR,
-    SAVED_MODEL_DIR,
+    MODEL_DIR as PATCHTST_RESULT_DIR,
+    N_HEADS as PATCHTST_N_HEADS,
+    N_LAYERS as PATCHTST_N_LAYERS,
+    PATCH_LEN as PATCHTST_PATCH_LEN,
+    PATCH_STRIDE as PATCHTST_PATCH_STRIDE,
+    PREPROCESS_DIR as PATCHTST_PREPROCESS_DIR,
+    SAVED_MODEL_DIR as PATCHTST_SAVED_MODEL_DIR,
     TARGET_COL,
+    WEIGHTS_DIR as PATCHTST_WEIGHTS_DIR,
     LearnablePositionEmbedding,
     MergeChannels,
     PatchExtract,
     RestoreChannels,
     TakeChannel,
     build_patchtst_model,
+    compute_patch_num as compute_patchtst_patch_num,
     load_and_preprocess,
+    transformer_encoder as patchtst_transformer_encoder,
 )
 from wind_dl_other_models_train import (
     BASE_RESULT_DIR,
@@ -46,16 +83,6 @@ from wind_dl_other_models_train import (
     seed,
     set_global_seed,
 )
-from wind_dl_tuned_patchtst_train import (
-    TUNED_MODEL_NAME,
-    SAVED_MODEL_DIR as TUNED_SAVED_MODEL_DIR,
-    WEIGHTS_DIR as TUNED_WEIGHTS_DIR,
-    RepeatLastTarget,
-    TunedPatchTSTLoss,
-    actual_mae,
-    actual_rmse,
-    build_tuned_patchtst_model,
-)
 
 warnings.filterwarnings('ignore')
 
@@ -63,11 +90,238 @@ warnings.filterwarnings('ignore')
 TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
-ALL_MODEL_NAMES = [PATCHTST_MODEL_NAME, TUNED_MODEL_NAME] + OTHER_MODEL_NAMES
+FETS_PATCHTST_MODEL_NAME = 'fets_patchtst'
+PATCHTST_LEGACY_ROUND2_DIR = os.path.join(PATCHTST_RESULT_DIR, '第2轮训练结果')
+ALL_MODEL_NAMES = [
+    PATCHTST_MODEL_NAME,
+    FETS_PATCHTST_MODEL_NAME,
+] + OTHER_MODEL_NAMES
 OUTPUT_SUBDIR = 'testdata_predict_output'
-PRED_BATCH_SIZE = max(256, PATCHTST_BATCH_SIZE, OTHER_BATCH_SIZE)
+PRED_BATCH_SIZE = max(
+    256,
+    PATCHTST_BATCH_SIZE,
+    FETS_PATCHTST_BATCH_SIZE,
+    OTHER_BATCH_SIZE,
+)
 EXP_WEIGHT_HALFLIFE_STEPS = 4.0
 PREDICT_VERBOSE = int(os.getenv('WIND_DL_PREDICT_VERBOSE', '1'))
+
+
+@keras.utils.register_keras_serializable(package='WindPatchTST')
+class RepeatLastTarget(keras.layers.Layer):
+    def __init__(self, target_channel_index, forecast_len=FORECAST_LEN, **kwargs):
+        super().__init__(**kwargs)
+        self.target_channel_index = int(target_channel_index)
+        self.forecast_len = int(forecast_len)
+
+    def call(self, inputs):
+        last_value = inputs[
+            :,
+            -1,
+            self.target_channel_index:self.target_channel_index + 1,
+        ]
+        return tf.repeat(last_value, repeats=self.forecast_len, axis=1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], self.forecast_len
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'target_channel_index': self.target_channel_index,
+            'forecast_len': self.forecast_len,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package='WindPatchTST')
+class HorizonGatedForecast(keras.layers.Layer):
+    def __init__(
+        self,
+        forecast_len=FORECAST_LEN,
+        init_near=2.0,
+        init_far=-2.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.forecast_len = int(forecast_len)
+        self.init_near = float(init_near)
+        self.init_far = float(init_far)
+
+    def build(self, input_shape):
+        init_values = np.linspace(
+            self.init_near,
+            self.init_far,
+            self.forecast_len,
+            dtype=np.float32,
+        )
+        self.gate_logits = self.add_weight(
+            name='horizon_gate_logits',
+            shape=(self.forecast_len,),
+            initializer=keras.initializers.Constant(init_values),
+            trainable=True,
+        )
+
+    def call(self, inputs):
+        baseline, direct_forecast, residual = inputs
+        gate = tf.sigmoid(
+            tf.cast(self.gate_logits, baseline.dtype),
+        )[tf.newaxis, :]
+        return gate * baseline + (1.0 - gate) * direct_forecast + residual
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0][0], self.forecast_len
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'forecast_len': self.forecast_len,
+            'init_near': self.init_near,
+            'init_far': self.init_far,
+        })
+        return config
+
+
+def build_legacy_patchtst_round2_model(input_dim, target_channel_index, artifact):
+    """重建 wind_results/patchtst/第2轮训练结果 对应的原生 PatchTST。"""
+    if target_channel_index is None:
+        raise ValueError('PatchTST 短期风电模型需要将历史功率作为输入通道')
+
+    history_len = int(artifact.get('history_len', HISTORY_LEN))
+    forecast_len = int(artifact.get('forecast_len', FORECAST_LEN))
+    patch_len = int(artifact.get('patch_len', PATCHTST_PATCH_LEN))
+    patch_stride = int(artifact.get('patch_stride', PATCHTST_PATCH_STRIDE))
+    cnn_stem_dropout = float(artifact.get('cnn_stem_dropout', 0.05))
+
+    patch_num = compute_patchtst_patch_num(
+        history_len,
+        patch_len,
+        patch_stride,
+    )
+    inputs = keras.Input(
+        shape=(history_len, input_dim),
+        name='history_features',
+    )
+
+    cnn_stem = keras.layers.Conv1D(
+        input_dim,
+        kernel_size=3,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=keras.regularizers.l2(1e-5),
+        name='local_cnn_stem',
+    )(inputs)
+    cnn_stem = keras.layers.Dropout(
+        cnn_stem_dropout,
+        name='local_cnn_stem_dropout',
+    )(cnn_stem)
+    x_input = keras.layers.Add(name='history_plus_local_stem')(
+        [inputs, cnn_stem],
+    )
+
+    local_context = keras.layers.Conv1D(
+        PATCHTST_D_MODEL,
+        kernel_size=3,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=keras.regularizers.l2(1e-5),
+        name='local_context_conv3',
+    )(x_input)
+    local_context = keras.layers.Conv1D(
+        PATCHTST_D_MODEL,
+        kernel_size=5,
+        padding='same',
+        activation='gelu',
+        kernel_regularizer=keras.regularizers.l2(1e-5),
+        name='local_context_conv5',
+    )(local_context)
+    local_context = keras.layers.GlobalAveragePooling1D(
+        name='local_context_pool',
+    )(local_context)
+
+    x = PatchExtract(
+        patch_len,
+        patch_stride,
+        name='patch_extract',
+    )(x_input)
+    x = keras.layers.Dense(
+        PATCHTST_D_MODEL,
+        name='patch_projection',
+    )(x)
+    x = MergeChannels(name='merge_channels')(x)
+    x = LearnablePositionEmbedding(
+        patch_num,
+        PATCHTST_D_MODEL,
+        name='position_embedding',
+    )(x)
+    x = keras.layers.Dropout(
+        PATCHTST_DROPOUT,
+        name='patch_dropout',
+    )(x)
+
+    for idx in range(PATCHTST_N_LAYERS):
+        x = patchtst_transformer_encoder(
+            x,
+            PATCHTST_D_MODEL,
+            PATCHTST_N_HEADS,
+            PATCHTST_D_FF,
+            PATCHTST_DROPOUT,
+            name=f'encoder_{idx + 1}',
+        )
+
+    x = RestoreChannels(
+        input_dim,
+        patch_num,
+        PATCHTST_D_MODEL,
+        name='restore_channels',
+    )(x)
+    target_repr = TakeChannel(
+        target_channel_index,
+        name='target_power_channel',
+    )(x)
+    target_repr = keras.layers.Flatten(name='target_flatten')(target_repr)
+    global_context = keras.layers.GlobalAveragePooling2D(
+        name='channel_context_pool',
+    )(x)
+
+    head = keras.layers.Concatenate(name='forecast_context')(
+        [target_repr, global_context, local_context],
+    )
+    head = keras.layers.Dropout(
+        PATCHTST_HEAD_DROPOUT,
+        name='head_dropout',
+    )(head)
+    head = keras.layers.Dense(
+        PATCHTST_D_FF,
+        activation='gelu',
+        kernel_regularizer=keras.regularizers.l2(1e-4),
+        name='forecast_ff',
+    )(head)
+    head = keras.layers.Dropout(
+        PATCHTST_HEAD_DROPOUT,
+        name='forecast_dropout',
+    )(head)
+    direct_forecast = keras.layers.Dense(
+        forecast_len,
+        name='direct_forecast',
+    )(head)
+    residual = keras.layers.Dense(
+        forecast_len,
+        kernel_initializer='zeros',
+        bias_initializer='zeros',
+        name='forecast_residual',
+    )(head)
+    baseline = RepeatLastTarget(
+        target_channel_index,
+        forecast_len,
+        name='persistence_baseline',
+    )(inputs)
+    outputs = HorizonGatedForecast(
+        forecast_len,
+        name='forecast_power',
+    )([baseline, direct_forecast, residual])
+
+    return keras.Model(inputs=inputs, outputs=outputs, name='WindPatchTST')
 
 
 def discover_test_files(data_dir=DATA_DIR):
@@ -105,6 +359,7 @@ def model_output_dirs(model_name):
         'figures': os.path.join(output_dir, 'figures'),
         'single_windows': os.path.join(output_dir, 'single_window_comparisons'),
         'weighted_curves': os.path.join(output_dir, 'weighted_curves'),
+        'router_diagnostics': os.path.join(output_dir, 'router_diagnostics'),
         'matplotlib_cache': os.path.join(output_dir, 'matplotlib_cache'),
     }
     for path in dirs.values():
@@ -125,13 +380,41 @@ def get_custom_objects():
         'TakeChannel': TakeChannel,
         'WindPatchTST>TakeChannel': TakeChannel,
         'RepeatLastTarget': RepeatLastTarget,
-        'WindTunedPatchTST>RepeatLastTarget': RepeatLastTarget,
-        'TunedPatchTSTLoss': TunedPatchTSTLoss,
-        'WindTunedPatchTST>TunedPatchTSTLoss': TunedPatchTSTLoss,
-        'actual_mae': actual_mae,
-        'WindTunedPatchTST>actual_mae': actual_mae,
-        'actual_rmse': actual_rmse,
-        'WindTunedPatchTST>actual_rmse': actual_rmse,
+        'WindPatchTST>RepeatLastTarget': RepeatLastTarget,
+        'HorizonGatedForecast': HorizonGatedForecast,
+        'WindPatchTST>HorizonGatedForecast': HorizonGatedForecast,
+        'FeTSPatchExtract': FeTSPatchExtract,
+        'WindFeTSPatchTST>FeTSPatchExtract': FeTSPatchExtract,
+        'FourierPolynomialMask': FourierPolynomialMask,
+        'WindFeTSPatchTST>FourierPolynomialMask': FourierPolynomialMask,
+        'AdaptiveFeatureExtraction': AdaptiveFeatureExtraction,
+        'WindFeTSPatchTST>AdaptiveFeatureExtraction': AdaptiveFeatureExtraction,
+        'DualScaleFeedForward': DualScaleFeedForward,
+        'WindFeTSPatchTST>DualScaleFeedForward': DualScaleFeedForward,
+        'FeTSFeatureBlock': FeTSFeatureBlock,
+        'WindFeTSPatchTST>FeTSFeatureBlock': FeTSFeatureBlock,
+        'ChannelIdentityEmbedding': ChannelIdentityEmbedding,
+        'WindFeTSPatchTST>ChannelIdentityEmbedding': ChannelIdentityEmbedding,
+        'LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
+        'WindFeTSPatchTST>LayerScaleFeTSFeatureBlock': LayerScaleFeTSFeatureBlock,
+        'HorizonScaledResidualAdd': HorizonScaledResidualAdd,
+        'WindFeTSPatchTST>HorizonScaledResidualAdd': HorizonScaledResidualAdd,
+        'PersistenceForecast': PersistenceForecast,
+        'WindFeTSPatchTST>PersistenceForecast': PersistenceForecast,
+        'HorizonRegimeRouter': HorizonRegimeRouter,
+        'WindFeTSPatchTST>HorizonRegimeRouter': HorizonRegimeRouter,
+        'ExpertConvexFusion': ExpertConvexFusion,
+        'WindFeTSPatchTST>ExpertConvexFusion': ExpertConvexFusion,
+        'FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
+        'WindFeTSPatchTST>FeTSChannelPatchTranspose': FeTSChannelPatchTranspose,
+        'PatchCrossChannelAttention': PatchCrossChannelAttention,
+        'WindFeTSPatchTST>PatchCrossChannelAttention': PatchCrossChannelAttention,
+        'TargetWeatherCrossAttention': TargetWeatherCrossAttention,
+        'WindFeTSPatchTST>TargetWeatherCrossAttention': TargetWeatherCrossAttention,
+        'TakeLastToken': TakeLastToken,
+        'WindFeTSPatchTST>TakeLastToken': TakeLastToken,
+        'SelectChannel': SelectChannel,
+        'WindFeTSPatchTST>SelectChannel': SelectChannel,
         'FixedPositionEmbedding': FixedPositionEmbedding,
         'WindInformer>FixedPositionEmbedding': FixedPositionEmbedding,
         'CircularTokenEmbedding': CircularTokenEmbedding,
@@ -161,9 +444,40 @@ def get_custom_objects():
 
 def load_artifact(model_name, farm_id):
     if model_name == PATCHTST_MODEL_NAME:
+        artifact_candidates = [
+            (
+                os.path.join(
+                    PATCHTST_PREPROCESS_DIR,
+                    f'patchtst_farm_{farm_id}_preprocess.pkl',
+                ),
+                'standard',
+            ),
+            (
+                os.path.join(
+                    PATCHTST_LEGACY_ROUND2_DIR,
+                    f'patchtst_farm_{farm_id}_preprocess.pkl',
+                ),
+                'legacy_round2',
+            ),
+            (
+                os.path.join(
+                    PATCHTST_RESULT_DIR,
+                    f'patchtst_farm_{farm_id}_preprocess.pkl',
+                ),
+                'legacy_root',
+            ),
+        ]
+        artifact_path = None
+        patchtst_layout = None
+        for candidate_path, candidate_layout in artifact_candidates:
+            if os.path.exists(candidate_path):
+                artifact_path = candidate_path
+                patchtst_layout = candidate_layout
+                break
+    elif model_name == FETS_PATCHTST_MODEL_NAME:
         artifact_path = os.path.join(
-            PATCHTST_MODEL_DIR,
-            f'patchtst_farm_{farm_id}_preprocess.pkl',
+            FETS_PATCHTST_PREPROCESS_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_preprocess.pkl',
         )
     else:
         artifact_path = os.path.join(
@@ -172,20 +486,106 @@ def load_artifact(model_name, farm_id):
             'preprocess',
             f'{model_name}_farm_{farm_id}_preprocess.pkl',
         )
+        patchtst_layout = None
 
-    if not os.path.exists(artifact_path):
+    if not artifact_path or not os.path.exists(artifact_path):
         raise FileNotFoundError(
             f'未找到 {model_name} 场站 {farm_id} 的预处理文件: {artifact_path}')
     artifact = joblib.load(artifact_path)
+    if model_name == PATCHTST_MODEL_NAME:
+        artifact['_patchtst_artifact_layout'] = patchtst_layout
+        if patchtst_layout == 'standard':
+            artifact['model_path'] = artifact.get('model_path') or os.path.join(
+                PATCHTST_SAVED_MODEL_DIR,
+                f'patchtst_farm_{farm_id}.keras',
+            )
+            artifact['best_weights_path'] = artifact.get('best_weights_path') or os.path.join(
+                PATCHTST_WEIGHTS_DIR,
+                f'patchtst_farm_{farm_id}_best.weights.h5',
+            )
+        elif patchtst_layout == 'legacy_round2':
+            artifact['model_path'] = os.path.join(
+                PATCHTST_LEGACY_ROUND2_DIR,
+                f'patchtst_farm_{farm_id}.keras',
+            )
+            artifact['best_weights_path'] = os.path.join(
+                PATCHTST_LEGACY_ROUND2_DIR,
+                f'patchtst_farm_{farm_id}_best.weights.h5',
+            )
+        else:
+            artifact['model_path'] = artifact.get('model_path') or os.path.join(
+                PATCHTST_SAVED_MODEL_DIR,
+                f'patchtst_farm_{farm_id}.keras',
+            )
+            artifact['best_weights_path'] = artifact.get('best_weights_path') or os.path.join(
+                PATCHTST_WEIGHTS_DIR,
+                f'patchtst_farm_{farm_id}_best.weights.h5',
+            )
+    if (
+        model_name == FETS_PATCHTST_MODEL_NAME
+        and artifact.get('architecture_version')
+        != FETS_PATCHTST_ARCHITECTURE_VERSION
+    ):
+        raise FileNotFoundError(
+            f'场站 {farm_id} 的 FeTS-PatchTST artifact 结构版本为 '
+            f"{artifact.get('architecture_version', 'unknown')}，"
+            f'当前预测代码要求 {FETS_PATCHTST_ARCHITECTURE_VERSION}；'
+            '请使用当前训练脚本重新训练后再预测'
+        )
     artifact['artifact_path'] = artifact_path
     return artifact
 
 
 def build_model_from_weights(model_name, artifact):
     if model_name == PATCHTST_MODEL_NAME:
+        if (
+            artifact.get('_patchtst_artifact_layout') == 'legacy_round2'
+            or 'cnn_stem_dropout' in artifact
+            or 'horizon_decay' in artifact
+        ):
+            return build_legacy_patchtst_round2_model(
+                len(artifact['input_cols']),
+                artifact['target_index'],
+                artifact,
+            )
         return build_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
-    if model_name == TUNED_MODEL_NAME:
-        return build_tuned_patchtst_model(len(artifact['input_cols']), artifact['target_index'])
+    if model_name == FETS_PATCHTST_MODEL_NAME:
+        return build_fets_patchtst_model(
+            len(artifact['input_cols']),
+            artifact['target_index'],
+            history_len=artifact.get('history_len', HISTORY_LEN),
+            forecast_len=artifact.get('forecast_len', FORECAST_LEN),
+            patch_len=artifact.get('patch_len', 16),
+            patch_stride=artifact.get('patch_stride', 8),
+            d_model=artifact.get('d_model', 64),
+            dropout=artifact.get('dropout', 0.15),
+            head_dropout=artifact.get('head_dropout', 0.2),
+            fourier_degree=artifact.get('fourier_degree', 2),
+            poly_degree=artifact.get('poly_degree', 2),
+            ffn_ratio=artifact.get('ffn_ratio', 2),
+            n_heads=artifact.get('n_heads', 4),
+            n_layers=artifact.get('n_layers', 3),
+            d_ff=artifact.get('d_ff', 128),
+            mid_patch_len=artifact.get('mid_patch_len', 8),
+            mid_patch_stride=artifact.get('mid_patch_stride', 4),
+            mid_n_layers=artifact.get('mid_n_layers', 2),
+            local_patch_len=artifact.get('local_patch_len', 4),
+            local_patch_stride=artifact.get('local_patch_stride', 2),
+            local_n_layers=artifact.get('local_n_layers', 2),
+            target_weather_heads=artifact.get('target_weather_heads', 4),
+            layer_scale_init=artifact.get('layer_scale_init', 1e-3),
+            long_context_dim=artifact.get('long_context_dim', 64),
+            router_hidden_dim=artifact.get('router_hidden_dim', 64),
+            horizon_embedding_dim=artifact.get('horizon_embedding_dim', 16),
+            router_dropout=artifact.get('router_dropout', 0.1),
+            router_initial_bias=artifact.get(
+                'router_initial_bias',
+                [2.0, 0.0, 0.0, -2.0],
+            ),
+            power_scale_ratio=artifact.get('power_scale_ratio', 1.0),
+            power_scale_offset=artifact.get('power_scale_offset', 0.0),
+            correction_kernel_l2=artifact.get('correction_kernel_l2', 1e-4),
+        )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
     builder = MODEL_BUILDERS[model_name]
@@ -197,21 +597,21 @@ def build_model_from_weights(model_name, artifact):
 def load_trained_model(model_name, farm_id, artifact):
     if model_name == PATCHTST_MODEL_NAME:
         model_path = artifact.get('model_path') or os.path.join(
-            SAVED_MODEL_DIR,
+            PATCHTST_SAVED_MODEL_DIR,
             f'patchtst_farm_{farm_id}.keras',
         )
         best_weights_path = artifact.get('best_weights_path') or os.path.join(
-            PATCHTST_MODEL_DIR,
+            PATCHTST_WEIGHTS_DIR,
             f'patchtst_farm_{farm_id}_best.weights.h5',
         )
-    elif model_name == TUNED_MODEL_NAME:
+    elif model_name == FETS_PATCHTST_MODEL_NAME:
         model_path = artifact.get('model_path') or os.path.join(
-            TUNED_SAVED_MODEL_DIR,
-            f'tuned_patchtst_farm_{farm_id}.keras',
+            FETS_PATCHTST_SAVED_MODEL_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}.keras',
         )
         best_weights_path = artifact.get('best_weights_path') or os.path.join(
-            TUNED_WEIGHTS_DIR,
-            f'tuned_patchtst_farm_{farm_id}_best.weights.h5',
+            FETS_PATCHTST_WEIGHTS_DIR,
+            f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_best.weights.h5',
         )
     else:
         model_path = artifact.get('model_path') or os.path.join(
@@ -572,6 +972,89 @@ def save_weighted_full_test_plot(pred_df, model_name, farm_id, dirs, capacity=No
     return weighted_curve_path, figure_path, weighted_metrics
 
 
+def predict_with_router_diagnostics(model_name, model, pred_ds):
+    """FeTS-PatchTST 单次前向同时返回预测和动态路由权重。"""
+    if model_name != FETS_PATCHTST_MODEL_NAME:
+        return model.predict(pred_ds, verbose=PREDICT_VERBOSE), None
+
+    router_layer = model.get_layer('horizon_regime_router')
+    diagnostic_model = keras.Model(
+        inputs=model.inputs,
+        outputs=[model.output, router_layer.output],
+        name='WindFeTSPatchTSTPredictDiagnostics',
+    )
+    predictions, router_weights = diagnostic_model.predict(
+        pred_ds,
+        verbose=PREDICT_VERBOSE,
+    )
+    return predictions, np.asarray(router_weights, dtype=float)
+
+
+def save_router_diagnostics(
+    router_weights,
+    expert_names,
+    model_name,
+    farm_id,
+    dirs,
+):
+    """保存逐 horizon 的路由均值、离散程度和分位数。"""
+    if router_weights is None:
+        return None, {}
+    if router_weights.ndim != 3:
+        raise ValueError(f'router 权重必须为三维，实际为 {router_weights.shape}')
+    if len(expert_names) != router_weights.shape[-1]:
+        raise ValueError('artifact 专家名称数量与 router 输出不一致')
+    if not np.isfinite(router_weights).all():
+        raise FloatingPointError('测试集 router 权重包含非有限值')
+    if not np.allclose(router_weights.sum(axis=-1), 1.0, atol=1e-5):
+        raise ValueError('测试集 router 权重之和不为 1')
+
+    entropy = -np.sum(
+        router_weights
+        * np.log(np.clip(router_weights, 1e-8, 1.0)),
+        axis=-1,
+    ) / np.log(len(expert_names))
+    rows = []
+    for horizon_idx in range(router_weights.shape[1]):
+        horizon_weights = router_weights[:, horizon_idx, :]
+        row = {
+            'model_name': model_name,
+            'farm_id': farm_id,
+            'horizon_step': horizon_idx + 1,
+            'horizon_minutes': (horizon_idx + 1) * 15,
+            'normalized_entropy_mean': float(entropy[:, horizon_idx].mean()),
+        }
+        for expert_idx, expert_name in enumerate(expert_names):
+            values = horizon_weights[:, expert_idx]
+            row.update({
+                f'{expert_name}_weight_mean': float(values.mean()),
+                f'{expert_name}_weight_std': float(values.std()),
+                f'{expert_name}_weight_p10': float(np.quantile(values, 0.10)),
+                f'{expert_name}_weight_p90': float(np.quantile(values, 0.90)),
+            })
+        rows.append(row)
+
+    diagnostics_path = os.path.join(
+        dirs['router_diagnostics'],
+        f'{model_name}_router_weights_farm_{farm_id}.csv',
+    )
+    pd.DataFrame(rows).to_csv(
+        diagnostics_path,
+        index=False,
+        encoding='utf-8-sig',
+    )
+    overall_fields = {
+        'router_diagnostics_path': diagnostics_path,
+        'router_normalized_entropy': float(entropy.mean()),
+    }
+    overall_mean = router_weights.mean(axis=(0, 1))
+    overall_fields.update({
+        f'router_weight_{expert_name}': float(weight)
+        for expert_name, weight in zip(expert_names, overall_mean)
+    })
+    return diagnostics_path, overall_fields
+
+
 def predict_one_farm(model_name, test_file):
     farm_id = get_farm_id(test_file)
     dirs = model_output_dirs(model_name)
@@ -584,11 +1067,23 @@ def predict_one_farm(model_name, test_file):
     forecast_len = artifact.get('forecast_len', FORECAST_LEN)
 
     pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
-    y_pred_scaled = model.predict(pred_ds, verbose=PREDICT_VERBOSE)
+    y_pred_scaled, router_weights = predict_with_router_diagnostics(
+        model_name,
+        model,
+        pred_ds,
+    )
     y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
     if y_pred.shape[0] != n_samples:
         raise ValueError(
             f'{model_name} 场站 {farm_id} 预测样本数不一致: {y_pred.shape[0]} vs {n_samples}')
+    if router_weights is not None and router_weights.shape[:2] != (
+        n_samples,
+        forecast_len,
+    ):
+        raise ValueError(
+            f'{model_name} 场站 {farm_id} router 形状不一致: '
+            f'{router_weights.shape} vs ({n_samples}, {forecast_len}, 专家数)'
+        )
 
     if capacity is not None:
         y_pred = np.clip(y_pred, 0, capacity)
@@ -619,6 +1114,17 @@ def predict_one_farm(model_name, test_file):
     )
     metric_df.to_csv(horizon_metric_path, index=False, encoding='utf-8-sig')
 
+    expert_names = artifact.get(
+        'expert_names',
+        list(FETS_PATCHTST_EXPERT_NAMES),
+    )
+    _, router_metric_fields = save_router_diagnostics(
+        router_weights,
+        expert_names,
+        model_name,
+        farm_id,
+        dirs,
+    )
     single_window_path, single_window_figure_path = save_single_window_plot(
         pred_df,
         model_name,
@@ -648,6 +1154,7 @@ def predict_one_farm(model_name, test_file):
         'single_window_figure_path': single_window_figure_path,
         'weighted_curve_path': weighted_curve_path,
         'weighted_curve_figure_path': weighted_curve_figure_path,
+        **router_metric_fields,
         **weighted_metric_fields,
     })
     print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "
@@ -711,31 +1218,21 @@ def main():
 
     if all_summary:
         global_summary = pd.concat(all_summary, ignore_index=True)
-        summary_filename = (
-            'wind_dl_all_models_test_metrics_summary.csv'
-            if requested_model_names == ALL_MODEL_NAMES
-            else 'wind_dl_selected_models_test_metrics_summary.csv'
-        )
         global_summary_path = os.path.join(
             BASE_RESULT_DIR,
-            summary_filename,
+            'wind_dl_all_models_test_metrics_summary.csv',
         )
         global_summary.to_csv(global_summary_path, index=False, encoding='utf-8-sig')
-        print(f'模型汇总指标已保存: {global_summary_path}')
+        print(f'全部模型汇总指标已保存: {global_summary_path}')
 
     if all_horizon:
         global_horizon = pd.concat(all_horizon, ignore_index=True)
-        horizon_filename = (
-            'wind_dl_all_models_test_metrics_by_horizon_all.csv'
-            if requested_model_names == ALL_MODEL_NAMES
-            else 'wind_dl_selected_models_test_metrics_by_horizon_all.csv'
-        )
         global_horizon_path = os.path.join(
             BASE_RESULT_DIR,
-            horizon_filename,
+            'wind_dl_all_models_test_metrics_by_horizon_all.csv',
         )
         global_horizon.to_csv(global_horizon_path, index=False, encoding='utf-8-sig')
-        print(f'模型分horizon指标已保存: {global_horizon_path}')
+        print(f'全部模型分horizon指标已保存: {global_horizon_path}')
 
     print('全部深度学习模型测试集预测完成')
 
