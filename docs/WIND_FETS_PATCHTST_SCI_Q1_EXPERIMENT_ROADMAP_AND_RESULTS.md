@@ -1,16 +1,21 @@
 # FeTS-PatchTST 面向 SCI 一区论文的创新路线、实验方案与结果总览
 
-> 更新日期：2026-07-15
+> 更新日期：2026-07-19
 > 项目根目录：`/mnt/d/Python/myprojects/digitalchina2026`
 > 任务：五场站、15 min 分辨率、历史 96 点预测未来 16 点的超短期风电功率预测
 > 当前实验种子：`seed=2026`
-> 当前正式测试选型模型：`T0 = G0 = F7`
+> 当前正式测试选型模型：`X0 = D0 = T0 = G0 = F7`
 > 当前证据协议：`legacy_seen_test_selected`，属于探索性选型，不是最终独立盲测
 > 背景文档：`docs/WIND_FETS_PATCHTST_MODEL_DEVELOPMENT_CONTEXT.md`
 
 本文将 FeTS-PatchTST 项目迄今的研究讨论、创新充分性判断、实验方案、执行进度、
 正式结果、文件路径和论文表述边界整理为一份可持续更新的总览。本文不是逐句
 对话转录，而是按“研究问题—实验—证据—结论”的顺序重组全部关键决策。
+
+“FeTS-PatchTST”是项目沿用的历史工程名称。Stage 1 以后经消融定型的当前部署
+模型已经不是完整 FeTS 或 PatchTST，而是 **Persistence-centered lightweight
+regime-gated forecaster**。后续新对话不得仅根据文档标题误认为最终模型仍含
+PatchTST encoder、四专家 MoE 或 FeTS 模块。
 
 文中必须始终区分三类结论：
 
@@ -19,7 +24,7 @@
 3. **论文可主张**：结果不仅数值较好，而且有直接消融、合理归因和足够严格的
    泛化证据。
 
-当前 `T0/G0/F7` 是第 2 类意义下的阶段性正式最优，但由于测试集反复参与结构
+当前 `X0/D0/T0/G0/F7` 是第 2 类意义下的阶段性正式最优，但由于测试集反复参与结构
 选择、只使用单随机种子，它还不能被写成最终独立盲测结论。
 
 ---
@@ -31,17 +36,19 @@
 当前测试协议下最终保留的模型为：
 
 ~~~text
-96步历史多变量输入
-├─ Persistence candidate：最后历史功率重复到未来16步
-├─ Corrected candidate：Persistence + lightweight causal residual
-└─ 36维显式工况编码 P+H+D
-     ├─ P：历史功率状态
-     ├─ H：轮毂高度风速状态
-     └─ D：风向变化
-        ↓
-非因子化 sample × horizon sigmoid gate
-        ↓
-Persistence / Corrected 逐样本、逐预测步凸融合
+96×45 历史多变量输入（24 h）
+├─ Persistence P：最后历史功率重复到未来16步（4 h）
+├─ Corrected C = P + lightweight causal residual
+│    ├─ causal Conv1D(32, k=5)
+│    ├─ causal Conv1D(32, k=3, dilation=2)
+│    ├─ last token + global average + last raw features
+│    └─ Dense(64) + Dropout + Dense(16) → residual
+└─ 36维显式工况 P+H+D（20+12+4）
+     └─ LayerNorm → Dense(24, GELU) → Dropout(0.1) → Dense(24)
+          ↓
+non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8）
+          ↓
+ŷ = P + gate × (C - P)
 ~~~
 
 关键事实：
@@ -49,10 +56,12 @@ Persistence / Corrected 逐样本、逐预测步凸融合
 - 参数量：20,969；
 - 五场站等权 Macro NRMSE：0.113760989；
 - Macro NMAE：0.077608814；
-- 当前正式名称映射：`F7`（特征结构）= `G0`（门控阶段参考）= `T0`（时频阶段参考）；
+- 当前正式名称映射：`F7`（特征结构）= `G0`（Stage 3 参考）= `T0`
+  （Stage 4 参考）= `D0`（Stage 4B 参考）= `X0`（Stage 5 参考）；
 - 不包含原始四专家模型中的 long、mid、short FeTS 专家；
 - 不包含 G1–G4 的因子化校准安全门控；
-- 不包含 T1–T3 的时间、频率或时频交互 adapter。
+- 不包含 T1–T3 的时间、频率或时频交互 adapter；
+- 不包含 X1-F/M/C/X1 的静态多尺度 adapter，也不包含 X2–X6 token 交互。
 
 ### 1.2 各阶段最终选择
 
@@ -64,7 +73,10 @@ Persistence / Corrected 逐样本、逐预测步凸融合
 | Stage 2B，F0–F8/FP | 哪些显式工况特征有效 | F7=P+H+D NRMSE 0.113761 最低 | 删除 M、C 和辅助任务，保留 F7 | 完成 |
 | Stage 3，G0–G4 | 校准、安全损失和 Persistence 保护是否可晋级 | G1 NRMSE 0.113606 数值最低；G2/G3 校准更好 | 全部新模型因 ramp 门槛失败，回退 G0/F7 | 完成 |
 | Stage 4，T0/M0/T1–T3 | 最小 residual 与轻量时频增强是否有效 | T3 corrected candidate 最好，但 fused NRMSE 0.114492 | 全部新模型失败宏精度/逐场/ramp 门槛，回退 T0 | 完成 |
-| 后续条件阶段 | fine/mid/coarse 与 token 级跨尺度交互 | 尚无支持直接扩大模型的证据 | 暂不启动完整结构，先解决候选收益向融合收益转化 | 未启动 |
+| Stage 4B，D0/D0R/D1–D3 | T1 候选收益能否通过重新生成 oracle/Q90 和重训门控转化 | D0R 数值最低 0.113721，仅比 D0 好 0.0349%，但仅 2/5 场站改善 | 全部新变体未过 0.2%/逐场守门，回退 D0 | 完成 |
+| Stage 5A，X0/X1-F/M/C/X1 | 轻量 fine/mid/coarse 静态历史表示本身是否改善 corrected candidate | X1-C candidate 数值最低 0.115680；X1-F 位于 0.1% 最优带且更轻 | Stage 5A 形式化选 X1-F；full X1 仅进入后续闭环诊断 | 完成 |
+| X1R 门控闭环 | full X1 候选收益能否经同 candidate 的新校准安全门控转化 | X1-fixed-G0 fused 数值为 0.113691（诊断，不可选）；X1R NRMSE 0.114370，但 NMAE/校准更好 | 精度、逐场、dynamic/ramp 与留一守门失败，正式回退 X0 | 完成 |
+| Stage 5B，X2–X6 | token 级单向/双向跨尺度交互是否应启动 | X1R 没有把 X1 candidate 收益转成稳健 fused 收益 | `stage5b_x2_x3_unlocked=false`，停止 X2–X6 | 未解锁 |
 
 ### 1.3 当前最重要的科学结论
 
@@ -76,9 +88,16 @@ Persistence / Corrected 逐样本、逐预测步凸融合
    同时保持 ramp 和总体 NRMSE，表现为明确的精度—安全 Pareto 权衡。
 4. T1/T3 能改善 corrected candidate，但统一新门控没有把候选增益稳定转化为
    五场站 fused 增益；当前瓶颈不是简单“缺少一个时频模块”。
-5. 当前证据可以支撑一条清晰的轻量、工况感知、Persistence 中心方法线，但
+5. Stage 4B 证明“为新 candidate 重建 train-only oracle/Q90 并重训 gate”是
+   必需的受控闭环，却不足以保证精度收益转化；T1 + fixed G0 的诊断值甚至优于
+   新门控，说明 gate objective 与尾部误差仍错配。
+6. Stage 5A 证明静态 fine/mid/coarse 表示可小幅改善 corrected candidate，但
+   X1R 又证明更好的校准、安全和平均绝对误差可以伴随 NRMSE、dynamic/ramp
+   恶化。不能把“candidate 改善”或“门控校准改善”等同于部署模型晋级。
+7. 当前证据可以支撑一条清晰的轻量、工况感知、Persistence 中心方法线，但
    **尚不足以保证 SCI 一区录用**。主要风险来自测试集参与选型、单 seed、缺少
-   最终独立时间外推/外部数据验证，以及新增安全和时频结构没有晋级最终模型。
+   最终独立时间外推/外部数据验证，以及新增安全、时频和多尺度结构没有晋级
+   最终模型。按现有证据，专业型 JCR Q2 是更现实的定位。
 
 ---
 
@@ -131,7 +150,8 @@ wind_split/wind_test_<farm_id>.csv
 当前结果应被标记为 `legacy_seen` 或 `legacy_seen_test_selected`，原因是：
 
 - 测试标签没有进入训练输入，但研究过程查看测试表现后继续选择了结构；
-- F0–F8、G0–G4 和 T0–T3 均按用户要求使用当前测试集做最终阶段选型；
+- F0–F8、G0–G4、T0–T3、D0–D3、X0–X1 与 X1R 均按用户要求使用当前
+  测试集做阶段选型；
 - 当前测试预处理先在整段文件做双向气象插值，严格在线因果性不足；
 - scaler 在完整训练文件上拟合后再切训练/验证窗口，验证段参与归一化统计；
 - 当前只有单 seed=2026，没有多 seed、K-fold 或统计显著性检验。
@@ -164,6 +184,10 @@ wind_split/wind_test_<farm_id>.csv
 | 2026 | [A time-frequency adaptive transformer for long-term wind power forecasting under complex meteorological fluctuations](https://www.sciencedirect.com/science/article/pii/S0957417426006536)，Expert Systems with Applications | 复杂气象下的时频依赖和频谱信息损失 | 两阶段时频建模、复谱机制、按任务自适应分配注意头，并在三数据集验证 | T0–T3 只是最小探针；只有跨场站稳定提升后才值得扩大时频结构 |
 | 2026 | [STWFormer: Interpretable wavelet-based spatio-temporal transformer](https://www.sciencedirect.com/science/article/pii/S0378779626003548)，Electric Power Systems Research | 时间—频率演化和多变量空间关系 | 小波多尺度网络与时空解耦注意并行，强调解释与真实数据验证 | token/尺度交互必须有清晰归因，不应以复杂结构名称代替证据 |
 | 2026 | [Enhancing short-term wind power forecasting through virtual prediction and wavelet packet transform](https://www.sciencedirect.com/science/article/pii/S0378779625012271)，Electric Power Systems Research | 波动信号频率子带的可预测性差异 | 小波包分解、分频预测、组合权重 | “多候选+融合”应验证每个候选质量和融合是否真正超过最佳候选 |
+| 2026 | [A physics-aware dynamic graph and mixture-of-experts framework for wind power forecasting](https://www.sciencedirect.com/science/article/pii/S0142061526002115)，International Journal of Electrical Power & Energy Systems | 物理机理、空间依赖与工况异质性 | 动态图与 physics/data experts 的条件融合 | “物理候选+数据候选+动态门控”本身已不是充分新颖点，必须有更专门的失效问题与直接证据 |
+| 2026 | [A novel hybrid short-term and ultra-short-term wind power forecasting method based on Weather Research and Forecasting: WRF-iTransformer-PSO](https://www.sciencedirect.com/science/article/pii/S0360544226010601)，Energy | 数值天气预报与数据模型协同 | WRF 预报、iTransformer 与超参数优化形成气象—预测链 | 不使用未来 NWP 的本文必须明确任务边界，并以轻量、可靠和历史信息利用形成差异化 |
+| 2026 | [Ultra-short-term wind power prediction for enhanced reliability considering error distribution characteristics and guided correction](https://www.sciencedirect.com/science/article/pii/S0360544226015033)，Energy | 平均误差之外的尾部风险和可靠校正 | 显式建模误差分布并按风险引导修正 | dynamic/ramp、过估风险、regret/harm 与校准可以成为核心问题，但必须与最终精度闭环 |
+| 2025 | [A cross-dataset benchmark for neural network-based wind power forecasting](https://www.sciencedirect.com/science/article/pii/S0960148125011255)，Renewable Energy | 不同数据集、尺度和初始化下结论不可比 | 八个全球数据集上的统一神经网络基准 | 跨数据集、随机种子和统一协议已接近方法论文的必要证据，而非附属实验 |
 
 ### 3.3 归纳出的创新规律
 
@@ -174,7 +198,8 @@ wind_split/wind_test_<farm_id>.csv
 
 2. **多尺度与时频仍是高频方向，但强调选择性和交互。**
    常见做法是趋势/周期分解、wavelet/Fourier、稀疏频率选择、局部—全局交互；
-   简单并联后拼接越来越难构成充分创新。
+   简单并联、池化后拼接越来越难构成充分创新。Stage 5A 的 X1 属于后者，
+   因此即使 candidate 小幅改善，也不能直接包装成一区级跨尺度创新。
 
 3. **动态融合从“能变化”转向“可校准、可解释、可保护”。**
    仅展示平均门控权重不够，需要 oracle、Brier/ECE、regret、harm、饱和率和
@@ -198,6 +223,11 @@ wind_split/wind_test_<farm_id>.csv
 8. **证据标准高于结构新颖度。**
    直接父子消融、逐场站/逐 horizon/逐工况结果、复杂度、稳定性和失败分析，
    往往比再增加一个命名复杂的模块更重要。
+
+9. **候选质量、门控质量和最终融合质量必须三层分开。**
+   Stage 4B 与 X1R 的结果表明，candidate 变好、Brier/ECE 变好或 regret/harm
+   下降都不自动推出 fused NRMSE 变好；每个 candidate 改变后都必须重新生成
+   train-only oracle/Q90，并以 candidate→fused 收益转化率验收。
 
 ---
 
@@ -242,8 +272,14 @@ P+H+D 两候选动态融合（F7）
 新门控未过 ramp 门槛 → 回退 G0
     ↓ Stage 4：只在满足5.1条件后做最小时频探针
 candidate略有改善但 fused 未改善 → 回退 T0
+    ↓ Stage 4B：T1/F7 candidate × direct/calibrated/factorized gate 闭环
+新门控未稳定转化候选收益 → 回退 D0
+    ↓ Stage 5A：fine/mid/coarse 独立静态表示
+candidate 小幅改善，形式化选 X1-F；full X1 进入闭环诊断
+    ↓ X1R：冻结 full X1，重建 oracle/Q90 并重训非因子化校准安全 gate
+校准/安全改善但 NRMSE、dynamic/ramp 失败 → 回退 X0
     ↓
-暂不扩大到完整 fine/mid/coarse 与 token 级双向跨尺度结构
+Stage 5B token 级 X2–X6 未解锁
 ~~~
 
 ---
@@ -257,7 +293,10 @@ candidate略有改善但 fused 未改善 → 回退 T0
 | P/H/D 特征组的可解释筛选与冻结候选归因 | F0–F8 端到端消融、FP0/FP4 Frozen-Pair、candidate drift 报告 | **已支持** | P、H、D 可保留；M、C 和辅助任务不能写成有效贡献 |
 | 校准、regret 与 Persistence 安全保护框架 | G2/G3 显著改善 Brier/ECE、regret/harm；G4 展示安全—精度 Pareto | **作为分析框架支持** | 不能声称最终模型已采用校准安全门控，因为 G1–G4 均未晋级 |
 | 因果时频增强 residual | T1/T3 改善 corrected candidate，但最终 fused NRMSE 和 ramp 退化 | **未支持为最终创新** | 只能作为否定消融和瓶颈诊断，不能写成最终模型贡献 |
-| 真正的 fine/mid/coarse token 级双向跨尺度交互 | 尚未训练 | **未完成** | 不得出现在当前模型结构或贡献列表中 |
+| 轻量 fine/mid/coarse 历史表示 | X1-F/M/C/X1 均已训练；candidate 改善 0.280%–0.413%，但 frozen-G0/X1R 未形成合格部署增益 | **候选层面支持，最终结构未采用** | 可写静态多尺度负/弱阳性消融；不能称最终模型含多尺度模块 |
+| candidate-specific oracle/Q90 与门控闭环 | Stage 4B、X1R 均严格冻结 candidate、重建 train-only oracle/Q90 并做身份审计 | **实验方法支持，精度闭环失败** | 可作为严谨归因和可靠性评价贡献；不能声称新 gate 提升最终 NRMSE |
+| X1R 非因子化校准安全门控 | 相同 X1 candidate 下 Brier/ECE、regret/harm 和饱和率显著改善，但 NRMSE 比 X0 恶化 0.5353% | **安全/校准支持，部署不晋级** | 必须同时报告 NMAE 改善与 NRMSE/dynamic/ramp 失败，不得选择性汇报 |
+| 真正的 fine/mid/coarse token 级双向跨尺度交互 | X2–X6 未训练且未解锁 | **未完成** | 不得出现在当前模型结构或已完成贡献列表中 |
 | 原四专家 FeTS-PatchTST/防塌缩稀疏路由 | Stage 1 未证明复杂专家不可删除；两候选结构不再需要四专家负载均衡 | **不再作为当前主线** | 只能作为历史动机或对照，不能作为最终模型创新 |
 
 当前最稳妥的论文主线是：
@@ -268,7 +307,7 @@ candidate略有改善但 fused 未改善 → 回退 T0
 > 可靠性。
 
 其中前半句是最终模型结构贡献，后半句主要是系统实验与安全评价贡献。不能把
-未晋级的 G2/G3/G4 或 T1–T3 写入最终部署结构。
+未晋级的 G2/G3/G4、T1–T3、X1/X1R 写入最终部署结构。
 
 ---
 
@@ -869,13 +908,14 @@ T1–T3 先训练新增 adapter，再冻结 candidate 训练 gate。实际新训
 fallback_t0_no_new_variant_passed_guards
 ~~~
 
-- 五场站最终 fused 预测仍选择 T0/G0/F7；
+- 在 Stage 4 当时，五场站最终 fused 预测仍选择 T0/G0/F7；
 - 若只看新 fused 模型，M0 最低；若只看 corrected candidate，T3 最低；
 - 两者都不能替代正式目标下的 T0；
 - T1–T3 应作为有价值的否定消融；
 - 当前瓶颈是 candidate 优势的跨场站一致性和 gate 收益转化，而非简单缺少
   更大的时频网络；
-- 不应立即堆叠完整 fine/mid/coarse 或 token 级跨尺度结构。
+- 当时不应立即堆叠完整 fine/mid/coarse 或 token 级跨尺度结构；后续先完成
+  Stage 4B 收益闭环，才按受控矩阵启动 Stage 5A 静态表示。
 
 ### 11.9 结果和可视化路径
 
@@ -902,9 +942,231 @@ fallback_t0_no_new_variant_passed_guards
 
 ---
 
-## 12. 跨阶段数据比较
+## 12. 第四阶段 B：D0–D3 门控收益转化闭环
 
-### 12.1 当前统一 seed 主线
+### 12.1 为什么在 T0–T3 后补做闭环
+
+Stage 4 已经观察到 T1/T3 corrected candidate 有小幅收益，但统一新 gate 的 fused
+结果退化。为区分“candidate 无效”“gate 拓扑无效”和“oracle/辅助目标错配”，
+Stage 4B 固定 candidate 身份，按每个 candidate 重新生成 train-only soft oracle
+和逐 horizon `|C-P| Q90`，只比较收益转化链路。D0 只读引用 T0/G0/F7，避免
+重复训练和重复预测。
+
+### 12.2 五变体矩阵
+
+| 变体 | Candidate | Gate/目标 | 受控问题 |
+| --- | --- | --- | --- |
+| D0 | F7 | 原非因子化 G0 | 正式部署参考，不重训 |
+| D0R | 冻结 T1 | 非因子化 direct gate，无校准/安全辅助 | T1 + 新 direct gate 能否转化收益 |
+| D1 | 冻结 F7 | 非因子化 calibrated-safe，`calibration=0.1`、`safety=0.05` | 同 F7 下辅助目标效应 |
+| D2 | 冻结 T1 | 与 D1 同构的非因子化 calibrated-safe | 同 gate 下 T1 相对 F7 的 candidate 效应 |
+| D3 | 冻结 T1 | 因子化 calibrated-dynamic-safe，另加 `dynamic=0.05` | 因子化拓扑与 dynamic 辅助项的联合效应 |
+
+D1/D2/D3 使用各自 train-only oracle/Q90。`fixed-G0-on-T1 replay` 只用于诊断
+“重训 gate 是否比原 G0 更好”，不进入五变体正式排名。D3 相对 D2 同时改变
+拓扑和 dynamic 辅助项，因此只能解释为联合效应，不能归因为单一因子化结构。
+
+实际训练 `D0R/D1/D2/D3 × 5=20` 个模型；D0 五场站全部只读复用。训练固定
+`seed=2026`、`batch_size=192`，全部 candidate identity 与 oracle/Q90 统计审计
+通过。
+
+### 12.3 测试集结果
+
+| 变体 | Macro NRMSE | Macro NMAE | 相对 D0 NRMSE | 不退化/严格改善场站 | 参数量 | 正式守门 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| D0 | **0.113760989** | 0.077608814 | 0 | 5/5（参考） | 20,969 | **通过，最终选择** |
+| D0R | **0.113721293** | 0.077472461 | -0.0349% | 2/5、2/5 | 24,121 | 失败 |
+| D1 | 0.114362328 | 0.075474 | +0.5286% | 2/5、2/5 | 20,969 | 失败 |
+| D2 | 0.114357238 | 0.075401 | +0.5241% | 2/5、2/5 | 24,121 | 失败 |
+| D3 | 0.114485458 | 0.075246 | +0.6368% | 2/5、2/5 | 23,561 | 失败 |
+
+预声明门槛要求新变体 Macro NRMSE 至少改善 0.2%、至少 4/5 场站不退化且
+3/5 严格改善，ramp-up/down 不超过 D0 的 +0.5%，并通过 candidate、安全和
+30k 参数守门。D0R 虽是数值最低 fused NRMSE，但只改善 0.0349% 且仅 2/5
+场站改善，不能正式晋级。D1–D3 的 NMAE、校准或安全指标有所改善，但 NRMSE
+明显退化。
+
+同一 T1 candidate 的 fixed-G0 replay NRMSE 为 0.113649；D0R 反而比它差
+0.0639%，说明本轮 gate 重训没有转化 candidate 潜力。最终正式回退 **D0**。
+
+### 12.4 代码、结果与完成标记
+
+- 训练：`wind_time_freq_model_stage4b_train.py`
+- 预测：`wind_time_freq_model_stage4b_predict.py`
+- 结果根目录：`wind_results/time_freq_model/supplement_round2_stage4b_gate_closure/`
+- 实验矩阵：`stage4b_gate_closure_experiment_manifest.csv`
+- 正式报告：`testdata_predict_output/stage4b_gate_closure_test_final_selection.md`
+- 正式比较：`testdata_predict_output/stage4b_gate_closure_test_variant_comparison.csv`
+- 训练完成标记：`stage4b_gate_closure_training_bundle_complete.json`
+- 测试完成标记：`testdata_predict_output/stage4b_gate_closure_test_bundle_complete.json`
+- 变体 artifact：`d0r/`、`d1/`、`d2/`、`d3/`
+- 正式可视化 inventory：`testdata_predict_output/stage4b_gate_closure_visual_inventory.csv`
+
+正式输出目录还保存 summary、horizon、candidate、regime、safety、calibration、
+complexity、controlled contrasts、candidate invariants 和 source reuse manifest。
+预测 marker 记录正式可视化 67 张；四个新变体各有五场站训练 history 图。
+
+---
+
+## 13. 第五阶段 A：轻量 fine/mid/coarse 历史表示
+
+### 13.1 研究问题与结构边界
+
+Stage 5A 先回答“多尺度历史表示本身是否改善 corrected candidate”，不直接训练
+token 级跨尺度交互。四个新变体全部冻结 F7 residual、P+H+D context 和原 G0，
+只训练零初始化的 candidate-delta adapter；正式主指标是 **corrected-candidate
+NRMSE**，冻结 G0 的 fused 回放只作诊断。
+
+这些 adapter 不是 PatchTST：代码没有接入 PatchTST encoder 或 Transformer
+patch token。各尺度以 causal Conv1D（8 filters，stride=1）提取局部表示，再做
+右对齐抽样、LayerNorm、global average/max pooling 和轻量 Dense 映射。`patch`
+与 `stride` 只定义历史感受野和右对齐采样间隔。
+
+### 13.2 X0–X1 矩阵
+
+| 变体 | 尺度结构 | Candidate adapter | Token 交互 | 总参数量 |
+| --- | --- | --- | --- | ---: |
+| X0 | D0/G0/F7 直接引用 | 无 | 无 | 20,969 |
+| X1-F | fine：patch=4、stride=2 | 单尺度表示→Dense(32)→16步 delta | 无 | 22,369 |
+| X1-M | mid：patch=8、stride=4 | 单尺度表示→Dense(32)→16步 delta | 无 | 22,401 |
+| X1-C | coarse：patch=16、stride=8 | 单尺度表示→Dense(32)→16步 delta | 无 | 22,465 |
+| X1 | fine/mid/coarse 分别编码至 16 维后 concat + static Dense | 三尺度静态融合→16步 delta | 无 | 24,177 |
+
+X0 五场站只读复用，新训练 `X1-F/M/C/X1 × 5=20` 个模型；`seed=2026`、
+`batch_size=192`。所有 source/candidate 不变量审计通过。
+
+### 13.3 Candidate 测试结果与形式化选择
+
+| 变体 | Candidate NRMSE | Candidate NMAE | 相对 X0 改善 | 不退化/严格改善场站 | Frozen-G0 fused 诊断 | 守门/选择 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| X0 | 0.116159752 | 0.081113333 | 0 | 5/5（参考） | 0.113760989 | 参考通过 |
+| X1-F | 0.115789078 | 0.080402038 | 0.3191% | 4/5、4/5 | 0.113716658 | **通过并正式选择** |
+| X1-M | 0.115834 | 0.080443 | 0.2805% | 4/5、4/5 | 0.113750 | 未达到 0.3% |
+| X1-C | **0.115680075** | **0.080193012** | **0.4129%** | 4/5、4/5 | 0.113691625 | 通过，数值最低 |
+| X1 | 0.115705166 | 0.080242515 | 0.3913% | 4/5、4/5 | **0.113690771** | 通过 |
+
+预声明条件要求 candidate Macro NRMSE 至少改善 0.3%、至少 4/5 场站不退化、
+3/5 严格改善，dynamic/ramp 不恶化超过 0.5%，删除最大收益场后仍为正且参数
+小于 30k。X1-F、X1-C、X1 通过，X1-M 未过 0.3% 门槛。
+
+X1-C 是 candidate 数值最低模型；X1-F 与它只差约 0.0943%，处在预声明的
+0.1% 最优带内，因此再按参数量/效率优先，Stage 5A **形式化选择 X1-F**。
+后续 X1R 特意使用 full X1，是为了测试完整三尺度 candidate 在相同旧 G0 与新
+gate 下的收益转化；这不改写 Stage 5A 的正式选择，也不能把 X1-fixed-G0 当作
+本阶段可部署最优。
+
+### 13.4 阶段结论
+
+- 轻量静态历史表示在 candidate 层面有小幅、但非五场站一致的收益；
+- coarse 单尺度数值最好，full 静态融合没有明显超过 coarse，尚不能证明尺度
+  互补或真正跨尺度交互；
+- frozen G0 只转化了约 0.01%–0.06% 的 fused 收益，仍需同 candidate 闭环；
+- Stage 5A 不是 PatchTST，也不是 X2–X6 token 交互创新。
+
+### 13.5 代码、结果与完成标记
+
+- 训练：`wind_multiscale_correc_cand_train.py`
+- 预测：`wind_multiscale_correc_cand_predict.py`
+- 结果根目录：`wind_results/multiscale_correc_cand/`
+- 实验矩阵：`multiscale_correc_cand_experiment_manifest.csv`
+- 正式报告：`testdata_predict_output/multiscale_correc_cand_test_final_selection.md`
+- 正式比较：`testdata_predict_output/multiscale_correc_cand_test_variant_comparison.csv`
+- 训练完成标记：`multiscale_correc_cand_training_bundle_complete.json`
+- 测试完成标记：`testdata_predict_output/multiscale_correc_cand_test_bundle_complete.json`
+- 新变体 artifact：`x1_f/`、`x1_m/`、`x1_c/`、`x1/`
+- 可视化 inventory：`testdata_predict_output/multiscale_correc_cand_visual_inventory.csv`
+
+测试 marker 记录正式可视化 96 张；每个新变体各保存五场站 candidate history，
+并保存 prediction、candidate archive、frozen-G0 replay、逐 horizon、逐工况、
+复杂度和不变量文件。
+
+---
+
+## 14. 第五阶段 A 闭环：full-X1 的 X1R 门控重校准
+
+### 14.1 为什么单独做 X1R
+
+Stage 5A 的 full X1 corrected candidate 比 X0 改善 0.3913%，但冻结旧 G0 后
+fused 只改善 0.0617%。X1R 固定 full X1 的 Persistence/corrected 两候选，剪除
+旧 G0，重新生成每场站 train-only soft oracle 和逐 horizon Q90，只训练一个与
+Stage 4B D2 同构的非因子化 sample×horizon calibrated-safe gate。这样可在
+candidate 完全相同的条件下，将“旧 G0”和“新门控”的影响分开。
+
+X1R 仍使用 36 维 P+H+D context，`calibration_weight=0.1`、
+`safety_weight=0.05`、`dynamic_weight=0`。总参数 24,177；阶段可训练参数为
+gate-only 993、context/objective 2,553。固定 `seed=2026`、`batch_size=192`，
+五场站 candidate max/mean drift 均为 0。
+
+### 14.2 正式对照与宏平均结果
+
+| 变体 | 身份 | Macro NRMSE | Macro NMAE | Regret | Harm@0.005 | Brier | ECE | 高饱和率 | 可选 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| X0 | D0/F7 + 原 G0 部署参考 | **0.113760989** | 0.077608814 | 0.015589 | 0.430711 | 0.408621 | 0.415817 | 0.744590 | 是 |
+| X1-fixed-G0 | full X1 + 原 G0 回放 | **0.113690771** | 0.077242222 | 0.015081 | 0.415879 | 0.408727 | 0.408654 | 0.744590 | 否，仅诊断 |
+| X1R | full X1 + 新 calibrated-safe gate | 0.114369918 | **0.075363723** | **0.008739** | **0.323984** | **0.240506** | **0.072355** | **0** | 是 |
+
+X1-fixed-G0 是全表 NRMSE 数值最低，但属于诊断模型，预注册时不具备正式部署
+资格。正式排名只比较 X0 与 X1R。X1R 相对 X0：
+
+- NRMSE 恶化 0.5353%，相对同 candidate 的 X1-fixed-G0 恶化 0.5974%；
+- NMAE 改善 2.8928%；regret 降 43.94%，harm 降 24.78%；
+- Brier 降 41.14%，ECE 降 82.60%，高饱和率从 74.46% 降至 0；
+- 只在 2/5 场站改善；删除最大收益场站后，余下四站反而恶化 0.7392%；
+- 16 个 horizon 全部退化，幅度约 0.219%–0.674%。
+
+### 14.3 逐场站与工况解释
+
+| 场站尾号 | X1R 相对 X0 NRMSE | 结论 |
+| --- | ---: | --- |
+| 5880 | +1.6255% | 退化 |
+| 5895 | -0.3352% | 改善 |
+| 5971 | +1.1606% | 退化 |
+| 5975 | +0.7595% | 退化 |
+| 6015 | -0.7726% | 改善 |
+
+X1R 在 dynamic、ramp-up、ramp-down、`change_ge_20` 上分别恶化约 1.0104%、
+1.1353%、0.9966%、4.0691%；但 stable/`change_00_02` 改善约 42.67%，low-power
+改善约 22.98%。新 gate 更保守、校准更好，显著降低大量小误差和低功率误差，
+所以 NMAE 下降；同时对大变化/尾部过度靠近 Persistence，平方误差主导的 NRMSE
+反而恶化。这是明确的 L1—L2—ramp 目标错配，而不是简单的训练失败。
+
+### 14.4 最终定型与 Stage 5B 决策
+
+X1R 通过 candidate 身份、参数、Brier/ECE、regret/harm 和饱和率守门，但失败于
+宏 NRMSE、同 candidate 优越性、逐场站一致性、留一稳健性和 dynamic/ramp。
+因此：
+
+- 当前最终部署结构仍为 **X0=D0=T0=G0=F7**，20,969 参数；
+- Stage 5A 的 X1-F 是 candidate 研究的形式化最优，不替代部署 X0；
+- X1-fixed-G0 是诊断数值最优，不具备正式选择资格；
+- `selection_guard_pass=false`，`stage5b_x2_x3_unlocked=false`；
+- 停止 X2–X6，不因“论文缺 token 交互”越过启动门槛。
+
+即使 X1R 全部通过，原协议也只允许先启动 X2/X3 单向交互，不能直接跳到 X6。
+每个新 candidate 仍必须重建自己的 train-only oracle/Q90 并重新校准 gate。
+
+### 14.5 代码、结果与完成标记
+
+- 训练：`wind_multiscale_correc_cand_x1r_train.py`
+- 预测：`wind_multiscale_correc_cand_x1r_predict.py`
+- 结果根目录：`wind_results/multiscale_correc_cand/x1r_gate_closure/`
+- 实验矩阵：`x1r_gate_closure_experiment_manifest.csv`
+- 正式报告：`testdata_predict_output/x1r_gate_closure_test_final_selection.md`
+- 正式比较：`testdata_predict_output/x1r_gate_closure_test_variant_comparison.csv`
+- 训练完成标记：`x1r_gate_closure_training_bundle_complete.json`
+- 测试完成标记：`testdata_predict_output/x1r_gate_closure_test_bundle_complete.json`
+- 正式可视化 inventory：`testdata_predict_output/x1r_gate_closure_visual_inventory.csv`
+
+正式输出还包括 summary、horizon、regime、safety、calibration、candidate、
+complexity、controlled contrasts、Stage 5A candidate evidence、candidate invariants
+和 source reuse manifest。预测 marker 记录 36 张正式可视化；X1R 五场站 history
+以及宏、逐 horizon、逐场站、可靠性与安全图均已归档。
+
+---
+
+## 15. 跨阶段数据比较
+
+### 15.1 当前统一 seed 主线
 
 | 节点 | 结构 | Macro NRMSE | 参数量 | 相对上一关键节点 | 结论 |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -913,13 +1175,21 @@ fallback_t0_no_new_variant_passed_guards
 | B6 | 四专家动态模型 | 0.116939 | 885,395 | -3.98% vs B1 | 复杂完整参考 |
 | B2/R1 | Persistence + residual | 0.115700 | 18,416 | -1.06% vs B6 | 最优轻量主干 |
 | R4/F4 | 完整显式工况门控 | 0.113822 | 21,151 | -1.62% vs B2 | 显式工况有效 |
-| F7/G0/T0 | P+H+D 显式门控 | **0.113761** | 20,969 | -0.053% vs F4 | 当前正式最终 |
+| F7/G0/T0/D0/X0 | P+H+D 显式门控 | **0.113761** | 20,969 | -0.053% vs F4 | 当前正式最终 |
 | G1 | 因子化动态监督 | **0.113606** | 20,409 | -0.136% vs G0 | 数值最低但 ramp 不合格 |
 | T3 | 时频 candidate + 新 gate | 0.114492 | 24,697 | +0.642% vs T0 | candidate 改善未转化 |
+| D0R | T1 candidate + 重训 direct gate | 0.113721 | 24,121 | -0.0349% vs D0 | 数值小幅改善但仅 2/5 场站改善 |
+| X1-fixed-G0 | full X1 candidate + 原 G0 | 0.113691 | 24,177 | -0.0617% vs X0 | 诊断模型，不具备选择资格 |
+| X1R | full X1 + 新校准安全 gate | 0.114370 | 24,177 | +0.5353% vs X0 | 校准/安全更好但正式精度失败 |
 
-这张表不把 G1 标为最终最优，因为“指标最低”和“通过正式安全守门”是不同概念。
+这张表的 NRMSE 均为 fused 口径，不与 Stage 5A 的 corrected-candidate 主指标混排。
+G1、D0R、X1-fixed-G0 均不能标为最终最优，因为“数值最低”“具有正式选择资格”
+和“通过全部守门”是三个不同概念。
 
-### 12.2 当前最终模型相对关键基线
+Stage 5A candidate 应单列阅读：X0=0.116160、X1-F=0.115789、X1-M=0.115834、
+X1-C=0.115680、full X1=0.115705；形式化选择 X1-F，数值最低为 X1-C。
+
+### 15.2 当前最终模型相对关键基线
 
 | 对比 | NRMSE 变化 | 参数变化 | 可用结论 |
 | --- | ---: | ---: | --- |
@@ -931,7 +1201,7 @@ fallback_t0_no_new_variant_passed_guards
 
 ---
 
-## 13. 现行实验方案进度
+## 16. 现行实验方案进度
 
 | 工作包 | 代码 | 训练 | 预测/报告 | 最终结果 | 进度 |
 | --- | --- | --- | --- | --- | --- |
@@ -944,25 +1214,29 @@ fallback_t0_no_new_variant_passed_guards
 | Stage 3 G0–G4 | `wind_controlled_gate_cali_train.py` / `_predict.py` | G1–G3 新训 | 完整 | 回退 G0 | 完成 |
 | Stage 4 T0/M0/T1–T3 | `wind_time_freq_model_train.py` / `_predict.py` | M0–T3 新训 | 完整 | 回退 T0 | 完成 |
 | Stage 4 可视化补齐 | `wind_time_freq_model_visualize.py` | 不重训 | 79 张补图/复核矩阵 | manifest=complete | 完成 |
+| Stage 4B D0/D0R/D1–D3 | `wind_time_freq_model_stage4b_train.py` / `_predict.py` | D0 只读，D0R/D1–D3 共 20 个新模型 | 完整，67 张正式图 | 回退 D0 | 完成 |
+| Stage 5A X0/X1-F/M/C/X1 | `wind_multiscale_correc_cand_train.py` / `_predict.py` | X0 只读，四个 adapter 共 20 个新模型 | 完整，96 张正式图 | candidate 形式化选 X1-F；部署不变 | 完成 |
+| X1R 同 candidate 门控闭环 | `wind_multiscale_correc_cand_x1r_train.py` / `_predict.py` | 冻结 full X1，新训五站 gate | 完整，36 张正式图 | 回退 X0，X2/X3 未解锁 | 完成 |
 | 多 seed/K-fold | — | 未做 | — | 本轮明确暂缓 | 暂缓 |
 | 严格时序/新盲测 | — | 未做 | — | 本轮明确暂缓，但仍是论文风险 | 暂缓 |
-| 完整因果时频 residual | — | 未启动 | — | T0–T3 不支持立即扩大 | 条件待定 |
-| fine/mid/coarse + token 双向跨尺度 | — | 未实现 | — | 尚无启动证据 | 条件待定 |
+| 静态 fine/mid/coarse 表示 | Stage 5A 代码 | 已完成 | 完整 | candidate 小幅有效，未成为部署结构 | 完成 |
+| X2–X6 token 单/双向跨尺度 | — | 未训练 | — | X1R 守门失败，明确未解锁 | 停止 |
 
 ---
 
-## 14. 接下来实验的现行决策方案
+## 17. 接下来实验的现行决策方案
 
-### 14.1 当前不应直接做的事
+### 17.1 当前不应直接做的事
 
 - 不恢复四专家 top-k 稀疏路由；当前两候选结构不存在同样的负载均衡问题；
 - 不因为论文需要“第三个结构创新”直接训练完整时频跨尺度模型；
-- 不把 G2/G3/G4 或 T1–T3 的局部优点写成最终模型已实现的能力；
+- 不把 G2/G3/G4、T1–T3、X1 或 X1R 的局部优点写成最终模型已实现的能力；
+- 不启动 X2–X6；X1R 的预声明解锁条件已经明确失败；
 - 不在没有新证据时继续在 legacy-seen 测试集反复手工调阈值。
 
-### 14.2 下一步优先问题
+### 17.2 下一步优先问题
 
-下一步优先级不是继续扩大 candidate，而是定位并改善：
+原 Stage 4B→5A→X1R 路线已经把以下链路实际验证完毕：
 
 ~~~text
 candidate 增益
@@ -974,6 +1248,19 @@ oracle / gate 可辨识性
 dynamic / ramp 守门
 ~~~
 
+结论是：静态多尺度可以小幅改善 candidate，但现有二分类 soft-oracle 和
+calibrated-safe gate 会把模型推向大量稳定/低功率样本的 L1 收益，牺牲大变化
+样本的平方误差与 ramp。继续微调 X1R 或直接增加 token 交互，成功先验较低。
+
+现在有两条诚实路线：
+
+1. **以现有 X0 定稿并按专业型 Q2 投稿。** 补齐强基线、复杂度、统计和协议
+   证据，突出轻量结构、显式工况和完整负结果；
+2. **仍以 Q1 为目标，开启新的问题驱动方法线。** 不再围绕 X1R 调阈值，而是
+   先在设计用训练/验证数据验证 Persistence 残差对齐和工况条件化多步损失；
+   只有候选五站一致改善后才进入选择性 variable×patch 交互与收益幅度门控。
+   详见第 23 节 PARQ-Wind 预注册路线。
+
 任何 corrected candidate 的新结构都必须遵守：
 
 1. 训练集重建 soft oracle；
@@ -982,36 +1269,38 @@ dynamic / ramp 守门
 4. 同时报 candidate 和 fused 指标；
 5. 继续检查五场站、dynamic、ramp、regret、harm 和参数门槛。
 
-### 14.3 启动更完整 residual 的必要条件
+### 17.3 启动更完整 residual 的必要条件
 
-只有当新 candidate 同时满足以下条件，才进入下一结构阶段：
+任何未来新 candidate 同时满足以下条件，才进入下一结构阶段：
 
 - corrected 总体、dynamic、ramp 至少不退化，并有明确改善；
 - 改善不能只集中在 1–2 个场站；
 - 重新校准后，candidate 改善能转化为 fused NRMSE 改善；
 - Persistence 安全、ramp 和参数守门继续通过。
 
-当前 T3 只满足“corrected 有小幅宏改善”，不满足跨场站和 fused 条件。
+当前 T3 和 X1 只满足“corrected 有小幅宏改善”，X1R 不满足跨场站、fused、
+逐 horizon 和 dynamic/ramp 条件，因此不能继续扩展原 X 系列。
 
-### 14.4 若未来满足条件，fine/mid/coarse 的建议控制矩阵
+### 17.4 Stage 5B 原控制矩阵与当前状态
 
-以下是条件满足后才冻结编号的候选方案，不属于已完成实验：
+原控制矩阵及截至 2026-07-19 的实际状态如下：
 
-| 暂定对照 | 结构 | 要隔离的因果问题 |
-| --- | --- | --- |
-| X0 | 当前 T0/F7 | 最终基线 |
-| X1 | 轻量 fine/mid/coarse 历史表示，独立编码后静态融合 | 多尺度表示本身是否有效 |
-| X2 | X1 + coarse→fine 单向 token 交互 | 长趋势是否帮助局部 ramp |
-| X3 | X1 + fine→coarse 单向 token 交互 | 局部变化是否修正全局趋势 |
-| X4 | X1 + fine↔mid 双向交互 | 相邻尺度交互增量 |
-| X5 | X1 + mid↔coarse 双向交互 | 中长尺度交互增量 |
-| X6 | fine↔mid↔coarse token 级双向交互 | 真正跨尺度结构的联合增量 |
+| 对照 | 结构 | 要隔离的因果问题 | 当前状态 |
+| --- | --- | --- | --- |
+| X0 | 当前 D0/T0/F7 | 最终基线 | 完成，当前部署模型 |
+| X1-F/M/C/X1 | 单尺度或 fine/mid/coarse 独立编码后静态融合 | 多尺度表示本身是否有效 | 完成；candidate 小幅有效 |
+| X1R | full X1 candidate + candidate-specific 新 gate | 多尺度 candidate 收益能否闭环 | 完成；守门失败 |
+| X2 | X1 + coarse→fine 单向 token 交互 | 长趋势是否帮助局部 ramp | 未解锁 |
+| X3 | X1 + fine→coarse 单向 token 交互 | 局部变化是否修正全局趋势 | 未解锁 |
+| X4 | X1 + fine↔mid 双向交互 | 相邻尺度交互增量 | 未解锁 |
+| X5 | X1 + mid↔coarse 双向交互 | 中长尺度交互增量 | 未解锁 |
+| X6 | fine↔mid↔coarse token 级双向交互 | 真正跨尺度结构的联合增量 | 未解锁 |
 
-该矩阵必须共享参数预算、初始化、candidate 训练和 gate 重校准协议。若 X1 都
-不能改善 candidate，则不应训练 X2–X6；若单向交互无效，也不应直接以 X6
-替代全部父子对照。
+原协议要求 X1R 全部通过才只先解锁 X2/X3。实际 marker 已记录
+`stage5b_x2_x3_unlocked=false`，所以 X2–X6 全部停止；不得以 X1 candidate
+有效为由绕过 fused 闭环，也不得直接用 X6 替代父子对照。
 
-### 14.5 为冲击一区仍需补强但当前被暂缓的证据
+### 17.5 为冲击一区仍需补强但当前被暂缓的证据
 
 | 证据 | 当前状态 | 投稿风险 |
 | --- | --- | --- |
@@ -1028,23 +1317,23 @@ dynamic / ramp 守门
 
 ---
 
-## 15. 工程复现、冒烟测试和故障修复记录
+## 18. 工程复现、冒烟测试和故障修复记录
 
-### 15.1 固定随机种子
+### 18.1 固定随机种子
 
 2026-07-11 起，FeTS-PatchTST 相关训练统一固定 `seed=2026`：
 
 - 场站构模前重置 Python、NumPy、TensorFlow/Keras 随机状态；
 - 请求 deterministic ops；
 - Stage 1 的共同同名分支也从同一 seed 初始化；
-- Stage 2–4 artifact 均记录 seed。
+- Stage 2–5/X1R artifact 均记录 seed。
 
 这提高同环境复现性，但不保证跨 TensorFlow、CUDA、cuDNN 和硬件逐位一致。
 
-### 15.2 Batch size 与冒烟测试
+### 18.2 Batch size 与冒烟测试
 
 原生 `wind_dl_model_train.py` 默认 batch=256，完整 FeTS 模型曾经 OOM。正式
-Stage 1 的 40 个 artifact 均记录 batch=192，Stage 2–4 直接以 192 为默认或
+Stage 1 的 40 个 artifact 均记录 batch=192，Stage 2–5/X1R 直接以 192 为默认或
 协议校验值。
 
 单场站、单 epoch 冒烟测试的作用是验证：
@@ -1058,7 +1347,7 @@ Stage 1 的 40 个 artifact 均记录 batch=192，Stage 2–4 直接以 192 为�
 因此正式统一使用 192 是合理选择。代码中的 save/load smoke test 另用于验证
 `.keras` 和自定义层重载一致性，两者不是同一个测试。
 
-### 15.3 Feature archive 与 CSV 不一致报错
+### 18.3 Feature archive 与 CSV 不一致报错
 
 原报错：
 
@@ -1083,7 +1372,7 @@ Stage 1 的 40 个 artifact 均记录 batch=192，Stage 2–4 直接以 192 为�
 
 修复后 FP0/FP4 五站 scaled candidate 位级一致，Frozen-Pair 验收全部通过。
 
-### 15.4 G0 跨运行时重建容差报错
+### 18.4 G0 跨运行时重建容差报错
 
 终端 NUMA 提示只是 WSL/内核缺少 NUMA 信息的 TensorFlow informational log；
 日志随后已正常创建 RTX 3080 Ti Laptop GPU 并加载 cuDNN，不是异常根因。
@@ -1108,7 +1397,7 @@ CUDA kernel 在极少数长 horizon 点产生尾差，最大值略超旧 `5e-5`�
 
 修复后五站最大差约 `0.85e-7–1.11e-7`，超过旧 `5e-5` 的点数均为 0。
 
-### 15.5 时频可视化补齐
+### 18.5 时频可视化补齐
 
 原 `wind_time_freq_model_train.py` 只保存 candidate/gate history CSV、
 checkpoint 和 hash marker，没有调用绘图函数。为避免修改已被 bundle hash
@@ -1135,9 +1424,39 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 - `wind_results/time_freq_model/<m0|t1|t2|t3>/testdata_predict_output/figures/`
 - `wind_results/time_freq_model/testdata_predict_output/figures/`
 
+### 18.6 Stage 5A 上游 complete marker 报错与代码变化量解释
+
+首次运行 `wind_multiscale_correc_cand_train.py` 曾报：
+
+~~~text
+FileNotFoundError: 缺少上游complete marker:
+.../stage4b_gate_closure_test_bundle_complete.json
+~~~
+
+根因是依赖校验过严：Stage 5A **训练**只消费 Stage 4B 的训练 bundle，用它重建
+冻结 F7 candidate；正式重跑 Stage 4B 训练会有意使旧预测 marker 失效，而 Stage 5A
+训练并不读取 Stage 4B 测试预测。把预测 complete marker 作为训练前置条件，会
+错误阻塞一个数据依赖完整的训练流程。
+
+修复后：
+
+- Stage 5A 训练强制校验 Stage 4B training marker 及关键文件 hash；
+- 若 prediction marker 存在，则继续校验它锁定当前 training marker；
+- 若 prediction marker 暂缺，只打印提示并允许训练；
+- Stage 5A **预测/测试选型**仍强制要求先运行
+  `wind_time_freq_model_stage4b_predict.py`，发布与当前训练 marker 匹配的正式
+  Stage 4B prediction bundle。
+
+当时看到训练文件“新增约 77 行、删除 2 行”、预测文件“新增约 55 行、删除
+2 行”，是相对已经生成的 Stage 5A 初版代码的修复差异，不是整个新模型只有这
+些代码。Stage 5A 复用了已有 F7 candidate、数据滑窗、工况 context、G0 回放、
+归一化、指标、绘图和 bundle 审计，只新增轻量 scale adapter 和实验编排；这种
+受控复用正是为了隔离“多尺度表示”变量。模型新颖性应由实际计算图、参数和
+父子消融判断，不能由单次 Git diff 行数判断。
+
 ---
 
-## 16. 各阶段正式数据路径总索引
+## 19. 各阶段正式数据路径总索引
 
 | 阶段 | 首选分析文件 | 最终选择 | 完成标记/主目录 |
 | --- | --- | --- | --- |
@@ -1149,16 +1468,20 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 | Stage 3 G | `wind_results/controlled_gate_cali/testdata_predict_output/controlled_gate_cali_test_final_selection.md` | G0 | `wind_results/controlled_gate_cali/testdata_predict_output/controlled_gate_cali_test_bundle_complete.json` |
 | Stage 4 T | `wind_results/time_freq_model/testdata_predict_output/time_freq_model_test_final_selection.md` | T0 | `wind_results/time_freq_model/testdata_predict_output/time_freq_model_test_bundle_complete.json` |
 | Stage 4 可视化 | `wind_results/time_freq_model/time_freq_model_visualization_backfill_inventory.csv` | 79 张补图完成 | `wind_results/time_freq_model/time_freq_model_visualization_backfill_manifest.json` |
+| Stage 4B D | `wind_results/time_freq_model/supplement_round2_stage4b_gate_closure/testdata_predict_output/stage4b_gate_closure_test_final_selection.md` | D0；D0R 仅数值小幅最低 | `wind_results/time_freq_model/supplement_round2_stage4b_gate_closure/testdata_predict_output/stage4b_gate_closure_test_bundle_complete.json` |
+| Stage 5A X | `wind_results/multiscale_correc_cand/testdata_predict_output/multiscale_correc_cand_test_final_selection.md` | candidate 形式化选 X1-F；X1-C 数值最低 | `wind_results/multiscale_correc_cand/testdata_predict_output/multiscale_correc_cand_test_bundle_complete.json` |
+| X1R 闭环 | `wind_results/multiscale_correc_cand/x1r_gate_closure/testdata_predict_output/x1r_gate_closure_test_final_selection.md` | 回退 X0，X2–X6 未解锁 | `wind_results/multiscale_correc_cand/x1r_gate_closure/testdata_predict_output/x1r_gate_closure_test_bundle_complete.json` |
 
 读取测试性能时应优先看各阶段 `variant_comparison.csv` 或
 `final_selection.md`，不要只看单个场站预测 CSV，也不要用验证集文件替代用户
-要求的测试集选型结论。
+要求的测试集选型结论。Stage 5A 的正式主指标是 corrected candidate；Stage 4B
+和 X1R 的正式主指标是 fused。两种口径不能直接混排。
 
 ---
 
-## 17. 论文写作建议与结论边界
+## 20. 论文写作建议与结论边界
 
-### 17.1 建议的论文贡献顺序
+### 20.1 建议的论文贡献顺序
 
 1. **Persistence-centered lightweight corrective forecaster**
    用 Persistence 作为物理低方差锚点，以 18,416 参数的轻量因果 residual
@@ -1170,32 +1493,39 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 
 3. **Candidate-controlled interpretation and safety evaluation**
    用 Frozen-Pair 控制 candidate drift，并用 oracle、Brier/ECE、regret、
-   harm、ramp、低功率和 Persistence abstention 系统分析门控可靠性。
+   harm、ramp、低功率和 Persistence abstention 系统分析门控可靠性；Stage 4B
+   与 X1R 进一步用同 candidate 闭环分离候选和 gate 效应。
 
 第三点更适合表述为“评价与机制验证贡献”，而不是最终部署结构已经通过的安全
 模块。
 
-### 17.2 可以写入正文的结果
+### 20.2 可以写入正文的结果
 
 - B2 相对 B6 的精度—复杂度优势；
 - R4 相对 R2/R3 的显式工况增益和样本门控变化；
 - F0–F8 与 FP0/FP4 对 P/H/M/D/C 的直接归因；
 - F7 相对 B0/B1/B2/B6 的总体、逐场站和复杂度比较；
 - G0–G4 的校准—安全—精度 Pareto 及 ramp 失败原因；
-- T0–T3 的 candidate/fused 分离结果，作为为何不继续堆叠时频模块的否定消融。
+- T0–T3 的 candidate/fused 分离结果，作为为何不继续堆叠时频模块的否定消融；
+- D0–D3 的 candidate-specific oracle/Q90 闭环以及新 gate 未转化 T1 收益；
+- X1-F/M/C/X1 的静态多尺度 candidate 消融，明确 X1-C 数值最低、X1-F 是
+  预声明 tie-band 下的形式化选择；
+- X1R 在相同 full-X1 candidate 下校准/安全显著改善、但 NRMSE 与 dynamic/ramp
+  失败的 L1—L2—尾部权衡。
 
-### 17.3 不能写成已证实的主张
+### 20.3 不能写成已证实的主张
 
 - “四专家 FeTS-PatchTST 中每个专家都必要”；
 - “最终模型使用防塌缩动态稀疏路由”；
 - “C 物理一致性特征有效”；
 - “辅助工况任务提升了预测”；
 - “最终模型具有通过精度门槛的校准安全保护”；
-- “因果时频增强或 token 级跨尺度交互提升了最终预测”；
+- “因果时频增强或静态/Token 级跨尺度交互提升了最终部署预测”；
+- “最终模型采用 X1-F、full X1 或 X1R”；
 - “多 seed 稳定”“严格在线因果”“独立盲测”“未见场站泛化”；
 - “所有指标都优于全部基线”。
 
-### 17.4 对 SCI 一区创新充分性的最终评估
+### 20.4 对 SCI 一区创新充分性的最终评估
 
 与最初复杂 HR-MoE 相比，当前论文故事更清晰、可归因且更符合近期趋势：
 
@@ -1207,22 +1537,26 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 - 有校准和安全诊断；
 - 有失败结构的否定证据。
 
-但当前更像“**有一区潜力的方法与完整内部消融**”，还不是“证据已经足以稳定
-支撑一区”的状态。最大短板不是模型名字不够复杂，而是：
+Stage 4B、Stage 5A 和 X1R 增加了很强的归因与失败分析，但没有改变最终结构：
+部署模型仍是 20,969 参数的 X0/F7。结合 2026 同领域工作，当前结构新颖性约为
+JCR Q2，内部诊断深度接近 Q1 边缘；单 seed 和测试集反复选型又给最终证据带来
+Q3 风险。整体最现实的定位是 **专业型 JCR Q2**，不是稳定 Q1。最大短板不是
+模型名字不够复杂，而是：
 
 1. 最终 F7 的增量部分较小；
-2. G/T 新结构没有晋级最终模型；
+2. G/T/D/X 新结构都没有晋级最终部署模型；
 3. 测试集被用于选型；
 4. 缺少多 seed、严格时间外推和外部/未见场站证据；
 5. 统一硬件效率和近期强基线仍不完整。
 
-因此，若严格维持现有评价协议且不补泛化证据，更稳妥的预期是 SCI 二区到一区
-边缘；若补齐独立时序泛化、统计稳定性、同协议强基线，并保持 F7 的轻量优势，
-则更有条件冲击一区。该判断是创新和证据强度评估，不是对期刊录用的保证。
+因此，若严格维持现有模型与评价协议，建议按 Q2 定位；若仍坚持冲击 Q1，应先
+产生一个能在五场站、NRMSE/NMAE、dynamic/ramp 和逐 horizon 上闭环的新增核心
+机制，再补独立时序泛化、统计稳定性、同协议强基线和效率证据。第 23 节给出
+问题驱动的新路线。该判断是创新和证据强度评估，不是对期刊录用的保证。
 
 ---
 
-## 18. 代码入口
+## 21. 代码入口
 
 | 工作 | 训练 | 预测/分析 |
 | --- | --- | --- |
@@ -1233,12 +1567,208 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 | Stage 3 | `wind_controlled_gate_cali_train.py` | `wind_controlled_gate_cali_predict.py` |
 | Stage 4 | `wind_time_freq_model_train.py` | `wind_time_freq_model_predict.py` |
 | Stage 4 补图 | — | `wind_time_freq_model_visualize.py` |
+| Stage 4B 门控闭环 | `wind_time_freq_model_stage4b_train.py` | `wind_time_freq_model_stage4b_predict.py` |
+| Stage 5A 多尺度 candidate | `wind_multiscale_correc_cand_train.py` | `wind_multiscale_correc_cand_predict.py` |
+| X1R 门控闭环 | `wind_multiscale_correc_cand_x1r_train.py` | `wind_multiscale_correc_cand_x1r_predict.py` |
 
 ---
 
-## 19. 参考资料
+## 22. 现有方案的投稿定位与建议
 
-### 19.1 项目结构来源
+### 22.1 当前最现实的定位
+
+按截至 2026-07-19 已完成的结构和证据，建议把现有论文定位为专业型 **SCI/JCR
+Q2**：方法线清楚、工程和内部消融完整，但最终部署结构仍是 X0，新增时频、
+静态多尺度与校准安全门控都没有在正式 NRMSE 守门下晋级。若不补新的盲测、
+多 seed、外部数据和同协议强基线，不宜把“冲击 Q1”写成高把握判断。
+
+期刊分区会随年份、学科类别和机构口径变化；以下排序是研究主题与当前证据的
+**相对匹配度**，不是录用概率承诺，投稿当年必须重新核验 JCR/中科院分区、
+开放获取费用和最新 scope。
+
+### 22.2 三本相对匹配的投稿期刊
+
+| 顺序 | 期刊 | 与现方案的匹配点 | 投稿前应重点补强 |
+| --- | --- | --- | --- |
+| 1 | [IET Renewable Power Generation](https://ietresearch.onlinelibrary.wiley.com/journal/17521424) | 风电功率预测、电力系统运行、轻量部署和真实场站数据直接匹配 | 强化 ramp、可靠性、工程价值、同协议强基线和统计检验 |
+| 2 | [Wind Energy](https://onlinelibrary.wiley.com/journal/10991824) | 风电主题最集中，P/H/D、Persistence 与容量归一化容易形成领域叙事 | 避免写成通用网络拼装，强化风电物理解释和场站泛化 |
+| 3 | [Energy Reports](https://www.sciencedirect.com/journal/energy-reports) | 能源/电力应用范围较宽，能容纳轻量预测与系统实验 | 仍有 desk-reject 风险；需压缩庞杂实验并突出清晰主贡献 |
+
+### 22.3 按现有 X0 定稿的论文结构
+
+1. Introduction：超短期风电非平稳、Persistence 强基线及复杂模型部署问题；
+2. Related Work：Patch/Transformer、物理先验、工况门控、可靠性评价；
+3. Problem and Protocol：96→16、五场站、容量归一化和 `legacy_seen` 边界；
+4. Method：轻量 causal residual、P+H+D 显式编码、sample×horizon 融合；
+5. Controlled Development：B/R/F/FP 直接父子消融与 candidate drift；
+6. Main Results：总体、逐场站、逐 horizon、复杂度及强基线；
+7. Reliability and Negative Ablations：G/T/D/X、校准、安全、ramp 和闭环失败；
+8. Limitations：单 seed、测试选型、非严格在线插值、无未见场站；
+9. Conclusion。
+
+---
+
+## 23. 继续冲击一区的下一代方法与预注册路线
+
+### 23.1 为什么不再继续微调 X1R 或直接训练 X2–X6
+
+X1R 已经证明当前瓶颈不是“gate 不够校准”：它把 Brier、ECE、regret、harm 和
+饱和率大幅改善，却同时让 16 个 horizon 的 NRMSE 全部退化，并伤害 dynamic、
+ramp 和大变化样本。继续调 `calibration/safety` 权重很可能只在 L1、小误差与
+L2、尾部之间移动 Pareto 点。静态 X1 candidate 的收益又只有约 0.4%，不足以
+支持直接增加完整 token 交互。
+
+因此下一代路线必须先解决两个更基础的问题：
+
+1. corrected residual 是否学到了 Persistence **失效时未来 16 步残差的形态**；
+2. 训练目标是否显式处理 NRMSE/NMAE、跨 horizon 误差相关和 ramp 尾部。
+
+下面的 `PARQ-Wind` 是 2026 顶会时序思想经风电任务改造后的**研究假设**，尚未
+实现，不能写入当前论文已完成贡献，也不能预先保证五个测试集全部提升。
+
+### 23.2 拟议方法：PARQ-Wind
+
+拟议全名：**Persistence-Anchored Residual Alignment and Regime-conditioned
+Quadratic Routing for Wind Power Forecasting**。保持纯数值时序、非多模态。
+
+#### 23.2.1 Persistence 锚定的未来残差对齐
+
+定义训练期真值残差 `r*=Y-P` 与候选残差 `r_hat=C-P`，由只在训练期可见未来
+真值的 stop-gradient teacher 提供分布关系，推理时完全删除 teacher：
+
+- local alignment：把未来 16 步分为四个 1 h patch，强调局部 ramp 形态；
+- global alignment：对齐完整 4 h 残差轨迹及跨 patch 关系；
+- 由 P+H+D 工况权重决定局部/全局对齐强度。
+
+思想来源于 ICLR 2026
+[TimeAlign: Bridging Past and Future—Distribution-Aware Alignment for Time Series Forecasting](https://iclr.cc/virtual/2026/poster/10007329)。
+风电化改造不是直接对齐原始序列，而是对齐 **Persistence 何时失效、失效幅度
+和 ramp 轨迹**，因此仍保留工程物理锚点。
+
+#### 23.2.2 工况条件化多步二次目标
+
+借鉴 ICLR 2026
+[Quadratic Direct Forecast](https://iclr.cc/virtual/2026/poster/10006776)，用
+P+H+D 软工况生成半正定 16×16 horizon 矩阵：
+
+~~~text
+W(z) = Σ_k π_k(z) L_k L_kᵀ + εI
+L = eᵀW(z)e + λ1 SmoothL1(e) + λr Huber(Δŷ-Δy)
+~~~
+
+- 非均匀对角项学习不同 horizon 难度；
+- 非对角项学习 16 步误差相关与连续轨迹；
+- stable/dynamic/ramp 三类基矩阵由软工况混合；
+- SmoothL1 保持 NMAE，差分项直接约束 ramp，二次项对应 NRMSE/尾部。
+
+这比 X1R 的“corrected 是否胜过 Persistence”二分类 oracle 更直接地优化多指标
+目标错配。
+
+#### 23.2.3 风电物理分组的 variable×patch 选择性交互
+
+只有残差对齐和 QDF 已经形成五场站一致 candidate 收益时才启动。将 45 个变量
+按功率、轮毂风速、多高度风速、风向和其它气象分组，构造 variable×patch 二维
+token 场：
+
+- 局部 depthwise 2D 交互捕获同一时间邻域的物理变量组合；
+- 图谱低/中/高频分解做 patch 级选择，而不是三个尺度池化后静态拼接；
+- 只预测 `C-P` 的增量，不破坏 Persistence 锚点；
+- 每个方向/频带设置直接父子消融和路由可视化。
+
+思想来源于 ICLR 2026
+[xCPD: Routing Channel-Patch Dependencies with Graph Spectral Decomposition](https://iclr.cc/virtual/2026/poster/10006906)
+和 [VPNet](https://openreview.net/forum?id=CNVL194fO5)。相对 Stage 5A 的核心变化
+是输入依赖的 patch/变量选择与真实 token 交互，而非静态 concat。
+
+#### 23.2.4 收益幅度门控与 Persistence 保护
+
+将二分类 oracle 改为多目标反事实收益：
+
+~~~text
+u = α(e_P²-e_C²) + β(|e_P|-|e_C|) + γ(R_P-R_C)
+target_gate = sigmoid(u / τ)
+~~~
+
+其中 `R` 是 ramp/一阶差分损失。gate 学习“corrected 能改善多少”，而不是只学
+“corrected 是否略好”；再用收益不确定性和逐 horizon Q90 决定何时回退
+Persistence。目标是避免 X1R 在大量稳定样本上获得漂亮校准，却对 dynamic/ramp
+过度保守。
+
+### 23.3 Stage A：优先验证残差对齐与多步目标
+
+| 编号 | 结构 | 研究问题 |
+| --- | --- | --- |
+| A0 | X0 | 当前父基线 |
+| A1 | X0 + regime-QDF | 多步相关目标是否独立有效 |
+| A2 | X0 + local residual alignment | 是否改善局部 ramp 形态 |
+| A3 | X0 + global residual alignment | 是否改善 4 h 整体轨迹 |
+| A4 | X0 + local + global alignment | 两层对齐是否互补 |
+| A5 | A4 + regime-QDF | 推荐的第一版 Q1 candidate |
+
+Stage A 只使用设计用训练/验证数据选择，不再查看五个 legacy-seen test 调参。
+A5 进入 Stage B 前建议同时满足：
+
+- 5/5 场站验证 NRMSE 严格改善；
+- 5/5 场站 NMAE 不退化，理想状态均严格改善；
+- Macro NRMSE、NMAE 均至少改善 0.5%；
+- dynamic、ramp-up、ramp-down、`change_ge_20` 均不退化；
+- 无连续 horizon 系统退化；参数尽量保持约 30k。
+
+### 23.4 Stage B：条件启动选择性 variable×patch 交互
+
+| 编号 | 结构 | 作用 |
+| --- | --- | --- |
+| B0 | A5 | 新 candidate 父基线 |
+| B1 | A5 + 物理分组局部 variable×patch | 隔离局部跨变量关系 |
+| B2 | A5 + 图谱频带路由 | 隔离低/中/高频选择 |
+| B3 | A5 + 二者 | 检验局部与图谱选择互补 |
+
+若 B1/B2 的 corrected candidate 不能形成五场站一致改善，则停止，不扩展 B3
+或更大的双向结构。参数预算、初始化和训练步必须受控。
+
+### 23.5 Stage C：candidate→fused 收益闭环
+
+| 编号 | 结构 | 研究问题 |
+| --- | --- | --- |
+| C0 | 最优 candidate + 旧 G0 | 旧 gate 的直接转化能力 |
+| C1 | 收益幅度门控 | 多指标收益是否优于二分类 oracle |
+| C2 | C1 + calibration | 校准是否在不损精度下增益 |
+| C3 | C2 + Persistence safety | 高风险样本能否安全回退 |
+
+每次 candidate 改变都必须重新生成 train-only oracle/utility 和逐 horizon Q90、
+重新训练 gate、验证 candidate identity。建议要求 fused 至少转化 candidate NRMSE
+收益的 50%，五场站 NRMSE/NMAE 不退化，并通过 dynamic/ramp、regret/harm、
+Brier/ECE 和参数守门。
+
+### 23.6 一区确认性证据
+
+当前五个测试集已是 `legacy_seen_test_selected`，不能再承担确认性评价。新路线
+即使验证成功，投稿前仍至少需要：
+
+- 新的未触碰时间 holdout、rolling-origin 或外部公开数据；
+- 至少 3 seeds、均值±标准差、配对 block bootstrap/置信区间；
+- 同协议 PatchTST、iTransformer、TimesNet、TimeMixer 等近期强基线；
+- overall、五场站、逐 horizon、dynamic/ramp/大变化与过估风险；
+- 参数量、FLOPs、延迟、吞吐、峰值显存和 candidate→fused 转化率；
+- 训练期 teacher 与推理期输入的泄漏审计。
+
+### 23.7 若新路线成功，一区论文大致结构
+
+1. Introduction：Persistence 工况失效、历史—未来残差分布差和多步误差相关；
+2. Related Work：物理/数据融合、工况门控、时频/patch、分布对齐、多步目标；
+3. Problem Formulation：96→16、Persistence residual、工况与无未来信息推理约束；
+4. PARQ-Wind：residual alignment、regime-QDF、选择性交互、收益安全门控；
+5. Experimental Protocol：新 holdout/公开数据、强基线、多 seed、统计与复杂度；
+6. Main Results：总体、五场站、逐 horizon、dynamic/ramp、外部泛化；
+7. Ablation and Mechanism：A/B/C 矩阵、QDF、频带路由、candidate→fused；
+8. Reliability and Deployment：Brier/ECE、regret/harm、过估风险和资源；
+9. Limitations and Conclusion。
+
+---
+
+## 24. 参考资料
+
+### 24.1 项目结构来源
 
 - [PatchTST: A Time Series is Worth 64 Words](https://arxiv.org/abs/2211.14730)
 - [PatchTST official repository](https://github.com/yuqinie98/PatchTST)
@@ -1248,9 +1778,10 @@ M0 candidate 是冻结 F7，T0 本轮没有训练，脚本不会伪造不存在�
 - [LayerScale/CaiT](https://openaccess.thecvf.com/content/ICCV2021/papers/Touvron_Going_Deeper_With_Image_Transformers_ICCV_2021_paper.pdf)
 
 FeTS、M2FMoE 和 LayerScale 只说明设计思想来源；是否对本项目有效必须由本项目
-直接消融决定。当前最终 T0/G0/F7 已不包含完整 FeTS 和四专家 M2FMoE 结构。
+直接消融决定。当前最终 X0/D0/T0/G0/F7 已不包含完整 FeTS、PatchTST encoder
+和四专家 M2FMoE 结构。
 
-### 19.2 2025–2026 风电预测代表论文
+### 24.2 2025–2026 风电预测代表论文
 
 - [Physics-constrained wind power forecasting aligned with probability distributions for noise-resilient deep learning](https://doi.org/10.1016/j.apenergy.2025.125295)
 - [Non-stationary GNNCrossformer](https://doi.org/10.1016/j.apenergy.2024.124492)
@@ -1261,3 +1792,19 @@ FeTS、M2FMoE 和 LayerScale 只说明设计思想来源；是否对本项目有
 - [A time-frequency adaptive transformer for long-term wind power forecasting under complex meteorological fluctuations](https://doi.org/10.1016/j.eswa.2026.131740)
 - [STWFormer](https://doi.org/10.1016/j.epsr.2026.113061)
 - [Virtual prediction and wavelet packet transform for short-term wind power forecasting](https://doi.org/10.1016/j.epsr.2025.112640)
+- [A physics-aware dynamic graph and mixture-of-experts framework for wind power forecasting](https://www.sciencedirect.com/science/article/pii/S0142061526002115)
+- [A novel hybrid short-term and ultra-short-term wind power forecasting method based on Weather Research and Forecasting: WRF-iTransformer-PSO](https://doi.org/10.1016/j.energy.2026.140955)
+- [Ultra-short-term wind power prediction for enhanced reliability considering error distribution characteristics and guided correction](https://doi.org/10.1016/j.energy.2026.141397)
+- [A cross-dataset benchmark for neural network-based wind power forecasting](https://doi.org/10.1016/j.renene.2025.123463)
+
+### 24.3 2026 时序预测方法启发
+
+- [TimeAlign: Bridging Past and Future—Distribution-Aware Alignment for Time Series Forecasting](https://iclr.cc/virtual/2026/poster/10007329)
+- [Quadratic Direct Forecast for Training Multi-Step Time-Series Forecast Models](https://iclr.cc/virtual/2026/poster/10006776)
+- [xCPD: Routing Channel-Patch Dependencies in Time Series Forecasting with Graph Spectral Decomposition](https://iclr.cc/virtual/2026/poster/10006906)
+- [VPNet](https://openreview.net/forum?id=CNVL194fO5)
+- [TimeRecipe](https://iclr.cc/virtual/2026/poster/10010822)
+- [ProtoTS](https://iclr.cc/virtual/2026/poster/10010284)
+
+上述顶会思想只用于提出下一轮研究假设。任何风电化改造必须由 A/B/C 直接父子
+消融和新的确认性评价证明，不能因为引用了顶会模块就自动构成一区创新。
