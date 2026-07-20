@@ -1131,10 +1131,23 @@ def _prepare_source(train_file):
 
 
 def _history_frame(histories):
+    # ``ReduceLROnPlateau`` injects ``lr`` into the objective-phase logs, while
+    # the teacher warm-up has no such callback metadata.  Keeping that key in a
+    # rectangular DataFrame makes pandas create structural NaNs for all warm-up
+    # rows, even though every metric produced by both fits is finite.  Learning
+    # rate is not a model metric and is not used by the three-panel history plot,
+    # so exclude callback-only telemetry before concatenating phases.  Genuine
+    # non-finite values are still rejected for each History object by
+    # ``ensure_finite_training_history`` immediately after ``fit``.
+    callback_metadata_keys = {"lr", "learning_rate"}
     frames = []
     offset = 0
     for phase, history in histories:
-        values = dict(history.history)
+        values = {
+            key: value
+            for key, value in history.history.items()
+            if key not in callback_metadata_keys
+        }
         length = max((len(value) for value in values.values()), default=0)
         frame = pd.DataFrame({key: list(value) for key, value in values.items()})
         frame.insert(0, "phase_epoch", np.arange(1, length + 1))
@@ -1508,10 +1521,15 @@ def _train_variant_for_farm(
     elapsed = float(time.monotonic() - start)
 
     history_frame = _history_frame(histories)
-    if history_frame.empty or not np.isfinite(
-        history_frame.select_dtypes(include=[np.number]).to_numpy()
-    ).all():
-        raise ValueError(f"{variant_id}/{farm_id} history为空或包含非有限值")
+    if history_frame.empty:
+        raise ValueError(f"{variant_id}/{farm_id} history为空")
+    numeric_history = history_frame.select_dtypes(include=[np.number])
+    finite_by_column = np.isfinite(numeric_history.to_numpy()).all(axis=0)
+    if not finite_by_column.all():
+        bad_columns = numeric_history.columns[~finite_by_column].tolist()
+        raise ValueError(
+            f"{variant_id}/{farm_id} history包含非有限值: columns={bad_columns}"
+        )
     _atomic_to_csv(history_frame, paths["history"])
     _plot_history(
         history_frame,
