@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import os
 import re
 import warnings
@@ -83,6 +84,10 @@ from wind_dl_other_models_train import (
     seed,
     set_global_seed,
 )
+from wind_RegimeEncoder_PatchTST_feature_screen_train import (
+    build_feature_screen_model,
+    get_feature_screen_custom_objects,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -91,11 +96,28 @@ TEST_FILE_PATTERN = 'wind_test_*.csv'
 TIME_COL = '时间'
 PATCHTST_MODEL_NAME = 'patchtst'
 FETS_PATCHTST_MODEL_NAME = 'fets_patchtst'
+PART3_ROUND2_STRONG_BASELINE_MODEL_NAME = (
+    'part3_round2_f7_g0_strong_baseline'
+)
+PART3_ROUND2_STRONG_BASELINE_VARIANT_ID = 'sb_f7_g0_bs256'
+PART3_ROUND2_STRONG_BASELINE_EXPERT_NAMES = (
+    'persistence',
+    'corrected',
+)
+PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT = os.path.join(
+    './wind_results',
+    'part3_new_module_supplement',
+    '02_strong_baseline_f7_g0_fair_training',
+)
 PATCHTST_LEGACY_ROUND2_DIR = os.path.join(PATCHTST_RESULT_DIR, '第2轮训练结果')
 ALL_MODEL_NAMES = [
     PATCHTST_MODEL_NAME,
     FETS_PATCHTST_MODEL_NAME,
-] + OTHER_MODEL_NAMES
+] + OTHER_MODEL_NAMES + [PART3_ROUND2_STRONG_BASELINE_MODEL_NAME]
+LEGACY_STRONG_COMPARISON_MODEL_NAMES = tuple(
+    [PATCHTST_MODEL_NAME, FETS_PATCHTST_MODEL_NAME] + OTHER_MODEL_NAMES
+)
+STRONG_COMPARISON_EXPECTED_FARM_COUNT = 5
 OUTPUT_SUBDIR = 'testdata_predict_output'
 PRED_BATCH_SIZE = max(
     256,
@@ -352,7 +374,13 @@ def get_requested_model_names():
 
 
 def model_output_dirs(model_name):
-    output_dir = os.path.join(BASE_RESULT_DIR, model_name, OUTPUT_SUBDIR)
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        output_dir = os.path.join(
+            PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT,
+            OUTPUT_SUBDIR,
+        )
+    else:
+        output_dir = os.path.join(BASE_RESULT_DIR, model_name, OUTPUT_SUBDIR)
     dirs = {
         'root': output_dir,
         'predictions': os.path.join(output_dir, 'predictions'),
@@ -442,6 +470,187 @@ def get_custom_objects():
     }
 
 
+def get_part3_round2_strong_baseline_custom_objects():
+    """Return the F7/G0 objects without changing legacy model deserialization."""
+    return get_feature_screen_custom_objects()
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_part3_round2_strong_baseline_artifact(artifact, artifact_path):
+    """Reject protocol drift before adding the retrained F7/G0 to baselines."""
+    required = (
+        'model_name',
+        'variant_id',
+        'farm_id',
+        'training_mode',
+        'initialization_mode',
+        'warm_start',
+        'loaded_pretrained_weights',
+        'batch_size',
+        'input_cols',
+        'target_index',
+        'scaler_x',
+        'scaler_y',
+        'history_len',
+        'forecast_len',
+        'power_scale_ratio',
+        'power_scale_offset',
+        'regime_feature_config',
+        'model_path',
+        'best_weights_path',
+        'diagnostic_layers',
+        'expert_names',
+        'primary_prediction_output',
+        'epochs',
+        'validation_split',
+        'learning_rate',
+        'optimizer',
+        'clipnorm',
+        'candidate_supervision_loss_weight',
+        'early_stopping_monitor',
+        'checkpoint_monitor',
+        'early_stopping_patience',
+        'reduce_lr_patience',
+        'reduce_lr_factor',
+        'minimum_learning_rate',
+        'model_sha256',
+        'best_weights_sha256',
+    )
+    missing = [key for key in required if key not in artifact]
+    if missing:
+        raise KeyError(
+            f'第三部分第二轮 artifact缺少字段 {missing}: {artifact_path}'
+        )
+    if artifact['model_name'] != PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        raise ValueError(
+            f'第三部分第二轮 model_name不匹配: '
+            f"{artifact['model_name']}"
+        )
+    if artifact['variant_id'] != PART3_ROUND2_STRONG_BASELINE_VARIANT_ID:
+        raise ValueError(
+            f'第三部分第二轮 variant_id不匹配: '
+            f"{artifact['variant_id']}"
+        )
+    if artifact['training_mode'] != 'single_stage_from_scratch_fair_protocol':
+        raise ValueError(
+            '强基线必须由单阶段from-scratch协议产生，'
+            f"实际为 {artifact['training_mode']}"
+        )
+    if (
+        artifact['initialization_mode'] != 'from_scratch'
+        or bool(artifact['warm_start'])
+        or bool(artifact['loaded_pretrained_weights'])
+    ):
+        raise ValueError(
+            '强基线不允许旧B2/F7权重初始化: '
+            f"initialization={artifact['initialization_mode']}, "
+            f"warm_start={artifact['warm_start']}, "
+            f"loaded_pretrained_weights={artifact['loaded_pretrained_weights']}"
+        )
+    if int(artifact['batch_size']) != 256:
+        raise ValueError(
+            '强基线协议要求 batch_size=256，'
+            f"实际为 {artifact['batch_size']}"
+        )
+    if int(artifact['history_len']) != HISTORY_LEN:
+        raise ValueError(
+            f'强基线历史长度必须为{HISTORY_LEN}: '
+            f"{artifact['history_len']}"
+        )
+    if int(artifact['forecast_len']) != FORECAST_LEN:
+        raise ValueError(
+            f'强基线预测长度必须为{FORECAST_LEN}: '
+            f"{artifact['forecast_len']}"
+        )
+    exact_protocol = {
+        'epochs': 80,
+        'early_stopping_patience': 10,
+        'reduce_lr_patience': 4,
+    }
+    for key, expected in exact_protocol.items():
+        if int(artifact[key]) != expected:
+            raise ValueError(
+                f'强基线协议 {key}漂移: '
+                f"{artifact[key]} != {expected}"
+            )
+    float_protocol = {
+        'validation_split': 0.15,
+        'learning_rate': 5e-4,
+        'clipnorm': 1.0,
+        'candidate_supervision_loss_weight': 0.5,
+        'reduce_lr_factor': 0.5,
+        'minimum_learning_rate': 1e-6,
+    }
+    for key, expected in float_protocol.items():
+        if not np.isclose(
+            float(artifact[key]),
+            expected,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f'强基线协议 {key}漂移: '
+                f"{artifact[key]} != {expected}"
+            )
+    if artifact['optimizer'] != 'Adam':
+        raise ValueError(f"强基线optimizer不是Adam: {artifact['optimizer']}")
+    for monitor_key in ('early_stopping_monitor', 'checkpoint_monitor'):
+        if artifact[monitor_key] != 'val_forecast_power_loss':
+            raise ValueError(
+                f'强基线 {monitor_key}不是主预测损失: '
+                f"{artifact[monitor_key]}"
+            )
+    if artifact['primary_prediction_output'] != 'forecast_power':
+        raise ValueError(
+            '强基线主预测输出必须为forecast_power'
+        )
+    if tuple(artifact['expert_names']) != (
+        PART3_ROUND2_STRONG_BASELINE_EXPERT_NAMES
+    ):
+        raise ValueError(
+            '强基线两候选名称必须依次为persistence/corrected: '
+            f"{artifact['expert_names']}"
+        )
+    expected_root = os.path.abspath(PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT)
+    for path_key in ('model_path', 'best_weights_path'):
+        recorded_path = os.path.abspath(os.fspath(artifact[path_key]))
+        if os.path.commonpath((expected_root, recorded_path)) != expected_root:
+            raise ValueError(
+                f'强基线 {path_key}越出第三部分第二轮目录: '
+                f'{recorded_path}'
+            )
+    diagnostics = artifact['diagnostic_layers']
+    expected_diagnostics = {
+        'forecast': 'forecast_power',
+        'gate': 'correction_gate',
+        'persistence_candidate': 'persistence_forecast_candidate',
+        'corrected_candidate': 'corrected_forecast_candidate',
+    }
+    missing_diagnostics = sorted(set(expected_diagnostics) - set(diagnostics))
+    if missing_diagnostics:
+        raise KeyError(
+            '第三部分第二轮 diagnostic_layers缺少 '
+            f'{missing_diagnostics}: {artifact_path}'
+        )
+    mismatched_diagnostics = {
+        key: diagnostics.get(key)
+        for key, expected in expected_diagnostics.items()
+        if diagnostics.get(key) != expected
+    }
+    if mismatched_diagnostics:
+        raise ValueError(
+            '强基线F7/G0诊断层语义漂移: '
+            f'{mismatched_diagnostics}'
+        )
+
+
 def load_artifact(model_name, farm_id):
     if model_name == PATCHTST_MODEL_NAME:
         artifact_candidates = [
@@ -479,6 +688,13 @@ def load_artifact(model_name, farm_id):
             FETS_PATCHTST_PREPROCESS_DIR,
             f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_preprocess.pkl',
         )
+    elif model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        artifact_path = os.path.join(
+            PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT,
+            'preprocess',
+            f'{model_name}_farm_{farm_id}_preprocess.pkl',
+        )
+        patchtst_layout = None
     else:
         artifact_path = os.path.join(
             BASE_RESULT_DIR,
@@ -492,6 +708,16 @@ def load_artifact(model_name, farm_id):
         raise FileNotFoundError(
             f'未找到 {model_name} 场站 {farm_id} 的预处理文件: {artifact_path}')
     artifact = joblib.load(artifact_path)
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        validate_part3_round2_strong_baseline_artifact(
+            artifact,
+            artifact_path,
+        )
+        if str(artifact['farm_id']) != str(farm_id):
+            raise ValueError(
+                '强基线artifact场站身份与测试文件不一致: '
+                f"{artifact['farm_id']} != {farm_id}; {artifact_path}"
+            )
     if model_name == PATCHTST_MODEL_NAME:
         artifact['_patchtst_artifact_layout'] = patchtst_layout
         if patchtst_layout == 'standard':
@@ -586,6 +812,15 @@ def build_model_from_weights(model_name, artifact):
             power_scale_offset=artifact.get('power_scale_offset', 0.0),
             correction_kernel_l2=artifact.get('correction_kernel_l2', 1e-4),
         )
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        return build_feature_screen_model(
+            variant_id='f7',
+            input_dim=len(artifact['input_cols']),
+            target_channel_index=int(artifact['target_index']),
+            power_scale_ratio=float(artifact['power_scale_ratio']),
+            power_scale_offset=float(artifact['power_scale_offset']),
+            regime_feature_config=artifact['regime_feature_config'],
+        )
 
     input_shape = (artifact.get('history_len', HISTORY_LEN), len(artifact['input_cols']))
     builder = MODEL_BUILDERS[model_name]
@@ -613,6 +848,17 @@ def load_trained_model(model_name, farm_id, artifact):
             FETS_PATCHTST_WEIGHTS_DIR,
             f'{FETS_PATCHTST_MODEL_NAME}_farm_{farm_id}_best.weights.h5',
         )
+    elif model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        model_path = artifact.get('model_path') or os.path.join(
+            PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT,
+            'models',
+            f'{model_name}_farm_{farm_id}.keras',
+        )
+        best_weights_path = artifact.get('best_weights_path') or os.path.join(
+            PART3_ROUND2_STRONG_BASELINE_RESULT_ROOT,
+            'weights',
+            f'{model_name}_farm_{farm_id}_best.weights.h5',
+        )
     else:
         model_path = artifact.get('model_path') or os.path.join(
             BASE_RESULT_DIR,
@@ -628,11 +874,25 @@ def load_trained_model(model_name, farm_id, artifact):
         )
 
     if os.path.exists(model_path):
+        if (
+            model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+            and _file_sha256(model_path) != artifact['model_sha256']
+        ):
+            raise ValueError(
+                f'强基线F7/G0模型hash与artifact不一致: {model_path}'
+            )
+        custom_objects = (
+            get_part3_round2_strong_baseline_custom_objects()
+            if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+            else get_custom_objects()
+        )
         model = keras.models.load_model(
             model_path,
-            custom_objects=get_custom_objects(),
+            custom_objects=custom_objects,
             compile=False,
         )
+        if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+            validate_part3_round2_strong_baseline_model(model, artifact)
         return model, model_path
 
     if not os.path.exists(best_weights_path):
@@ -640,9 +900,57 @@ def load_trained_model(model_name, farm_id, artifact):
             f'未找到 {model_name} 场站 {farm_id} 的完整模型或最佳权重: '
             f'{model_path}, {best_weights_path}')
 
+    if (
+        model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+        and _file_sha256(best_weights_path) != artifact['best_weights_sha256']
+    ):
+        raise ValueError(
+            f'强基线F7/G0权重hash与artifact不一致: '
+            f'{best_weights_path}'
+        )
+
     model = build_model_from_weights(model_name, artifact)
     model.load_weights(best_weights_path)
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        validate_part3_round2_strong_baseline_model(model, artifact)
     return model, best_weights_path
+
+
+def validate_part3_round2_strong_baseline_model(model, artifact):
+    """Validate the full fused F7/G0 inference graph selected for comparison."""
+    if len(model.inputs) != 1:
+        raise ValueError('强基线F7/G0推理图必须只有一个历史输入')
+    expected_shape = (
+        int(artifact['history_len']),
+        len(artifact['input_cols']),
+    )
+    actual_shape = tuple(int(value) for value in model.input_shape[1:])
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f'强基线F7/G0输入形状不一致: '
+            f'{actual_shape} != {expected_shape}'
+        )
+    for diagnostic_name, layer_name in artifact['diagnostic_layers'].items():
+        if diagnostic_name in {
+            'forecast',
+            'gate',
+            'persistence_candidate',
+            'corrected_candidate',
+        }:
+            try:
+                model.get_layer(layer_name)
+            except ValueError as exc:
+                raise ValueError(
+                    f'强基线F7/G0缺少诊断层 '
+                    f'{diagnostic_name}={layer_name}'
+                ) from exc
+    actual_params = int(model.count_params())
+    recorded_params = int(artifact.get('total_params', actual_params))
+    if recorded_params != actual_params:
+        raise ValueError(
+            f'强基线F7/G0参数量与artifact不一致: '
+            f'{actual_params} != {recorded_params}'
+        )
 
 
 def load_actual_power_series(data_path, index, capacity=None):
@@ -990,6 +1298,67 @@ def predict_with_router_diagnostics(model_name, model, pred_ds):
     return predictions, np.asarray(router_weights, dtype=float)
 
 
+def predict_part3_round2_strong_baseline_with_diagnostics(
+    model,
+    pred_ds,
+    artifact,
+):
+    """Predict the fused F7/G0 output and retain its two-candidate evidence."""
+    names = artifact['diagnostic_layers']
+    diagnostic_model = keras.Model(
+        inputs=model.inputs,
+        outputs=[
+            model.get_layer(names['forecast']).output,
+            model.get_layer(names['persistence_candidate']).output,
+            model.get_layer(names['corrected_candidate']).output,
+            model.get_layer(names['gate']).output,
+        ],
+        name='Part3Round2F7G0StrongBaselineDiagnostics',
+    )
+    forecast, persistence, corrected, gate = diagnostic_model.predict(
+        pred_ds,
+        verbose=PREDICT_VERBOSE,
+    )
+    arrays = {
+        'forecast': np.asarray(forecast),
+        'persistence': np.asarray(persistence),
+        'corrected': np.asarray(corrected),
+        'gate': np.asarray(gate),
+    }
+    expected_forecast_len = int(artifact['forecast_len'])
+    expected_shape = (arrays['forecast'].shape[0], expected_forecast_len)
+    for key, values in arrays.items():
+        if values.shape != expected_shape:
+            raise ValueError(
+                f'强基线F7/G0 {key}输出形状不一致: '
+                f'{values.shape} != {expected_shape}'
+            )
+        if not np.isfinite(values).all():
+            raise FloatingPointError(f'强基线F7/G0 {key}包含非有限值')
+    gate = arrays['gate'].astype(float)
+    if np.any((gate < -1e-6) | (gate > 1.0 + 1e-6)):
+        raise ValueError('强基线F7/G0 correction gate超出[0, 1]')
+    reconstructed = (
+        arrays['persistence']
+        + gate * (arrays['corrected'] - arrays['persistence'])
+    )
+    if not np.allclose(
+        reconstructed,
+        arrays['forecast'],
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        max_difference = float(
+            np.max(np.abs(reconstructed - arrays['forecast']))
+        )
+        raise ValueError(
+            '强基线F7/G0主输出不等于两候选门控重建: '
+            f'max_abs={max_difference}'
+        )
+    router_weights = np.stack([1.0 - gate, gate], axis=-1)
+    return arrays['forecast'], router_weights, arrays
+
+
 def save_router_diagnostics(
     router_weights,
     expert_names,
@@ -1067,11 +1436,23 @@ def predict_one_farm(model_name, test_file):
     forecast_len = artifact.get('forecast_len', FORECAST_LEN)
 
     pred_ds, n_samples = make_prediction_dataset(features, history_len, forecast_len)
-    y_pred_scaled, router_weights = predict_with_router_diagnostics(
-        model_name,
-        model,
-        pred_ds,
-    )
+    strong_baseline_diagnostics = None
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        (
+            y_pred_scaled,
+            router_weights,
+            strong_baseline_diagnostics,
+        ) = predict_part3_round2_strong_baseline_with_diagnostics(
+            model,
+            pred_ds,
+            artifact,
+        )
+    else:
+        y_pred_scaled, router_weights = predict_with_router_diagnostics(
+            model_name,
+            model,
+            pred_ds,
+        )
     y_pred = inverse_power(artifact['scaler_y'], y_pred_scaled).reshape(-1, forecast_len)
     if y_pred.shape[0] != n_samples:
         raise ValueError(
@@ -1100,6 +1481,53 @@ def predict_one_farm(model_name, test_file):
         history_len,
         forecast_len,
     )
+    strong_baseline_metric_fields = {}
+    if strong_baseline_diagnostics is not None:
+        persistence = inverse_power(
+            artifact['scaler_y'],
+            strong_baseline_diagnostics['persistence'],
+        ).reshape(-1, forecast_len)
+        corrected = inverse_power(
+            artifact['scaler_y'],
+            strong_baseline_diagnostics['corrected'],
+        ).reshape(-1, forecast_len)
+        if capacity is not None:
+            persistence = np.clip(persistence, 0, capacity)
+            corrected = np.clip(corrected, 0, capacity)
+        else:
+            persistence = np.clip(persistence, 0, None)
+            corrected = np.clip(corrected, 0, None)
+        gate = np.asarray(strong_baseline_diagnostics['gate'], dtype=float)
+        pred_df['persistence_power'] = persistence.T.reshape(-1)
+        pred_df['corrected_candidate_power'] = corrected.T.reshape(-1)
+        pred_df['corrected_gate_weight'] = gate.T.reshape(-1)
+        persistence_metrics = calculate_metrics(y_true, persistence, capacity)
+        corrected_metrics = calculate_metrics(y_true, corrected, capacity)
+        strong_baseline_metric_fields = {
+            'model_family': 'part3_new_module_supplement',
+            'model_variant': PART3_ROUND2_STRONG_BASELINE_VARIANT_ID,
+            'training_protocol': 'strong_baseline_fair_training_bs256',
+            'training_mode': artifact['training_mode'],
+            'batch_size': int(artifact['batch_size']),
+            'parameter_count': int(model.count_params()),
+            'gate_corrected_weight_mean': float(gate.mean()),
+            'persistence_mae': persistence_metrics['mae'],
+            'persistence_rmse': persistence_metrics['rmse'],
+            'persistence_capacity_normalized_mae': persistence_metrics[
+                'capacity_normalized_mae'
+            ],
+            'persistence_capacity_normalized_rmse': persistence_metrics[
+                'capacity_normalized_rmse'
+            ],
+            'corrected_candidate_mae': corrected_metrics['mae'],
+            'corrected_candidate_rmse': corrected_metrics['rmse'],
+            'corrected_candidate_capacity_normalized_mae': corrected_metrics[
+                'capacity_normalized_mae'
+            ],
+            'corrected_candidate_capacity_normalized_rmse': corrected_metrics[
+                'capacity_normalized_rmse'
+            ],
+        }
 
     pred_path = os.path.join(
         dirs['predictions'],
@@ -1114,10 +1542,13 @@ def predict_one_farm(model_name, test_file):
     )
     metric_df.to_csv(horizon_metric_path, index=False, encoding='utf-8-sig')
 
-    expert_names = artifact.get(
-        'expert_names',
-        list(FETS_PATCHTST_EXPERT_NAMES),
-    )
+    if model_name == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME:
+        expert_names = list(PART3_ROUND2_STRONG_BASELINE_EXPERT_NAMES)
+    else:
+        expert_names = artifact.get(
+            'expert_names',
+            list(FETS_PATCHTST_EXPERT_NAMES),
+        )
     _, router_metric_fields = save_router_diagnostics(
         router_weights,
         expert_names,
@@ -1156,6 +1587,7 @@ def predict_one_farm(model_name, test_file):
         'weighted_curve_figure_path': weighted_curve_figure_path,
         **router_metric_fields,
         **weighted_metric_fields,
+        **strong_baseline_metric_fields,
     })
     print(f"{model_name} 场站 {farm_id}: MAE={all_metrics['mae']:.4f}, "
           f"RMSE={all_metrics['rmse']:.4f}")
@@ -1196,6 +1628,241 @@ def predict_model_family(model_name, test_files):
     return summary_df, all_horizon_metrics
 
 
+def _validate_legacy_strong_comparison_frame(frame, frame_name):
+    """Require the existing nine-model result matrix before read-only reuse."""
+    required = {'model_name', 'farm_id', 'horizon_step'}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise KeyError(f'{frame_name}缺少列: {missing}')
+    checked = frame.copy()
+    checked['model_name'] = checked['model_name'].astype(str)
+    checked['farm_id'] = checked['farm_id'].astype(str)
+    actual_models = set(checked['model_name'])
+    expected_models = set(LEGACY_STRONG_COMPARISON_MODEL_NAMES)
+    if actual_models != expected_models:
+        raise ValueError(
+            f'{frame_name}旧基线模型集不完整: '
+            f'missing={sorted(expected_models - actual_models)}, '
+            f'extra={sorted(actual_models - expected_models)}'
+        )
+    if checked.duplicated(['model_name', 'farm_id', 'horizon_step']).any():
+        raise ValueError(f'{frame_name}存在重复model/farm/horizon键')
+    farm_counts = checked.groupby('model_name')['farm_id'].nunique()
+    if not (farm_counts == STRONG_COMPARISON_EXPECTED_FARM_COUNT).all():
+        raise ValueError(
+            f'{frame_name}不是9模型×5场站完整矩阵: '
+            f'{farm_counts.to_dict()}'
+        )
+    farm_sets = checked.groupby('model_name')['farm_id'].agg(
+        lambda values: frozenset(values)
+    )
+    if farm_sets.nunique() != 1:
+        raise ValueError(
+            f'{frame_name}旧9模型的场站集不一致: '
+            f'{farm_sets.to_dict()}'
+        )
+    model_farm_pairs = checked[['model_name', 'farm_id']].drop_duplicates()
+    if len(model_farm_pairs) != (
+        len(LEGACY_STRONG_COMPARISON_MODEL_NAMES)
+        * STRONG_COMPARISON_EXPECTED_FARM_COUNT
+    ):
+        raise ValueError(f'{frame_name}旧基线model/farm键不完整')
+    if frame_name == 'global summary':
+        if len(checked) != len(model_farm_pairs):
+            raise ValueError('global summary每个model/farm必须只有一行')
+        if not (checked['horizon_step'].astype(str) == 'all').all():
+            raise ValueError('global summary只能包含horizon_step=all')
+    else:
+        row_counts = checked.groupby(['model_name', 'farm_id']).size()
+        if not (row_counts == FORECAST_LEN + 1).all():
+            raise ValueError(
+                f'global horizon每个model/farm应有{FORECAST_LEN + 1}行: '
+                f'{row_counts[row_counts != FORECAST_LEN + 1].to_dict()}'
+            )
+        expected_horizons = {'all', *map(str, range(1, FORECAST_LEN + 1))}
+        for key, group in checked.groupby(['model_name', 'farm_id']):
+            actual_horizons = set(group['horizon_step'].astype(str))
+            if actual_horizons != expected_horizons:
+                raise ValueError(
+                    f'global horizon {key}的horizon集不完整: '
+                    f'{sorted(actual_horizons)}'
+                )
+    return checked
+
+
+def load_existing_legacy_strong_comparison_results():
+    """Read, never recompute, the complete 9x5 legacy baseline matrix."""
+    summary_path = os.path.join(
+        BASE_RESULT_DIR,
+        'wind_dl_all_models_test_metrics_summary.csv',
+    )
+    horizon_path = os.path.join(
+        BASE_RESULT_DIR,
+        'wind_dl_all_models_test_metrics_by_horizon_all.csv',
+    )
+    missing_paths = [
+        path for path in (summary_path, horizon_path) if not os.path.exists(path)
+    ]
+    if missing_paths:
+        raise FileNotFoundError(
+            '仅运行第三部分第二轮模型时需要旧基线全局结果: '
+            f'{missing_paths}'
+        )
+    summary_all = pd.read_csv(summary_path, dtype={'farm_id': str})
+    horizon_all = pd.read_csv(horizon_path, dtype={'farm_id': str})
+    # A repeated strong-baseline run may see the 50-row file written by its
+    # previous run.  Reuse only the immutable nine legacy families.
+    summary = summary_all[
+        summary_all['model_name'].astype(str).isin(
+            LEGACY_STRONG_COMPARISON_MODEL_NAMES
+        )
+    ].copy()
+    horizon = horizon_all[
+        horizon_all['model_name'].astype(str).isin(
+            LEGACY_STRONG_COMPARISON_MODEL_NAMES
+        )
+    ].copy()
+    return (
+        _validate_legacy_strong_comparison_frame(summary, 'global summary'),
+        _validate_legacy_strong_comparison_frame(horizon, 'global horizon'),
+    )
+
+
+def _validate_new_strong_baseline_matrix(summary, horizon):
+    expected_model = PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+    selected_summary = summary[
+        summary['model_name'].astype(str) == expected_model
+    ].copy()
+    selected_horizon = horizon[
+        horizon['model_name'].astype(str) == expected_model
+    ].copy()
+    if len(selected_summary) != STRONG_COMPARISON_EXPECTED_FARM_COUNT:
+        raise ValueError(
+            '强基线新模型测试汇总不是5场站: '
+            f'{len(selected_summary)}'
+        )
+    if selected_summary['farm_id'].astype(str).nunique() != (
+        STRONG_COMPARISON_EXPECTED_FARM_COUNT
+    ):
+        raise ValueError('强基线新模型测试汇总场站键不唯一')
+    row_counts = selected_horizon.groupby(
+        selected_horizon['farm_id'].astype(str)
+    ).size()
+    if len(row_counts) != STRONG_COMPARISON_EXPECTED_FARM_COUNT or not (
+        row_counts == FORECAST_LEN + 1
+    ).all():
+        raise ValueError(
+            '强基线新模型分horizon结果不是5场站×17行: '
+            f'{row_counts.to_dict()}'
+        )
+
+
+def validate_part3_round2_all_model_comparison(global_summary, global_horizon):
+    """Require a complete 10-model matrix before replacing the global CSVs."""
+    _validate_new_strong_baseline_matrix(global_summary, global_horizon)
+    legacy_summary = global_summary[
+        global_summary['model_name'].astype(str).isin(
+            LEGACY_STRONG_COMPARISON_MODEL_NAMES
+        )
+    ]
+    legacy_horizon = global_horizon[
+        global_horizon['model_name'].astype(str).isin(
+            LEGACY_STRONG_COMPARISON_MODEL_NAMES
+        )
+    ]
+    _validate_legacy_strong_comparison_frame(
+        legacy_summary,
+        'global summary',
+    )
+    _validate_legacy_strong_comparison_frame(
+        legacy_horizon,
+        'global horizon',
+    )
+    legacy_farms = set(legacy_summary['farm_id'].astype(str))
+    strong_farms = set(
+        global_summary.loc[
+            global_summary['model_name'].astype(str)
+            == PART3_ROUND2_STRONG_BASELINE_MODEL_NAME,
+            'farm_id',
+        ].astype(str)
+    )
+    if strong_farms != legacy_farms:
+        raise ValueError(
+            '强基线新模型与旧9模型的场站集不一致: '
+            f'new={sorted(strong_farms)}, legacy={sorted(legacy_farms)}'
+        )
+    expected_models = {
+        *LEGACY_STRONG_COMPARISON_MODEL_NAMES,
+        PART3_ROUND2_STRONG_BASELINE_MODEL_NAME,
+    }
+    actual_models = set(global_summary['model_name'].astype(str))
+    if actual_models != expected_models:
+        raise ValueError(
+            '强基线全模型对比集不是10个预定模型: '
+            f'missing={sorted(expected_models - actual_models)}, '
+            f'extra={sorted(actual_models - expected_models)}'
+        )
+
+
+def save_part3_round2_all_model_comparison(global_summary, global_horizon):
+    """Archive the 10-model comparison beside the new round-2 experiment."""
+    validate_part3_round2_all_model_comparison(
+        global_summary,
+        global_horizon,
+    )
+    dirs = model_output_dirs(PART3_ROUND2_STRONG_BASELINE_MODEL_NAME)
+    summary_path = os.path.join(
+        dirs['root'],
+        'part3_round2_all_models_test_metrics_summary.csv',
+    )
+    horizon_path = os.path.join(
+        dirs['root'],
+        'part3_round2_all_models_test_metrics_by_horizon.csv',
+    )
+    global_summary.to_csv(summary_path, index=False, encoding='utf-8-sig')
+    global_horizon.to_csv(horizon_path, index=False, encoding='utf-8-sig')
+
+    macro = global_summary.copy()
+    numeric_columns = [
+        'mae',
+        'rmse',
+        'r2',
+        'capacity_normalized_mae',
+        'capacity_normalized_rmse',
+    ]
+    macro = macro.groupby('model_name', as_index=False).agg(
+        farm_count=('farm_id', 'nunique'),
+        **{
+            f'macro_{column}': (column, 'mean')
+            for column in numeric_columns
+        },
+    )
+    macro = macro.rename(
+        columns={
+            'macro_capacity_normalized_mae': 'macro_nmae',
+            'macro_capacity_normalized_rmse': 'macro_nrmse',
+        }
+    )
+    macro['macro_nrmse_rank'] = macro['macro_nrmse'].rank(
+        method='min',
+        ascending=True,
+    ).astype(int)
+    macro['macro_nmae_rank'] = macro['macro_nmae'].rank(
+        method='min',
+        ascending=True,
+    ).astype(int)
+    macro = macro.sort_values(
+        ['macro_nrmse_rank', 'macro_nmae_rank', 'model_name']
+    )
+    macro_path = os.path.join(
+        dirs['root'],
+        'part3_round2_all_models_test_macro_comparison.csv',
+    )
+    macro.to_csv(macro_path, index=False, encoding='utf-8-sig')
+    print(f'第三部分第二轮10模型汇总已保存: {summary_path}')
+    print(f'第三部分第二轮10模型Macro排名已保存: {macro_path}')
+
+
 def main():
     set_global_seed(seed)
 
@@ -1204,6 +1871,15 @@ def main():
         raise FileNotFoundError(f'未在 {DATA_DIR} 找到 {TEST_FILE_PATTERN}')
 
     requested_model_names = get_requested_model_names()
+    strong_baseline_requested = (
+        PART3_ROUND2_STRONG_BASELINE_MODEL_NAME in requested_model_names
+    )
+    strong_baseline_only = requested_model_names == [
+        PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+    ]
+    complete_default_all_requested = (
+        set(requested_model_names) == set(ALL_MODEL_NAMES)
+    )
     print(f'发现 {len(test_files)} 个风电测试文件')
     print(f'将预测模型: {requested_model_names}')
 
@@ -1216,8 +1892,55 @@ def main():
         if not horizon_df.empty:
             all_horizon.append(horizon_df)
 
+    if (
+        strong_baseline_requested
+        and not complete_default_all_requested
+        and all_summary
+        and all_horizon
+    ):
+        legacy_summary, legacy_horizon = (
+            load_existing_legacy_strong_comparison_results()
+        )
+        all_summary.insert(0, legacy_summary)
+        all_horizon.insert(0, legacy_horizon)
+    if strong_baseline_only and (not all_summary or not all_horizon):
+        raise FileNotFoundError(
+            '未生成第三部分第二轮强基线任一场站预测；'
+            '请先完成新训练脚本的5场站训练'
+        )
+
+    if all_summary and all_horizon:
+        preview_summary = pd.concat(all_summary, ignore_index=True)
+        preview_horizon = pd.concat(all_horizon, ignore_index=True)
+        if PART3_ROUND2_STRONG_BASELINE_MODEL_NAME in set(
+            preview_summary['model_name'].astype(str)
+        ):
+            preview_summary['farm_id'] = preview_summary['farm_id'].astype(str)
+            preview_horizon['farm_id'] = preview_horizon['farm_id'].astype(str)
+            preview_summary = preview_summary.drop_duplicates(
+                ['model_name', 'farm_id', 'horizon_step'],
+                keep='last',
+            )
+            preview_horizon = preview_horizon.drop_duplicates(
+                ['model_name', 'farm_id', 'horizon_step'],
+                keep='last',
+            )
+            validate_part3_round2_all_model_comparison(
+                preview_summary,
+                preview_horizon,
+            )
+
+    global_summary = None
     if all_summary:
         global_summary = pd.concat(all_summary, ignore_index=True)
+        if PART3_ROUND2_STRONG_BASELINE_MODEL_NAME in set(
+            global_summary['model_name'].astype(str)
+        ):
+            global_summary['farm_id'] = global_summary['farm_id'].astype(str)
+            global_summary = global_summary.drop_duplicates(
+                ['model_name', 'farm_id', 'horizon_step'],
+                keep='last',
+            )
         global_summary_path = os.path.join(
             BASE_RESULT_DIR,
             'wind_dl_all_models_test_metrics_summary.csv',
@@ -1225,14 +1948,34 @@ def main():
         global_summary.to_csv(global_summary_path, index=False, encoding='utf-8-sig')
         print(f'全部模型汇总指标已保存: {global_summary_path}')
 
+    global_horizon = None
     if all_horizon:
         global_horizon = pd.concat(all_horizon, ignore_index=True)
+        if PART3_ROUND2_STRONG_BASELINE_MODEL_NAME in set(
+            global_horizon['model_name'].astype(str)
+        ):
+            global_horizon['farm_id'] = global_horizon['farm_id'].astype(str)
+            global_horizon = global_horizon.drop_duplicates(
+                ['model_name', 'farm_id', 'horizon_step'],
+                keep='last',
+            )
         global_horizon_path = os.path.join(
             BASE_RESULT_DIR,
             'wind_dl_all_models_test_metrics_by_horizon_all.csv',
         )
         global_horizon.to_csv(global_horizon_path, index=False, encoding='utf-8-sig')
         print(f'全部模型分horizon指标已保存: {global_horizon_path}')
+
+    if (
+        global_summary is not None
+        and global_horizon is not None
+        and PART3_ROUND2_STRONG_BASELINE_MODEL_NAME
+        in set(global_summary['model_name'].astype(str))
+    ):
+        save_part3_round2_all_model_comparison(
+            global_summary,
+            global_horizon,
+        )
 
     print('全部深度学习模型测试集预测完成')
 
