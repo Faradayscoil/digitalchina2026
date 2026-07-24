@@ -41,7 +41,7 @@ from openpyxl import load_workbook
 from sklearn.preprocessing import StandardScaler
 
 
-PROTOCOL_VERSION = "part3_round3_external14_leakage_free_v1"
+PROTOCOL_VERSION = "part3_round3_external14_leakage_free_v2"
 SCHEMA_VERSION = "FEATURE_SCHEMA_V1"
 ARTIFACT_SCHEMA_VERSION = 1
 # Verified once against the original five-farm F7 artifact ``input_cols``.
@@ -64,6 +64,12 @@ RANDOM_SEED = 2026
 CAUSAL_FILL_LIMIT = 4
 POWER_REFERENCE_QUANTILE = 0.999
 BLANK_ROW_STOP = 512
+CCF_MAX_LAG_STEPS = 4
+CCF_TIME_SLICES = 4
+CCF_MIN_FULL_PAIRS = 500
+CCF_MIN_SLICE_PAIRS = 100
+CCF_MIN_PEAK_CORRELATION = 0.10
+CCF_MIN_PEAK_MARGIN = 0.005
 
 SPEED_COLS = (
     "10米风速",
@@ -104,6 +110,9 @@ TIME_FEATURE_COLS = (
     "month_cos",
 )
 
+# Frozen legacy F7 order (do not reorder to match prose summaries):
+# speed -> meteorology -> direction sin/cos -> time -> speed powers ->
+# hub-height differences/ratios -> historical power.
 FEATURE_SCHEMA = (
     "10米风速",
     "30米风速",
@@ -847,6 +856,43 @@ def reconstruct_directions(
         encoded[f"{name}_cos"] = cos_value
     if violations_after:
         raise ValueError(f"风向单位圆修复后仍有{violations_after}个违规点")
+    hub_direction = "轮毂高度风向"
+    hub_known = ~unknown_masks[hub_direction]
+    consecutive_hub_pairs = (
+        train_mask[1:]
+        & train_mask[:-1]
+        & hub_known[1:]
+        & hub_known[:-1]
+    )
+    train_hub_known = train_mask & hub_known
+    direction_context_steps = 17
+    valid_direction_contexts = (
+        np.convolve(
+            train_hub_known.astype(np.int16),
+            np.ones(direction_context_steps, dtype=np.int16),
+            mode="valid",
+        )
+        == direction_context_steps
+    )
+    direct_available = hub_direction in reliable
+    reconstructable = bool(reliable)
+    model_available = bool(
+        reconstructable
+        and int(valid_direction_contexts.sum()) > 0
+        and violations_after == 0
+    )
+    if direct_available and model_available:
+        direction_group_source_status = "direct"
+    elif direct_available:
+        direction_group_source_status = "direct_but_insufficient_history"
+    elif reconstructable and model_available:
+        direction_group_source_status = "reconstructed_usable"
+    elif reconstructable:
+        direction_group_source_status = (
+            "reconstruction_source_available_but_insufficient_history"
+        )
+    else:
+        direction_group_source_status = "unavailable"
     return encoded, {
         "reliability": reliability,
         "reliable_columns": reliable,
@@ -859,6 +905,32 @@ def reconstruct_directions(
         ),
         "unity_violations_after_repair_per_mille": (
             1000.0 * violations_after / max(1, total_pairs)
+        ),
+        # "Direct" and "model available" are deliberately separate: a
+        # missing hub-height sensor can still be reconstructed causally from a
+        # reliable neighbouring height.  Treating those cases as unavailable
+        # would incorrectly discard a valid F7 direction group.
+        "direction_group_available": model_available,
+        "direction_group_direct_available": direct_available,
+        "direction_group_reconstructable": reconstructable,
+        "direction_group_model_available": model_available,
+        "direction_group_source_status": direction_group_source_status,
+        "direction_reliable_source_count": len(reliable),
+        "direction_reliable_source_columns": reliable,
+        "hub_direction_directly_reliable": direct_available,
+        "train_consecutive_valid_hub_direction_pairs": int(
+            consecutive_hub_pairs.sum()
+        ),
+        "train_consecutive_valid_hub_direction_pair_rate": float(
+            consecutive_hub_pairs.sum()
+            / max(1, int((train_mask[1:] & train_mask[:-1]).sum()))
+        ),
+        "direction_group_required_contiguous_steps": direction_context_steps,
+        "train_valid_hub_direction_contexts_17": int(
+            valid_direction_contexts.sum()
+        ),
+        "train_valid_hub_direction_fraction": float(
+            train_hub_known.sum() / max(1, int(train_mask.sum()))
         ),
     }
 
@@ -888,6 +960,234 @@ def fill_meteorology(
         "train_medians": medians,
         "reliability": reliability,
         "defaults": defaults,
+    }
+
+
+def _lagged_pearson(
+    power: np.ndarray,
+    wind: np.ndarray,
+    lag_steps: int,
+) -> tuple[float, int]:
+    """Compute ``corr(power_t, wind_(t-lag))`` on finite paired values."""
+    if lag_steps > 0:
+        power_pair = power[lag_steps:]
+        wind_pair = wind[:-lag_steps]
+    elif lag_steps < 0:
+        power_pair = power[:lag_steps]
+        wind_pair = wind[-lag_steps:]
+    else:
+        power_pair = power
+        wind_pair = wind
+    finite = np.isfinite(power_pair) & np.isfinite(wind_pair)
+    count = int(finite.sum())
+    if count < 3:
+        return math.nan, count
+    first = power_pair[finite].astype(np.float64, copy=False)
+    second = wind_pair[finite].astype(np.float64, copy=False)
+    if float(np.std(first)) <= 1e-12 or float(np.std(second)) <= 1e-12:
+        return math.nan, count
+    return float(np.corrcoef(first, second)[0, 1]), count
+
+
+def compute_ccf_diagnostics(
+    power_mw: np.ndarray,
+    hub_wind_ms: np.ndarray,
+    train_mask: np.ndarray,
+    max_lag: int = CCF_MAX_LAG_STEPS,
+    time_slices: int = CCF_TIME_SLICES,
+    wind_source: str = "direct_hub_wind",
+) -> dict[str, Any]:
+    """Diagnose train-only power/wind alignment without shifting timestamps.
+
+    Both level and first-difference CCFs are evaluated for lags ``[-4, 4]``.
+    Positive lag means wind leads power.  The complete training segment and
+    four contiguous training slices are reported so a single autocorrelation
+    peak cannot silently trigger a time correction.
+    """
+    power = np.asarray(power_mw, dtype=np.float64).reshape(-1)
+    wind = np.asarray(hub_wind_ms, dtype=np.float64).reshape(-1)
+    train = np.asarray(train_mask, dtype=bool).reshape(-1)
+    if not (len(power) == len(wind) == len(train)):
+        raise ValueError("CCF功率、风速和train_mask长度不一致")
+    if max_lag < 0 or time_slices <= 0:
+        raise ValueError("CCF max_lag/time_slices配置无效")
+
+    train_positions = np.flatnonzero(train)
+    scope_masks: list[tuple[str, np.ndarray, int]] = [
+        ("full", train.copy(), CCF_MIN_FULL_PAIRS)
+    ]
+    edges = np.linspace(0, len(train_positions), time_slices + 1, dtype=int)
+    for index in range(time_slices):
+        mask = np.zeros(len(train), dtype=bool)
+        selected = train_positions[edges[index] : edges[index + 1]]
+        mask[selected] = True
+        scope_masks.append(
+            (f"slice_{index + 1}", mask, CCF_MIN_SLICE_PAIRS)
+        )
+
+    rows: list[dict[str, Any]] = []
+    peak_by_kind: dict[str, dict[str, Any]] = {}
+    for series_kind in ("level", "difference"):
+        if series_kind == "level":
+            power_series = power.copy()
+            wind_series = wind.copy()
+        else:
+            power_series = np.full(len(power), np.nan, dtype=np.float64)
+            wind_series = np.full(len(wind), np.nan, dtype=np.float64)
+            consecutive_train = train[1:] & train[:-1]
+            positions = np.flatnonzero(consecutive_train) + 1
+            power_series[positions] = power[positions] - power[positions - 1]
+            wind_series[positions] = wind[positions] - wind[positions - 1]
+
+        scope_peaks: dict[str, dict[str, Any] | None] = {}
+        for scope, scope_mask, minimum_pairs in scope_masks:
+            effective_scope = scope_mask.copy()
+            if series_kind == "difference":
+                # A slice's first difference must not borrow the previous
+                # slice's terminal observation.
+                effective_scope[0] = False
+                effective_scope[1:] &= scope_mask[:-1]
+            scoped_power = np.where(effective_scope, power_series, np.nan)
+            scoped_wind = np.where(effective_scope, wind_series, np.nan)
+            candidates: list[dict[str, Any]] = []
+            for lag_steps in range(-max_lag, max_lag + 1):
+                correlation, pair_count = _lagged_pearson(
+                    scoped_power,
+                    scoped_wind,
+                    lag_steps,
+                )
+                eligible = bool(
+                    pair_count >= minimum_pairs and np.isfinite(correlation)
+                )
+                row = {
+                    "series_kind": series_kind,
+                    "scope": scope,
+                    "lag_steps": lag_steps,
+                    "lag_minutes": lag_steps * 15,
+                    "correlation": correlation,
+                    "valid_pair_count": pair_count,
+                    "minimum_pair_count": minimum_pairs,
+                    "eligible_for_peak": eligible,
+                    "wind_source": wind_source,
+                    "lag_convention": "corr(power_t, wind_(t-lag)); positive=wind_leads",
+                }
+                rows.append(row)
+                if eligible:
+                    candidates.append(row)
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    float(item["correlation"]),
+                    -abs(int(item["lag_steps"])),
+                ),
+                reverse=True,
+            )
+            if not ordered:
+                scope_peaks[scope] = None
+                continue
+            best = ordered[0]
+            second = ordered[1] if len(ordered) >= 2 else None
+            scope_peaks[scope] = {
+                "peak_lag_steps": int(best["lag_steps"]),
+                "peak_lag_minutes": int(best["lag_minutes"]),
+                "peak_correlation": float(best["correlation"]),
+                "peak_valid_pair_count": int(best["valid_pair_count"]),
+                "second_best_correlation": (
+                    float(second["correlation"]) if second else math.nan
+                ),
+                "peak_margin": (
+                    float(best["correlation"] - second["correlation"])
+                    if second
+                    else math.nan
+                ),
+            }
+
+        full_peak = scope_peaks.get("full")
+        slice_peaks = [
+            value
+            for name, value in scope_peaks.items()
+            if name.startswith("slice_") and value is not None
+        ]
+        if full_peak is None or len(slice_peaks) < 3:
+            status = "insufficient_ccf_pairs"
+            stable_fraction = math.nan
+            lag_span = math.nan
+            modal_lag = None
+        else:
+            full_lag = int(full_peak["peak_lag_steps"])
+            slice_lags = np.asarray(
+                [item["peak_lag_steps"] for item in slice_peaks],
+                dtype=int,
+            )
+            stable_fraction = float(np.mean(np.abs(slice_lags - full_lag) <= 1))
+            lag_span = int(slice_lags.max() - slice_lags.min())
+            values, counts = np.unique(slice_lags, return_counts=True)
+            modal_lag = int(values[np.argmax(counts)])
+            stable = stable_fraction >= 0.75 and lag_span <= 2
+            peak_correlation = float(full_peak["peak_correlation"])
+            peak_margin = float(full_peak["peak_margin"])
+            weak_or_ambiguous = bool(
+                peak_correlation < CCF_MIN_PEAK_CORRELATION
+                or not np.isfinite(peak_margin)
+                or peak_margin < CCF_MIN_PEAK_MARGIN
+            )
+            if weak_or_ambiguous:
+                status = "weak_or_ambiguous_ccf_peak"
+            elif stable and full_lag == 0:
+                status = "stable_exact_zero_lag"
+            elif stable and abs(full_lag) <= 1:
+                status = "stable_within_one_step_of_zero_lag"
+            elif stable:
+                status = "stable_nonzero_lag_warning"
+            else:
+                status = "alignment_warning_unstable_lag"
+        peak_by_kind[series_kind] = {
+            "full": full_peak,
+            "slice_peaks": scope_peaks,
+            "slice_peak_count": len(slice_peaks),
+            "slice_modal_lag_steps": modal_lag,
+            "slice_lag_span_steps": lag_span,
+            "slice_within_one_step_of_full_fraction": stable_fraction,
+            "exact_zero_lag": bool(
+                full_peak is not None
+                and int(full_peak["peak_lag_steps"]) == 0
+            ),
+            "minimum_peak_correlation": CCF_MIN_PEAK_CORRELATION,
+            "minimum_peak_margin": CCF_MIN_PEAK_MARGIN,
+            "diagnostic_status": status,
+        }
+
+    statuses = [
+        item["diagnostic_status"] for item in peak_by_kind.values()
+    ]
+    if "alignment_warning_unstable_lag" in statuses:
+        overall_status = "alignment_warning_unstable_lag"
+    elif "stable_nonzero_lag_warning" in statuses:
+        overall_status = "stable_nonzero_lag_warning"
+    elif "weak_or_ambiguous_ccf_peak" in statuses:
+        overall_status = "weak_or_ambiguous_ccf_peak"
+    elif all(value == "stable_exact_zero_lag" for value in statuses):
+        overall_status = "stable_exact_zero_lag"
+    elif all(
+        value
+        in {
+            "stable_exact_zero_lag",
+            "stable_within_one_step_of_zero_lag",
+        }
+        for value in statuses
+    ):
+        overall_status = "stable_within_one_step_of_zero_lag"
+    else:
+        overall_status = "insufficient_ccf_pairs"
+    return {
+        "protocol": "train_only_level_and_difference_ccf_v1",
+        "max_lag_steps": max_lag,
+        "time_slices": time_slices,
+        "wind_source": wind_source,
+        "automatic_time_shift_applied": False,
+        "overall_diagnostic_status": overall_status,
+        "summary_by_series": peak_by_kind,
+        "rows": rows,
     }
 
 
@@ -979,7 +1279,10 @@ def feasibility_label(
     # retention remain separate audit fields rather than silently changing a
     # station's tier.
     del calendar_days, retention_ratio
-    if eligible_windows >= 50_000:
+    # A complete two-year 15-minute record yields only about 49k eligible
+    # windows after the 70% chronological split and the 96/16 context bounds;
+    # 50k would therefore make the "sufficient" tier unreachable by design.
+    if eligible_windows >= 40_000:
         return "sufficient"
     if eligible_windows >= 20_000:
         return "limited"
@@ -1045,6 +1348,12 @@ def result_paths(farm_id: str) -> dict[str, Path]:
         "regime_config": (
             RESULT_ROOT / "preprocess" / farm_id / "regime_feature_config.json"
         ),
+        "ccf_diagnostics": (
+            RESULT_ROOT
+            / "data_audit"
+            / "time_alignment"
+            / f"{farm_id}_ccf_diagnostics.csv"
+        ),
         "farm_manifest": RESULT_ROOT / "manifests" / "preprocess" / f"{farm_id}.json",
     }
 
@@ -1057,6 +1366,22 @@ def prepare_farm(
     if farm_id not in EXPECTED_FARMS:
         raise ValueError(f"未知场站: {farm_id}")
     paths = result_paths(farm_id)
+    farm_root = RAW_ROOT / farm_id
+    power_candidates = sorted(farm_root.glob("*场站出力*.xlsx"))
+    weather_candidates = sorted(
+        list(farm_root.glob("*测风数据*.xlsx"))
+        + list(farm_root.glob("*测风塔数据*.xlsx"))
+    )
+    run_record_candidates = sorted(farm_root.glob("*运行记录*.xlsx"))
+    if len(power_candidates) != 1 or len(weather_candidates) != 1:
+        raise FileNotFoundError(
+            f"{farm_id}原始文件不唯一: power={power_candidates}, "
+            f"weather={weather_candidates}"
+        )
+    current_raw_power_sha = sha256_file(power_candidates[0])
+    current_raw_weather_sha = sha256_file(weather_candidates[0])
+    current_semantics_config_sha = sha256_json(semantics_config)
+    current_preprocess_code_sha = sha256_file(__file__)
     if paths["farm_manifest"].exists() and not force:
         with open(paths["farm_manifest"], "r", encoding="utf-8") as handle:
             prior = json.load(handle)
@@ -1077,28 +1402,34 @@ def prepare_farm(
         json_ok = paths["power_reference"].is_file() and paths[
             "regime_config"
         ].is_file()
+        ccf_ok = (
+            paths["ccf_diagnostics"].is_file()
+            and summary.get("ccf_diagnostics_sha256")
+            == sha256_file(paths["ccf_diagnostics"])
+        )
+        source_identity_ok = bool(
+            summary.get("raw_power_file_sha256") == current_raw_power_sha
+            and summary.get("raw_weather_file_sha256")
+            == current_raw_weather_sha
+            and summary.get("timestamp_semantics_config_sha256")
+            == current_semantics_config_sha
+            and summary.get("preprocessing_code_sha256")
+            == current_preprocess_code_sha
+        )
         if (
             prior.get("status") == "complete"
+            and prior.get("protocol_version") == PROTOCOL_VERSION
             and array_ok
             and bundle_ok
             and split_ok
             and json_ok
+            and ccf_ok
+            and source_identity_ok
         ):
             print(f"[resume] {farm_id} 已完成，跳过")
             return summary
         print(f"[stale] {farm_id}已有manifest但产物不完整或hash不符，重新生成")
 
-    farm_root = RAW_ROOT / farm_id
-    power_candidates = sorted(farm_root.glob("*场站出力*.xlsx"))
-    weather_candidates = sorted(
-        list(farm_root.glob("*测风数据*.xlsx"))
-        + list(farm_root.glob("*测风塔数据*.xlsx"))
-    )
-    run_record_candidates = sorted(farm_root.glob("*运行记录*.xlsx"))
-    if len(power_candidates) != 1 or len(weather_candidates) != 1:
-        raise FileNotFoundError(
-            f"{farm_id}原始文件不唯一: power={power_candidates}, weather={weather_candidates}"
-        )
     run_record_audit: list[dict[str, Any]] = []
     for path in run_record_candidates:
         assert_raw_path(path)
@@ -1191,6 +1522,34 @@ def prepare_farm(
     power_train_max = float(np.max(train_power))
     if not np.isfinite(power_reference) or power_reference <= 1e-6:
         raise ValueError(f"{farm_id}训练段Q99.9功率参考无效: {power_reference}")
+
+    reliable_speed_columns = list(speed_audit["reliable_columns"])
+    hub_speed = "轮毂高度风速"
+    if hub_speed in reliable_speed_columns:
+        ccf_wind = weather[hub_speed].to_numpy(dtype=np.float64)
+        ccf_wind_source = "direct_cleaned_hub_wind"
+    elif reliable_speed_columns:
+        # The source list is learned from train-only reliability checks.  The
+        # values remain the cleaned observations at the same timestamp: no
+        # long-gap fill, validation statistic, or test statistic enters CCF.
+        ccf_wind = (
+            weather.loc[:, reliable_speed_columns]
+            .mean(axis=1, skipna=True)
+            .to_numpy(dtype=np.float64)
+        )
+        ccf_wind_source = (
+            "same_time_mean_train_reliable_heights:"
+            + "|".join(reliable_speed_columns)
+        )
+    else:
+        ccf_wind = np.full(n_rows, np.nan, dtype=np.float64)
+        ccf_wind_source = "unavailable_no_train_reliable_speed_sensor"
+    ccf_diagnostics = compute_ccf_diagnostics(
+        power_values.to_numpy(dtype=np.float64),
+        ccf_wind,
+        train_mask,
+        wind_source=ccf_wind_source,
+    )
 
     features = pd.concat([speed_frame, met_frame, direction_frame], axis=1)
     add_time_features(features)
@@ -1289,6 +1648,14 @@ def prepare_farm(
 
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
+    ccf_frame = pd.DataFrame(ccf_diagnostics["rows"])
+    ccf_frame.insert(0, "farm_id", farm_id)
+    ccf_frame.to_csv(
+        paths["ccf_diagnostics"],
+        index=False,
+        encoding="utf-8-sig",
+    )
+    ccf_diagnostics_sha = sha256_file(paths["ccf_diagnostics"])
     power_reference_payload = {
         "protocol_version": PROTOCOL_VERSION,
         "farm_id": farm_id,
@@ -1327,6 +1694,12 @@ def prepare_farm(
         "power_scale_offset": float(power_scale_offset),
         "power_reference_mw": power_reference,
         "power_reference_kind": "train_power_q999",
+        "direction_group_available": direction_audit[
+            "direction_group_model_available"
+        ],
+        "direction_group_source_status": direction_audit[
+            "direction_group_source_status"
+        ],
         "regime_feature_config": regime_config,
     }
     regime_payload["config_hash"] = sha256_json(regime_payload)
@@ -1441,7 +1814,23 @@ def prepare_farm(
                 or "assumed" in weather_rule.semantics
                 else "resolved"
             ),
+            "ccf_diagnostic_protocol": ccf_diagnostics["protocol"],
+            "ccf_diagnostic_status": ccf_diagnostics[
+                "overall_diagnostic_status"
+            ],
+            "ccf_wind_source": ccf_diagnostics["wind_source"],
+            "ccf_automatic_time_shift_applied": False,
+            "timestamp_semantics_config_sha256": (
+                current_semantics_config_sha
+            ),
         },
+        "time_alignment_ccf": {
+            key: value
+            for key, value in ccf_diagnostics.items()
+            if key != "rows"
+        },
+        "ccf_diagnostics_path": str(paths["ccf_diagnostics"].resolve()),
+        "ccf_diagnostics_sha256": ccf_diagnostics_sha,
         "array_path": str(paths["array"].resolve()),
         "array_sha256": array_sha,
         "canonical_path": str(paths["canonical"].resolve()),
@@ -1456,11 +1845,17 @@ def prepare_farm(
         "run_records_used_for_features": False,
         "run_records_used_as_nameplate_capacity": False,
         "preprocessing_code_path": str(Path(__file__).resolve()),
-        "preprocessing_code_sha256": sha256_file(__file__),
+        "preprocessing_code_sha256": current_preprocess_code_sha,
     }
     joblib.dump(bundle, paths["bundle"], compress=3)
     bundle_sha = sha256_file(paths["bundle"])
 
+    level_ccf_full = (
+        ccf_diagnostics["summary_by_series"]["level"]["full"] or {}
+    )
+    difference_ccf_full = (
+        ccf_diagnostics["summary_by_series"]["difference"]["full"] or {}
+    )
     summary = {
         "farm_id": farm_id,
         "status": "complete",
@@ -1476,6 +1871,12 @@ def prepare_farm(
         "validation_rows": int(val_stop - train_stop),
         "test_rows": int(n_rows - val_stop),
         "scaler_fit_points": int(scaler_fit_mask.sum()),
+        "raw_power_file_path": str(power_candidates[0].resolve()),
+        "raw_power_file_sha256": current_raw_power_sha,
+        "raw_weather_file_path": str(weather_candidates[0].resolve()),
+        "raw_weather_file_sha256": current_raw_weather_sha,
+        "timestamp_semantics_config_sha256": current_semantics_config_sha,
+        "preprocessing_code_sha256": current_preprocess_code_sha,
         "power_sampling_minutes": power_rule.sampling_minutes,
         "weather_sampling_minutes": weather_rule.sampling_minutes,
         "power_timestamp_semantics": power_rule.semantics,
@@ -1501,6 +1902,29 @@ def prepare_farm(
         "power_wind_alignment_status": bundle["timestamp_rules"][
             "alignment_status"
         ],
+        "ccf_diagnostic_status": ccf_diagnostics[
+            "overall_diagnostic_status"
+        ],
+        "ccf_wind_source": ccf_diagnostics["wind_source"],
+        "ccf_automatic_time_shift_applied": False,
+        "ccf_level_peak_lag_steps": level_ccf_full.get("peak_lag_steps"),
+        "ccf_level_peak_correlation": level_ccf_full.get(
+            "peak_correlation"
+        ),
+        "ccf_level_stability_status": ccf_diagnostics[
+            "summary_by_series"
+        ]["level"]["diagnostic_status"],
+        "ccf_difference_peak_lag_steps": difference_ccf_full.get(
+            "peak_lag_steps"
+        ),
+        "ccf_difference_peak_correlation": difference_ccf_full.get(
+            "peak_correlation"
+        ),
+        "ccf_difference_stability_status": ccf_diagnostics[
+            "summary_by_series"
+        ]["difference"]["diagnostic_status"],
+        "ccf_diagnostics_path": str(paths["ccf_diagnostics"].resolve()),
+        "ccf_diagnostics_sha256": ccf_diagnostics_sha,
         "run_record_file_count": len(run_record_audit),
         "power_valid_points": int(power_valid.sum()),
         "essential_wind_valid_points": int(essential_wind_valid.sum()),
@@ -1511,6 +1935,8 @@ def prepare_farm(
             sum(cross_split_target_overlap.values())
         ),
         "train_window_retention_ratio": float(retention),
+        "theoretical_train_windows": int(theoretical_train),
+        "train_calendar_days": float(train_days),
         "training_feasibility": feasibility,
         "limited_test_coverage": bool(len(origins["test"]) < 5000),
         "insufficient_test_samples": bool(len(origins["test"]) < 2000),
@@ -1539,6 +1965,36 @@ def prepare_farm(
         "direction_unity_violations_after_repair_per_mille": direction_audit[
             "unity_violations_after_repair_per_mille"
         ],
+        "direction_group_available": direction_audit[
+            "direction_group_available"
+        ],
+        "direction_group_direct_available": direction_audit[
+            "direction_group_direct_available"
+        ],
+        "direction_group_reconstructable": direction_audit[
+            "direction_group_reconstructable"
+        ],
+        "direction_group_model_available": direction_audit[
+            "direction_group_model_available"
+        ],
+        "direction_group_source_status": direction_audit[
+            "direction_group_source_status"
+        ],
+        "direction_reliable_source_count": direction_audit[
+            "direction_reliable_source_count"
+        ],
+        "train_consecutive_valid_hub_direction_pairs": direction_audit[
+            "train_consecutive_valid_hub_direction_pairs"
+        ],
+        "direction_group_required_contiguous_steps": direction_audit[
+            "direction_group_required_contiguous_steps"
+        ],
+        "train_valid_hub_direction_contexts_17": direction_audit[
+            "train_valid_hub_direction_contexts_17"
+        ],
+        "train_valid_hub_direction_fraction": direction_audit[
+            "train_valid_hub_direction_fraction"
+        ],
         "power_duplicate_rows": duplicate_power["duplicate_rows"],
         "weather_duplicate_rows": duplicate_weather["duplicate_rows"],
         "array_path": str(paths["array"].resolve()),
@@ -1563,6 +2019,7 @@ def prepare_farm(
         "weather_cleaning": weather_clean_audit,
         "speed_audit": speed_audit,
         "direction_audit": direction_audit,
+        "time_alignment_ccf": ccf_diagnostics,
         "meteorology_audit": met_audit,
         "cross_split_target_overlap": cross_split_target_overlap,
     }
@@ -1641,7 +2098,10 @@ def parse_farms(raw: str | None) -> list[str]:
     return list(dict.fromkeys(farms))
 
 
-def save_data_audit_visualization(frame: pd.DataFrame) -> Path:
+def save_data_audit_visualization(
+    frame: pd.DataFrame,
+    output_root: Path = RESULT_ROOT,
+) -> Path:
     """Save a compact, paper-traceable overview of the prepared stations."""
     os.environ.setdefault(
         "MPLCONFIGDIR",
@@ -1702,7 +2162,7 @@ def save_data_audit_visualization(frame: pd.DataFrame) -> Path:
         axis.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     path = (
-        RESULT_ROOT
+        output_root
         / "visualizations"
         / "data_quality"
         / "round3_external14_preprocess_overview.png"
@@ -1715,10 +2175,20 @@ def save_data_audit_visualization(frame: pd.DataFrame) -> Path:
 
 def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) -> None:
     frame = pd.DataFrame(summaries).sort_values("farm_id")
-    audit_path = RESULT_ROOT / "data_audit" / "round3_raw_data_audit.csv"
+    complete = set(requested) == set(EXPECTED_FARMS) and set(
+        frame["farm_id"]
+    ) == set(EXPECTED_FARMS)
+    report_root = (
+        RESULT_ROOT
+        if complete
+        else RESULT_ROOT / "partial_runs" / "preprocess_summary"
+    )
+    audit_dir = report_root / "data_audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / "round3_raw_data_audit.csv"
     frame.to_csv(audit_path, index=False, encoding="utf-8-sig")
     frame.to_csv(
-        RESULT_ROOT / "data_audit" / "round3_external14_data_audit.csv",
+        audit_dir / "round3_external14_data_audit.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -1739,14 +2209,16 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "cross_split_target_overlap_count",
     ]
     frame[split_cols].to_csv(
-        RESULT_ROOT / "data_audit" / "round3_external14_split_manifest.csv",
+        audit_dir / "round3_external14_split_manifest.csv",
         index=False,
         encoding="utf-8-sig",
     )
     feasibility_cols = [
         "farm_id",
         "train_windows",
+        "theoretical_train_windows",
         "train_window_retention_ratio",
+        "train_calendar_days",
         "training_feasibility",
         "validation_windows",
         "test_windows",
@@ -1754,7 +2226,7 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "insufficient_test_samples",
     ]
     frame[feasibility_cols].to_csv(
-        RESULT_ROOT / "data_audit" / "round3_training_feasibility.csv",
+        audit_dir / "round3_training_feasibility.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -1767,7 +2239,7 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "common_end",
     ]
     frame[reference_cols].to_csv(
-        RESULT_ROOT / "data_audit" / "round3_power_reference_table.csv",
+        audit_dir / "round3_power_reference_table.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -1784,11 +2256,20 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "power_wind_relative_offset",
         "alignment_status",
         "power_wind_alignment_status",
+        "ccf_diagnostic_status",
+        "ccf_wind_source",
+        "ccf_automatic_time_shift_applied",
+        "ccf_level_peak_lag_steps",
+        "ccf_level_peak_correlation",
+        "ccf_level_stability_status",
+        "ccf_difference_peak_lag_steps",
+        "ccf_difference_peak_correlation",
+        "ccf_difference_stability_status",
         "common_start",
         "common_end",
     ]
     frame[timestamp_cols].to_csv(
-        RESULT_ROOT / "data_audit" / "round3_timestamp_semantics.csv",
+        audit_dir / "round3_timestamp_semantics.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -1802,28 +2283,58 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "structurally_missing_speed_channels",
         "structurally_missing_direction_channels",
         "direction_unity_violations_after_repair_per_mille",
+        "direction_group_available",
+        "direction_group_direct_available",
+        "direction_group_reconstructable",
+        "direction_group_model_available",
+        "direction_group_source_status",
+        "direction_reliable_source_count",
+        "train_consecutive_valid_hub_direction_pairs",
+        "direction_group_required_contiguous_steps",
+        "train_valid_hub_direction_contexts_17",
+        "train_valid_hub_direction_fraction",
     ]
     regime_validation = frame[regime_cols].copy()
-    regime_validation["regime_config_status"] = np.where(
+    schema_valid = (
         (regime_validation["final_model_input_channels"] == 45)
         & (
             regime_validation[
                 "direction_unity_violations_after_repair_per_mille"
             ]
             == 0
-        ),
-        "valid",
-        "blocked",
+        )
+    )
+    regime_validation["regime_config_status"] = np.select(
+        [
+            schema_valid
+            & regime_validation["direction_group_model_available"]
+            & regime_validation["direction_group_direct_available"],
+            schema_valid & regime_validation["direction_group_model_available"],
+            schema_valid,
+        ],
+        [
+            "valid_direct_direction",
+            "valid_reconstructed_direction",
+            "valid_schema_direction_signal_unavailable",
+        ],
+        default="blocked_schema_or_physical_validation",
     )
     regime_validation.to_csv(
-        RESULT_ROOT / "data_audit" / "round3_regime_config_validation.csv",
+        audit_dir / "round3_regime_config_validation.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    overview_path = save_data_audit_visualization(frame)
-    complete = set(requested) == set(EXPECTED_FARMS) and set(frame["farm_id"]) == set(
-        EXPECTED_FARMS
+    ccf_frames = [
+        pd.read_csv(path, encoding="utf-8-sig")
+        for path in frame["ccf_diagnostics_path"]
+    ]
+    ccf_global_path = audit_dir / "round3_time_alignment_diagnostics.csv"
+    pd.concat(ccf_frames, ignore_index=True).to_csv(
+        ccf_global_path,
+        index=False,
+        encoding="utf-8-sig",
     )
+    overview_path = save_data_audit_visualization(frame, report_root)
     payload = {
         "status": "complete" if complete else "partial",
         "created_at": utc_now(),
@@ -1835,6 +2346,9 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
         "feature_schema_hash": sha256_json(list(FEATURE_SCHEMA)),
         "audit_path": str(audit_path.resolve()),
         "audit_sha256": sha256_file(audit_path),
+        "time_alignment_diagnostics_path": str(ccf_global_path.resolve()),
+        "time_alignment_diagnostics_sha256": sha256_file(ccf_global_path),
+        "ccf_used_for_automatic_time_shift": False,
         "data_overview_path": str(overview_path.resolve()),
         "data_overview_sha256": sha256_file(overview_path),
         "farm_artifacts": [
@@ -1846,6 +2360,8 @@ def write_global_outputs(summaries: list[dict[str, Any]], requested: list[str]) 
                 "bundle_sha256": row["bundle_sha256"],
                 "split_indices_path": row["split_indices_path"],
                 "split_indices_sha256": row["split_indices_sha256"],
+                "ccf_diagnostics_path": row["ccf_diagnostics_path"],
+                "ccf_diagnostics_sha256": row["ccf_diagnostics_sha256"],
             }
             for row in frame.to_dict(orient="records")
         ],

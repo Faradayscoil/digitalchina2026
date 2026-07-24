@@ -40,7 +40,13 @@ TRAINING_COMPLETE_CANDIDATES = (
     "manifests/training/round3_training_bundle_complete.json",
     "manifests/training/round3_external14_training_bundle_complete.json",
 )
-PROTOCOL_VERSION = "part3_round3_external14_test_once_v1"
+PROTOCOL_VERSION = "part3_round3_external14_test_once_v2"
+EXPECTED_PREPROCESS_PROTOCOL_VERSION = (
+    "part3_round3_external14_leakage_free_v2"
+)
+EXPECTED_TRAINING_PROTOCOL_VERSION = (
+    "part3_round3_external14_unified_training_v2"
+)
 SEED = 2026
 HISTORY_LEN = 96
 FORECAST_LEN = 16
@@ -82,6 +88,57 @@ TIE_TOLERANCE = 1e-6
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _test_evaluation_provenance(formal):
+    """Return precise test-use claims without overstating global blindness."""
+    return {
+        "test_reuse_status": (
+            "frozen_current_round_external_evaluation_with_"
+            "prior_dataset_exposure_disclosed"
+            if formal
+            else "nonformal_partial_or_smoke_diagnostic"
+        ),
+        # JSFD001--014 existed in an earlier teacher/processed-data workflow.
+        # This round rebuilds raw Excel and freezes models before formal
+        # prediction, but cannot truthfully claim that the dataset was never
+        # seen anywhere in the wider project.
+        "test_is_final_blind_evaluation": False,
+        "test_used_for_selection": bool(formal),
+        "selection_is_descriptive_not_confirmatory": True,
+        "confirmatory_evaluation_scope": (
+            "predeclared frozen-model comparisons and primary WindPRISM hypothesis"
+            if formal
+            else "none_nonformal_run"
+        ),
+        "winner_selection_scope": "descriptive test-set ranking",
+        "test_execution_mode": (
+            "one_shot_after_140_training_tasks_frozen"
+            if formal
+            else "partial_or_smoke_after_selected_tasks_frozen"
+        ),
+        "all_models_frozen_before_first_formal_test_prediction": bool(formal),
+        "test_targets_used_for_training_or_validation_selection": False,
+        "post_test_training_or_hyperparameter_changes_in_this_run": False,
+        "test_results_used_for_further_tuning_within_this_run": False,
+        "future_tuning_policy": (
+            "any later test-driven change invalidates confirmatory use and "
+            "must be disclosed as development reuse"
+        ),
+        "test_split_role": "within_station_chronological_holdout",
+        "external_to_current_windprism_development": True,
+        "dataset_globally_never_used": False,
+        "dataset_prior_use_context": (
+            "historical external-teacher/processed-data workflow; no Round-3 "
+            "arrays, statistics, or weights reused"
+        ),
+        "legacy_processed_npz_used": False,
+        "legacy_processed_npz_used_as_model_input": False,
+        "legacy_weights_reused": False,
+        "all_station_models_trained_from_scratch": bool(formal),
+        "architecture_definitions_reused": True,
+        "prediction_resume_allowed_only_with_identical_frozen_snapshot": True,
+    }
 
 
 def _sha256(path):
@@ -366,30 +423,95 @@ def _validate_preprocess_complete(root):
     payload = _read_json(path)
     if not _completion_declared(payload):
         raise ValueError(f"预处理marker未声明complete: {path}")
+    if payload.get("protocol_version") != EXPECTED_PREPROCESS_PROTOCOL_VERSION:
+        raise ValueError(f"预处理协议版本不是Round-3 v2: {path}")
+    if set(map(str, payload.get("completed_farms", ()))) != set(
+        EXPECTED_FARMS
+    ):
+        raise ValueError(f"预处理complete marker未精确覆盖14个场站: {path}")
     return path, payload
 
 
 def _validate_all_training_frozen(root):
     """在测试数组被读取前冻结并验证全部 140 个训练任务。"""
     root = Path(root).resolve()
-    complete_path = _find_training_complete(root)
+    complete_path = root / "round3_training_bundle_complete.json"
+    if not complete_path.is_file():
+        raise FileNotFoundError(
+            f"正式测试只接受规范Round-3 v2训练complete marker: {complete_path}"
+        )
     complete = _read_json(complete_path)
     if not _completion_declared(complete):
         raise ValueError(f"训练总marker未声明complete: {complete_path}")
+    if complete.get("protocol_version") != EXPECTED_TRAINING_PROTOCOL_VERSION:
+        raise ValueError(f"训练complete marker不是Round-3 v2: {complete_path}")
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+    declared_pairs = {
+        (str(item.get("model_id")), str(item.get("farm_id")))
+        for item in complete.get("completed_tasks", ())
+    }
+    if (
+        int(complete.get("expected_task_count", -1)) != len(expected_pairs)
+        or int(complete.get("completed_task_count", -1)) != len(expected_pairs)
+        or declared_pairs != expected_pairs
+    ):
+        raise ValueError("训练complete marker未精确声明10×14任务矩阵")
     hash_cache = {}
+    for record in complete.get("summary_outputs", {}).values():
+        _validate_record(record, hash_cache)
+    batch_policy_path = _validate_record(
+        {
+            "path": complete.get("global_batch_policy_path"),
+            "sha256": complete.get("global_batch_policy_sha256"),
+        },
+        hash_cache,
+    )
+    del batch_policy_path
+    task_records = {
+        (str(item.get("model_id")), str(item.get("farm_id"))): item
+        for item in complete.get("task_marker_records", ())
+    }
+    if set(task_records) != expected_pairs:
+        raise ValueError("训练complete marker缺少140个task marker哈希快照")
     tasks = {}
     for farm_id in EXPECTED_FARMS:
         for model_id in MODEL_IDS:
             path = _task_marker_path(root, model_id, farm_id)
             if not path.is_file():
                 raise FileNotFoundError(f"正式测试缺少训练task marker: {path}")
+            declared_record = task_records[(model_id, farm_id)]
+            if Path(declared_record["path"]).resolve() != path.resolve():
+                raise ValueError(f"训练task marker路径与complete快照不一致: {path}")
+            _validate_record(declared_record, hash_cache)
             marker = _read_json(path)
             if not _completion_declared(marker):
                 raise ValueError(f"训练task尚未complete: {path}")
+            if marker.get("protocol_version") != EXPECTED_TRAINING_PROTOCOL_VERSION:
+                raise ValueError(f"训练task协议版本漂移: {path}")
+            if (
+                marker.get("preprocess_protocol_version")
+                != EXPECTED_PREPROCESS_PROTOCOL_VERSION
+            ):
+                raise ValueError(f"训练task预处理协议版本漂移: {path}")
             if str(marker.get("model_id", model_id)) != model_id:
                 raise ValueError(f"训练task model_id漂移: {path}")
             if str(marker.get("farm_id", farm_id)) != farm_id:
                 raise ValueError(f"训练task farm_id漂移: {path}")
+            if (
+                marker.get("training_initialization")
+                != "from_scratch_seed_2026"
+                or marker.get("pretrained_weights_loaded") is not False
+            ):
+                raise ValueError(f"训练task未证明从seed=2026随机初始化: {path}")
+            if (
+                marker.get("global_batch_policy_sha256")
+                != complete.get("global_batch_policy_sha256")
+            ):
+                raise ValueError(f"训练task全局batch策略哈希漂移: {path}")
             model_record = _extract_artifact_record(marker, "model")
             _validate_record(model_record, hash_cache)
             for optional_role in ("weights", "artifact", "history"):
@@ -1351,16 +1473,74 @@ def _final_paths(output_root, model_id, farm_id):
     }
 
 
-def _prediction_marker_valid(path, frozen_task_hash, array_hash):
+def _prediction_marker_valid(
+    path,
+    frozen_task_hash,
+    array_hash,
+    *,
+    expected_model_id=None,
+    expected_farm_id=None,
+    expected_formal=None,
+    expected_bundle_hash=None,
+    expected_snapshot_hash=None,
+):
     if not Path(path).is_file():
         return None
     try:
         marker = _read_json(path)
         if not _completion_declared(marker):
             return None
+        if marker.get("protocol_version") != PROTOCOL_VERSION:
+            return None
+        if (
+            expected_model_id is not None
+            and marker.get("model_id") != expected_model_id
+        ):
+            return None
+        if (
+            expected_farm_id is not None
+            and marker.get("farm_id") != expected_farm_id
+        ):
+            return None
+        if (
+            expected_formal is not None
+            and marker.get("formal") is not bool(expected_formal)
+        ):
+            return None
         if marker.get("training_task_marker_sha256") != frozen_task_hash:
             return None
         if marker.get("test_array_sha256") != array_hash:
+            return None
+        if (
+            expected_bundle_hash is not None
+            and marker.get("preprocessing_bundle_sha256")
+            != expected_bundle_hash
+        ):
+            return None
+        if (
+            expected_snapshot_hash is not None
+            and marker.get("frozen_snapshot_sha256")
+            != expected_snapshot_hash
+        ):
+            return None
+        if not marker.get("power_reference_kind"):
+            return None
+        if "test_reuse_status" not in marker:
+            return None
+        horizon_rows = marker.get("horizon_metrics", ())
+        if len(horizon_rows) != FORECAST_LEN:
+            return None
+        if {
+            int(row.get("horizon", -1))
+            for row in horizon_rows
+        } != set(range(1, FORECAST_LEN + 1)):
+            return None
+        required_outputs = {
+            "sample_predictions",
+            "farm_metrics",
+            "horizon_metrics",
+        }
+        if not required_outputs.issubset(marker.get("output_files", {})):
             return None
         for record in marker.get("output_files", {}).values():
             if isinstance(record, dict) and record.get("path"):
@@ -1379,6 +1559,8 @@ def _run_prediction_task(
     station,
     frozen_task,
     batch_size,
+    formal,
+    snapshot_record,
 ):
     import numpy as np
 
@@ -1468,6 +1650,7 @@ def _run_prediction_task(
         "model_id": model_id,
         "model_display_name": MODEL_DISPLAY_NAMES[model_id],
         "farm_id": farm_id,
+        "formal": bool(formal),
         "training_task_marker_path": frozen_task["path"],
         "training_task_marker_sha256": frozen_task["sha256"],
         "model_path": str(model_path),
@@ -1477,8 +1660,12 @@ def _run_prediction_task(
         "test_array_path": station["array_path"],
         "test_array_sha256": station["array_sha256"],
         "schema_hash": station["schema_hash"],
+        "frozen_snapshot_path": snapshot_record["path"],
+        "frozen_snapshot_sha256": snapshot_record["sha256"],
+        "power_reference_kind": station["power_reference_kind"],
         "test_samples": len(station["test_origins"]),
         "batch_size": int(batch_size),
+        **_test_evaluation_provenance(formal),
         "metrics": overall,
         "horizon_metrics": horizon_rows,
         "output_files": output_files,
@@ -1877,6 +2064,7 @@ def _save_final_selection(
     macro_micro,
     average_ranks,
     complexity_summary,
+    formal,
 ):
     """Select the test winner using the frozen equal-farm protocol."""
     macro = {
@@ -1919,29 +2107,56 @@ def _save_final_selection(
         row["final_rank"] = position
     selected = ranking[0]
     payload = {
-        "status": "complete",
+        "status": "complete" if formal else "diagnostic_complete",
         "created_at_utc": _utc_now(),
         "selection_scope": "frozen test sets of requested farms",
         "primary_metric": "equal-farm macro NRMSE",
         "secondary_metric": "equal-farm macro NMAE",
         "tertiary_metric": "average per-farm NRMSE rank",
         "final_tiebreaker": "total parameter count",
-        "selected_model_id": selected["model_id"],
-        "selected_model_display_name": selected["model_display_name"],
-        "selected_metrics": selected,
+        **_test_evaluation_provenance(formal),
+        "selection_eligible": bool(formal),
+        "publication_result_eligible": bool(formal),
         "ranking": ranking,
     }
     root = Path(output_root)
-    json_path = root / "round3_external14_test_final_selection.json"
-    markdown_path = root / "round3_external14_test_final_selection.md"
-    _atomic_json(payload, json_path)
-    lines = [
-        "# Part 3 Round 3 test-set final selection",
-        "",
-        (
+    if formal:
+        payload.update(
+            {
+                "selected_model_id": selected["model_id"],
+                "selected_model_display_name": selected[
+                    "model_display_name"
+                ],
+                "selected_metrics": selected,
+            }
+        )
+        json_path = root / "round3_external14_test_final_selection.json"
+        markdown_path = root / "round3_external14_test_final_selection.md"
+        heading = "# Part 3 Round 3 test-set final selection"
+        lead = (
             f"Selected model: **{selected['model_display_name']} "
             f"(`{selected['model_id']}`)**."
-        ),
+        )
+    else:
+        payload.update(
+            {
+                "diagnostic_top_model_id": selected["model_id"],
+                "diagnostic_top_metrics": selected,
+                "selected_model_id": None,
+            }
+        )
+        json_path = root / "round3_nonformal_diagnostic_ranking.json"
+        markdown_path = root / "round3_nonformal_diagnostic_ranking.md"
+        heading = "# Part 3 Round 3 non-formal diagnostic ranking"
+        lead = (
+            f"Diagnostic top row: **{selected['model_display_name']} "
+            f"(`{selected['model_id']}`)**. This is not a final selection."
+        )
+    _atomic_json(payload, json_path)
+    lines = [
+        heading,
+        "",
+        lead,
         "",
         (
             "The frozen rule minimizes equal-farm Macro NRMSE, then Macro "
@@ -1967,6 +2182,16 @@ def _save_final_selection(
                 "the paired significance table must be consulted before "
                 "claiming statistical superiority."
             ),
+            (
+                "It is not labelled globally blind: JSFD001--JSFD014 had "
+                "historical exposure in a separate teacher-data workflow, "
+                + (
+                    "while formal Round-3 evaluation starts only after its "
+                    "140 from-scratch tasks are frozen."
+                    if formal
+                    else "and this partial/smoke ranking is diagnostic only."
+                )
+            ),
             "",
         ]
     )
@@ -1977,7 +2202,7 @@ def _save_final_selection(
     }
 
 
-def _aggregate_and_save(output_root, markers, models, farms):
+def _aggregate_and_save(output_root, markers, models, farms, formal):
     per_farm = [dict(marker["metrics"]) for marker in markers]
     per_horizon = [
         dict(row) for marker in markers for row in marker["horizon_metrics"]
@@ -2042,6 +2267,7 @@ def _aggregate_and_save(output_root, markers, models, farms):
             macro_micro,
             average_ranks,
             complexity_summary,
+            formal,
         )
     )
     return paths
@@ -2067,7 +2293,41 @@ def _write_inventory(output_root):
     return inventory_path, rows
 
 
-def _freeze_snapshot(output_root, frozen, preprocess_record, formal, resume):
+def _validate_inventory(output_root, inventory_record):
+    """Revalidate every inventoried file and reject missing/extra outputs."""
+    root = Path(output_root).resolve()
+    inventory_path = _validate_record(inventory_record)
+    with open(inventory_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    declared = set()
+    for row in rows:
+        relative = str(row["relative_path"])
+        if relative in declared:
+            raise ValueError(f"inventory包含重复路径: {relative}")
+        declared.add(relative)
+        _validate_record(
+            {
+                "path": root / relative,
+                "size_bytes": int(row["size_bytes"]),
+                "sha256": row["sha256"],
+            }
+        )
+    actual = {
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.resolve() != inventory_path.resolve()
+        and path.name != PREDICTION_COMPLETE_NAME
+    }
+    if actual != declared:
+        raise ValueError(
+            "prediction inventory与当前输出树不一致: "
+            f"missing={sorted(declared - actual)[:5]}, "
+            f"extra={sorted(actual - declared)[:5]}"
+        )
+
+
+def _freeze_snapshot(output_root, frozen, preprocess_record, formal):
     path = Path(output_root) / "manifests" / "frozen_training_snapshot.json"
     payload = {
         "protocol_version": PROTOCOL_VERSION,
@@ -2155,32 +2415,83 @@ def main(argv=None):
         output_root = root / PREDICTION_DIRNAME
     elif args.output_root:
         output_root = Path(args.output_root).resolve()
-        if output_root == (root / PREDICTION_DIRNAME).resolve():
-            raise ValueError("partial/smoke输出不能指向正式testdata_predict_output")
+        formal_output_root = (root / PREDICTION_DIRNAME).resolve()
+        if (
+            output_root == formal_output_root
+            or formal_output_root in output_root.parents
+        ):
+            raise ValueError(
+                "partial/smoke输出不能位于正式testdata_predict_output目录树"
+            )
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = "smoke" if args.smoke else "partial"
         output_root = (
-            root / PREDICTION_DIRNAME / "partial_runs" / f"{stamp}_{tag}"
+            root / "partial_runs" / "prediction" / f"{stamp}_{tag}"
         )
     output_root.mkdir(parents=True, exist_ok=True)
     snapshot_path = _freeze_snapshot(
-        output_root, frozen, preprocess_record, formal, args.resume
+        output_root,
+        frozen,
+        preprocess_record,
+        formal,
     )
+    snapshot_record = _file_record(snapshot_path)
     complete_path = output_root / PREDICTION_COMPLETE_NAME
     if formal and complete_path.is_file():
         existing = _read_json(complete_path)
         if _completion_declared(existing):
-            if int(existing.get("task_count", -1)) != (
-                len(MODEL_IDS) * len(EXPECTED_FARMS)
-            ):
-                raise ValueError("已有正式预测complete marker的任务数不完整")
-            for record in existing.get("summary_files", {}).values():
-                _validate_record(record)
-            _validate_record(existing["inventory"])
-            _revalidate_frozen(frozen)
-            print(f"正式测试bundle已经完成且冻结产物未变化: {complete_path}")
-            return 0
+            if existing.get("protocol_version") != PROTOCOL_VERSION:
+                print(
+                    "检测到旧协议正式预测marker；将在相同冻结训练条件下"
+                    "重新生成v2预测归档"
+                )
+            else:
+                if int(existing.get("task_count", -1)) != (
+                    len(MODEL_IDS) * len(EXPECTED_FARMS)
+                ):
+                    raise ValueError("已有正式预测complete marker的任务数不完整")
+                for record in existing.get("summary_files", {}).values():
+                    _validate_record(record)
+                _validate_inventory(output_root, existing["inventory"])
+                for farm_id in EXPECTED_FARMS:
+                    for model_id in MODEL_IDS:
+                        marker_path = _prediction_marker_path(
+                            output_root,
+                            model_id,
+                            farm_id,
+                        )
+                        marker = _read_json(marker_path)
+                        task = frozen["tasks"][(model_id, farm_id)]
+                        if _prediction_marker_valid(
+                            marker_path,
+                            task["sha256"],
+                            _sha256(marker["test_array_path"]),
+                            expected_model_id=model_id,
+                            expected_farm_id=farm_id,
+                            expected_formal=True,
+                            expected_bundle_hash=_sha256(
+                                marker["preprocessing_bundle_path"]
+                            ),
+                            expected_snapshot_hash=snapshot_record["sha256"],
+                        ) is None:
+                            raise ValueError(
+                                f"已有正式预测task恢复校验失败: {marker_path}"
+                            )
+                _revalidate_frozen(frozen)
+                if (
+                    "test_reuse_status" in existing
+                    and "test_is_final_blind_evaluation" in existing
+                ):
+                    print(
+                        "正式测试bundle已经完成且冻结产物未变化: "
+                        f"{complete_path}"
+                    )
+                    return 0
+                print(
+                    "检测到旧版正式预测marker缺少测试使用声明；"
+                    "将在相同冻结快照下重新生成预测归档"
+                )
     _atomic_json(
         {
             "protocol_version": PROTOCOL_VERSION,
@@ -2206,12 +2517,15 @@ def main(argv=None):
                 "all 140 training tasks and the training complete marker "
                 "validated before any test NPZ values are read"
             ),
+            **_test_evaluation_provenance(formal),
         },
         output_root / "manifests" / "round3_prediction_protocol.json",
     )
 
     tf, keras = _configure_tensorflow()
     completed = []
+    reused_prediction_task_count = 0
+    new_prediction_task_count = 0
     failures = []
     for farm_id in farms:
         print(f"\n===== Round 3 test farm={farm_id} =====")
@@ -2228,7 +2542,14 @@ def main(argv=None):
             marker_path = _prediction_marker_path(output_root, model_id, farm_id)
             cached = (
                 _prediction_marker_valid(
-                    marker_path, task["sha256"], station["array_sha256"]
+                    marker_path,
+                    task["sha256"],
+                    station["array_sha256"],
+                    expected_model_id=model_id,
+                    expected_farm_id=farm_id,
+                    expected_formal=formal,
+                    expected_bundle_hash=station["bundle_sha256"],
+                    expected_snapshot_hash=snapshot_record["sha256"],
                 )
                 if args.resume
                 else None
@@ -2236,6 +2557,7 @@ def main(argv=None):
             if cached is not None:
                 print(f"resume跳过 {model_id}/{farm_id}")
                 completed.append(cached)
+                reused_prediction_task_count += 1
                 continue
             try:
                 marker = _run_prediction_task(
@@ -2247,8 +2569,11 @@ def main(argv=None):
                     station,
                     task,
                     args.batch_size,
+                    formal,
+                    snapshot_record,
                 )
                 completed.append(marker)
+                new_prediction_task_count += 1
             except Exception as exc:
                 failures.append(
                     {
@@ -2278,7 +2603,14 @@ def main(argv=None):
             f"{len(failures)}个预测任务失败；未生成complete marker"
         )
     markers = _collect_prediction_markers(output_root, models, farms)
-    summary_paths = _aggregate_and_save(output_root, markers, models, farms)
+    summary_paths = _aggregate_and_save(
+        output_root,
+        markers,
+        models,
+        farms,
+        formal,
+    )
+    selection_payload = _read_json(summary_paths["selection_json"])
     _revalidate_frozen(frozen)
     inventory_path, inventory_rows = _write_inventory(output_root)
     completion = {
@@ -2291,10 +2623,19 @@ def main(argv=None):
         "farm_ids": farms,
         "task_count": len(markers),
         "expected_formal_task_count": len(MODEL_IDS) * len(EXPECTED_FARMS),
-        "test_was_read_only_after_training_freeze": True,
+        "new_prediction_task_count": new_prediction_task_count,
+        "reused_prediction_task_count": reused_prediction_task_count,
+        "all_140_models_frozen_before_this_test_run": bool(formal),
+        "selected_tasks_frozen_before_this_test_run": True,
+        "selection_eligible": bool(formal),
+        "selected_model_id": (
+            selection_payload.get("selected_model_id") if formal else None
+        ),
+        "final_selection": _file_record(summary_paths["selection_json"]),
+        **_test_evaluation_provenance(formal),
         "preprocess_complete": preprocess_record,
         "training_complete": frozen.get("training_complete"),
-        "frozen_snapshot": _file_record(snapshot_path),
+        "frozen_snapshot": snapshot_record,
         "summary_files": {
             key: _file_record(path) for key, path in summary_paths.items()
         },

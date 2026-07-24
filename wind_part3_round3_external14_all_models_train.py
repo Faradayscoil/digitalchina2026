@@ -3,8 +3,9 @@
 父调度器本身不导入 TensorFlow。每个 ``model_id × farm_id`` 任务均在全新
 子进程中构建模型、训练并退出，以可靠释放 GPU 上下文。数据只来自 Round 3
 预处理生成的 NPZ/bundle；本文件不会调用旧工程的读 CSV、插值、缩放或切窗
-函数。HR-MoE 首先以 batch=192 运行，仅在识别到 CUDA OOM 后由父进程启动
-新的 batch=128 worker 并从 seed=2026 随机初始化重新训练。
+函数。正式训练前，三个重模型会在最大训练场站各用独立进程完成一个完整
+train+validation预检epoch；只有HR-MoE预检确认CUDA OOM时才锁定全局
+batch=128，随后14个HR场站全部使用同一batch。
 """
 
 from __future__ import annotations
@@ -28,8 +29,8 @@ import numpy as np
 import pandas as pd
 
 
-PROTOCOL_VERSION = "part3_round3_external14_unified_training_v1"
-PREPROCESS_PROTOCOL_VERSION = "part3_round3_external14_leakage_free_v1"
+PROTOCOL_VERSION = "part3_round3_external14_unified_training_v2"
+PREPROCESS_PROTOCOL_VERSION = "part3_round3_external14_leakage_free_v2"
 RESULT_ROOT = Path(
     "./wind_results/part3_new_module_supplement/"
     "03_external14_leakage_free_strong_baseline_benchmark"
@@ -49,6 +50,16 @@ MODEL_IDS = (
 )
 OTHER_MODELS = frozenset(MODEL_IDS[1:8])
 HEAVY_FALLBACK_MODEL = "hr_moe_fets_patchtst"
+PREFLIGHT_MODELS = (
+    "hr_moe_fets_patchtst",
+    "wavenet",
+    "transformer",
+)
+CALIBRATION_MODELS = (
+    "hr_moe_fets_patchtst",
+    "autoformer",
+    "patchtst",
+)
 HISTORY_LEN = 96
 FORECAST_LEN = 16
 INPUT_DIM = 45
@@ -59,6 +70,7 @@ EXPECTED_FEATURE_SCHEMA_HASH = (
 RANDOM_SEED = 2026
 DEFAULT_BATCH_SIZE = 192
 OOM_FALLBACK_BATCH_SIZE = 128
+HISTORICAL_BATCH_SIZE = 256
 LEARNING_RATE = 5e-4
 CLIPNORM = 1.0
 EARLY_STOPPING_PATIENCE = 10
@@ -85,14 +97,36 @@ EXPECTED_PARAMETER_COUNTS = {
 }
 _MISSING_SAFE_REGIME_LAYER_CLASS: Any | None = None
 OOM_EXIT_CODE = 86
-CUDA_OOM_PATTERNS = (
-    "resourceexhaustederror",
+EXPLICIT_CUDA_OOM_PATTERNS = (
     "cuda_error_out_of_memory",
     "cudaerrormemoryallocation",
     "cudnn_status_alloc_failed",
-    "failed to allocate memory",
-    "oom when allocating",
 )
+BATCH_POLICY_PATH = RESULT_ROOT / "manifests" / "round3_batch_policy.json"
+PREFLIGHT_SUMMARY_PATH = (
+    RESULT_ROOT / "data_audit" / "round3_gpu_preflight_summary.csv"
+)
+RESOURCE_PLAN_INITIAL_PATH = (
+    RESULT_ROOT / "manifests" / "round3_resource_plan_initial.json"
+)
+RESOURCE_PLAN_CALIBRATED_PATH = (
+    RESULT_ROOT / "manifests" / "round3_resource_plan_calibrated.json"
+)
+RUNTIME_PROGRESS_PATH = (
+    RESULT_ROOT / "complexity" / "round3_runtime_progress.csv"
+)
+HISTORICAL_TASK_SECONDS = {
+    "patchtst": 1035.0,
+    "bilstm": 128.0,
+    "cnn_lstm": 81.0,
+    "cnn_resnet_gru": 136.0,
+    "wavenet": 101.0,
+    "transformer": 147.0,
+    "informer": 288.0,
+    "autoformer": 1755.0,
+    "hr_moe_fets_patchtst": 3292.0,
+    "windprism_f7_g0": 137.0,
+}
 
 
 def utc_now() -> str:
@@ -171,7 +205,7 @@ def artifact_paths(model_id: str, farm_id: str, smoke: bool = False) -> dict[str
             if smoke
             else RESULT_ROOT / "manifests" / "training" / f"{stem}.json"
         ),
-        "attempt_root": RESULT_ROOT / "attempts" / model_id / farm_id,
+        "attempt_root": root / "attempts" / model_id / farm_id,
     }
 
 
@@ -183,10 +217,109 @@ def ensure_preprocess_complete() -> dict[str, Any]:
         payload = json.load(handle)
     if payload.get("status") != "complete":
         raise ValueError(f"预处理marker不是complete: {marker}")
+    if payload.get("protocol_version") != PREPROCESS_PROTOCOL_VERSION:
+        raise ValueError(
+            f"预处理协议版本不匹配: {payload.get('protocol_version')}"
+        )
     completed = set(map(str, payload.get("completed_farms", ())))
     if completed != set(EXPECTED_FARMS):
         raise ValueError("预处理marker未覆盖JSFD001--JSFD014")
     return payload
+
+
+def preprocess_summary(farm_id: str) -> dict[str, Any]:
+    path = RESULT_ROOT / "manifests" / "preprocess" / f"{farm_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("status") != "complete":
+        raise ValueError(f"预处理场站marker不是complete: {path}")
+    if payload.get("protocol_version") != PREPROCESS_PROTOCOL_VERSION:
+        raise ValueError(f"预处理场站协议版本漂移: {path}")
+    summary = payload.get("summary", {})
+    if str(summary.get("farm_id")) != farm_id:
+        raise ValueError(f"预处理场站marker身份漂移: {path}")
+    return summary
+
+
+def largest_training_farm() -> str:
+    rows = [
+        (int(preprocess_summary(farm_id)["train_windows"]), farm_id)
+        for farm_id in EXPECTED_FARMS
+    ]
+    return max(rows, key=lambda item: (item[0], item[1]))[1]
+
+
+def load_batch_policy(require_valid_sources: bool = True) -> dict[str, Any]:
+    if not BATCH_POLICY_PATH.is_file():
+        raise FileNotFoundError(f"缺少全局batch策略: {BATCH_POLICY_PATH}")
+    with open(BATCH_POLICY_PATH, "r", encoding="utf-8") as handle:
+        policy = json.load(handle)
+    if policy.get("status") != "complete":
+        raise ValueError("全局batch策略不是complete")
+    if policy.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("全局batch策略协议版本漂移")
+    if set(policy.get("preflight_models", ())) != set(PREFLIGHT_MODELS):
+        raise ValueError("全局batch策略未覆盖三个预检模型")
+    hr_batch = int(policy.get("hr_moe_effective_batch_size", -1))
+    if hr_batch not in (DEFAULT_BATCH_SIZE, OOM_FALLBACK_BATCH_SIZE):
+        raise ValueError(f"HR-MoE全局batch无效: {hr_batch}")
+    effective = policy.get("model_effective_batch_sizes", {})
+    if int(effective.get(HEAVY_FALLBACK_MODEL, -1)) != hr_batch:
+        raise ValueError("HR-MoE预检结果与全局batch字段不一致")
+    for model_id in ("wavenet", "transformer"):
+        if int(effective.get(model_id, -1)) != DEFAULT_BATCH_SIZE:
+            raise ValueError(f"{model_id}预检未锁定batch=192")
+    if policy.get("gpu_preflight_verified") is not True:
+        raise ValueError("全局batch策略没有真实GPU预检证明")
+    gpu_names = policy.get("preflight_gpu_names_by_model", {})
+    if any(not gpu_names.get(model_id) for model_id in PREFLIGHT_MODELS):
+        raise ValueError("全局batch策略缺少预检GPU设备身份")
+    summary_path = Path(str(policy.get("preflight_summary_path", "")))
+    if (
+        not summary_path.is_file()
+        or sha256_file(summary_path) != policy.get("preflight_summary_sha256")
+    ):
+        raise ValueError("GPU预检summary缺失或SHA漂移")
+    if require_valid_sources:
+        farm_id = str(policy.get("preflight_farm_id"))
+        if farm_id != largest_training_farm():
+            raise ValueError("全局batch策略的最大训练场站已漂移")
+        paths = artifact_paths("patchtst", farm_id)
+        current = {
+            "array_sha256": sha256_file(paths["array"]),
+            "preprocess_bundle_sha256": sha256_file(paths["bundle"]),
+            "training_code_sha256": sha256_file(__file__),
+        }
+        for key, value in current.items():
+            if policy.get(key) != value:
+                raise ValueError(f"全局batch策略源身份漂移: {key}")
+    return policy
+
+
+def formal_batch_size(model_id: str, policy: dict[str, Any]) -> int:
+    if model_id == HEAVY_FALLBACK_MODEL:
+        return int(policy["hr_moe_effective_batch_size"])
+    return DEFAULT_BATCH_SIZE
+
+
+def validate_task_policy(
+    marker_path: Path,
+    model_id: str,
+    policy: dict[str, Any],
+) -> None:
+    with open(marker_path, "r", encoding="utf-8") as handle:
+        marker = json.load(handle)
+    expected_batch = formal_batch_size(model_id, policy)
+    if int(marker.get("effective_batch_size", -1)) != expected_batch:
+        raise ValueError(
+            f"{model_id}/{marker.get('farm_id')} batch与全局策略不一致"
+        )
+    if marker.get("global_batch_policy_sha256") != sha256_file(BATCH_POLICY_PATH):
+        raise ValueError(
+            f"{model_id}/{marker.get('farm_id')} batch策略SHA已漂移"
+        )
 
 
 def completed_marker_valid(path: Path) -> bool:
@@ -197,21 +330,36 @@ def completed_marker_valid(path: Path) -> bool:
             payload = json.load(handle)
         if payload.get("status") != "complete":
             return False
-        for key in ("model_path", "weights_path", "history_path"):
-            value = payload.get(key)
-            if not value or not Path(value).is_file():
-                return False
-        hash_pairs = (
+        if payload.get("protocol_version") != PROTOCOL_VERSION:
+            return False
+        if payload.get("preprocess_protocol_version") != PREPROCESS_PROTOCOL_VERSION:
+            return False
+        required_path_hashes = (
             ("model_path", "model_sha256"),
             ("weights_path", "weights_sha256"),
             ("history_path", "history_sha256"),
+            ("history_plot_path", "history_plot_sha256"),
+            ("validation_path", "validation_sha256"),
+            ("overfit_path", "overfit_sha256"),
             ("array_path", "array_sha256"),
             ("preprocess_bundle_path", "preprocess_bundle_sha256"),
         )
-        for path_key, hash_key in hash_pairs:
+        for path_key, hash_key in required_path_hashes:
             value = payload.get(path_key)
             expected = payload.get(hash_key)
-            if not value or not expected or sha256_file(value) != expected:
+            if not value or not expected or not Path(value).is_file():
+                return False
+            if sha256_file(value) != expected:
+                return False
+        if not payload.get("smoke"):
+            policy_path = payload.get("global_batch_policy_path")
+            policy_hash = payload.get("global_batch_policy_sha256")
+            if (
+                not policy_path
+                or not policy_hash
+                or not Path(policy_path).is_file()
+                or sha256_file(policy_path) != policy_hash
+            ):
                 return False
         return True
     except Exception:
@@ -220,11 +368,54 @@ def completed_marker_valid(path: Path) -> bool:
 
 def is_oom_text(text: str) -> bool:
     lowered = text.lower()
-    if any(pattern in lowered for pattern in CUDA_OOM_PATTERNS):
+    if any(pattern in lowered for pattern in EXPLICIT_CUDA_OOM_PATTERNS):
         return True
-    return "out of memory" in lowered and any(
-        token in lowered for token in ("cuda", "gpu", "cudnn", "tensorflow")
+    memory_signal = any(
+        pattern in lowered
+        for pattern in (
+            "resourceexhaustederror",
+            "failed to allocate memory",
+            "out of memory",
+            "oom when allocating",
+        )
     )
+    gpu_signal = any(
+        token in lowered
+        for token in (
+            "cuda",
+            "gpu",
+            "cudnn",
+            "gpu_bfc",
+            "/device:gpu",
+        )
+    )
+    return memory_signal and gpu_signal
+
+
+def is_confirmed_cuda_oom(
+    exc: Exception,
+    text: str,
+    tf: Any,
+    model: Any,
+) -> bool:
+    if is_oom_text(text):
+        return True
+    if tf is None or model is None:
+        return False
+    resource_exhausted = isinstance(exc, tf.errors.ResourceExhaustedError)
+    memory_signal = any(
+        token in text.lower()
+        for token in ("oom", "out of memory", "failed to allocate")
+    )
+    model_on_gpu = False
+    for variable in getattr(model, "weights", ()):
+        device = str(getattr(variable, "device", ""))
+        if not device and hasattr(variable, "handle"):
+            device = str(getattr(variable.handle, "device", ""))
+        if "GPU" in device.upper():
+            model_on_gpu = True
+            break
+    return resource_exhausted and memory_signal and model_on_gpu
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,7 +425,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="跳过身份校验通过的任务")
     parser.add_argument("--force", action="store_true", help="覆盖已有任务")
     parser.add_argument("--smoke", action="store_true", help="每任务仅跑1 epoch且隔离保存")
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="只完成全局GPU预检和batch策略，不启动正式训练",
+    )
+    parser.add_argument(
+        "--force-preflight",
+        action="store_true",
+        help="忽略已有有效GPU预检策略并重新运行",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--preflight-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model", choices=MODEL_IDS, help=argparse.SUPPRESS)
     parser.add_argument("--farm", choices=EXPECTED_FARMS, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, help=argparse.SUPPRESS)
@@ -884,12 +1086,162 @@ def model_size_bytes(path: Path) -> int:
     return 0
 
 
+def run_preflight_worker(args: argparse.Namespace) -> int:
+    """在隔离子进程执行完整train+validation单epoch显存预检。"""
+    if args.model not in PREFLIGHT_MODELS or not args.farm or not args.batch_size:
+        raise ValueError("preflight worker参数不完整")
+    model_id = str(args.model)
+    farm_id = str(args.farm)
+    batch_size = int(args.batch_size)
+    attempt_dir = Path(args.attempt_dir)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = attempt_dir / "preflight_attempt.json"
+    started = time.monotonic()
+    tf = keras = model = None
+    try:
+        tf, keras = configure_worker_environment()
+        physical_gpus = tf.config.list_physical_devices("GPU")
+        if not physical_gpus:
+            raise RuntimeError(
+                "GPU预检要求至少一个TensorFlow可见GPU；禁止用CPU结果发布显存策略"
+            )
+        prepared = load_prepared(farm_id)
+        train_ds = make_dataset(
+            tf,
+            prepared,
+            prepared["train_origins"],
+            batch_size,
+            training=True,
+            dual_targets=False,
+        )
+        val_ds = make_dataset(
+            tf,
+            prepared,
+            prepared["val_origins"],
+            batch_size,
+            training=False,
+            dual_targets=False,
+        )
+        model = build_model(model_id, prepared, keras)
+        model.compile(
+            optimizer=keras.optimizers.Adam(
+                learning_rate=LEARNING_RATE, clipnorm=CLIPNORM
+            ),
+            loss=keras.losses.Huber(delta=1.0),
+            metrics=[
+                keras.metrics.MeanAbsoluteError(name="mae"),
+                keras.metrics.RootMeanSquaredError(name="rmse"),
+            ],
+        )
+        for gpu in tf.config.list_physical_devices("GPU"):
+            try:
+                tf.config.experimental.reset_memory_stats("GPU:0")
+            except Exception:
+                break
+        fit_started = time.monotonic()
+        history = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=1,
+            verbose=2,
+        )
+        fit_seconds = time.monotonic() - fit_started
+        history_values = pd.DataFrame(history.history).select_dtypes(
+            include=[np.number]
+        )
+        if history_values.empty or not np.isfinite(
+            history_values.to_numpy(dtype=float)
+        ).all():
+            raise FloatingPointError("GPU预检history为空或包含非有限值")
+        peak_gpu_bytes = None
+        try:
+            peak_gpu_bytes = int(
+                tf.config.experimental.get_memory_info("GPU:0")["peak"]
+            )
+        except Exception:
+            pass
+        payload = {
+            "status": "complete",
+            "created_at": utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "preflight_kind": "full_train_validation_single_epoch",
+            "formal_artifact_published": False,
+            "model_id": model_id,
+            "farm_id": farm_id,
+            "batch_size": batch_size,
+            "random_seed": RANDOM_SEED,
+            "training_initialization": "from_scratch_seed_2026",
+            "pretrained_weights_loaded": False,
+            "train_windows": int(len(prepared["train_origins"])),
+            "validation_windows": int(len(prepared["val_origins"])),
+            "train_steps": int(
+                np.ceil(len(prepared["train_origins"]) / batch_size)
+            ),
+            "validation_steps": int(
+                np.ceil(len(prepared["val_origins"]) / batch_size)
+            ),
+            "parameter_count": int(model.count_params()),
+            "fit_seconds": fit_seconds,
+            "elapsed_seconds": time.monotonic() - started,
+            "peak_gpu_memory_bytes": peak_gpu_bytes,
+            "physical_gpu_names": [
+                str(getattr(gpu, "name", gpu)) for gpu in physical_gpus
+            ],
+            "gpu_preflight_verified": True,
+            "array_sha256": prepared["array_sha256"],
+            "preprocess_bundle_sha256": prepared["preprocess_bundle_sha256"],
+            "training_code_sha256": sha256_file(__file__),
+        }
+        atomic_json(marker_path, payload)
+        print(
+            f"[preflight complete] {model_id}/{farm_id}, batch={batch_size}, "
+            f"fit={fit_seconds:.1f}s"
+        )
+        return 0
+    except Exception as exc:
+        text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        oom = is_confirmed_cuda_oom(exc, text, tf, model)
+        atomic_json(
+            marker_path,
+            {
+                "status": "oom" if oom else "failed",
+                "created_at": utc_now(),
+                "protocol_version": PROTOCOL_VERSION,
+                "model_id": model_id,
+                "farm_id": farm_id,
+                "batch_size": batch_size,
+                "exception_type": type(exc).__name__,
+                "message": str(exc)[:4000],
+                "cuda_oom_confirmed": oom,
+                "elapsed_seconds": time.monotonic() - started,
+                "training_code_sha256": sha256_file(__file__),
+            },
+        )
+        print(text, file=sys.stderr)
+        return OOM_EXIT_CODE if oom else 1
+    finally:
+        if keras is not None:
+            try:
+                keras.backend.clear_session()
+            except Exception:
+                pass
+        del model
+        gc.collect()
+
+
 def run_worker(args: argparse.Namespace) -> int:
     if not args.model or not args.farm or not args.batch_size:
         raise ValueError("worker必须指定--model/--farm/--batch-size")
     model_id, farm_id = args.model, args.farm
     batch_size = int(args.batch_size)
     smoke = bool(args.smoke)
+    batch_policy = None if smoke else load_batch_policy(require_valid_sources=True)
+    if batch_policy is not None:
+        expected_batch = formal_batch_size(model_id, batch_policy)
+        if batch_size != expected_batch:
+            raise ValueError(
+                f"{model_id} worker batch={batch_size}与全局策略{expected_batch}不符"
+            )
     paths = artifact_paths(model_id, farm_id, smoke=smoke)
     attempt_dir = Path(args.attempt_dir or paths["attempt_root"] / f"attempt_bs{batch_size}")
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -901,6 +1253,8 @@ def run_worker(args: argparse.Namespace) -> int:
     tf = keras = model = None
     try:
         tf, keras = configure_worker_environment()
+        if not smoke and not tf.config.list_physical_devices("GPU"):
+            raise RuntimeError("正式训练要求TensorFlow可见GPU，当前仅检测到CPU")
 
         class FiniteLogGuard(keras.callbacks.Callback):
             def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
@@ -1049,6 +1403,8 @@ def run_worker(args: argparse.Namespace) -> int:
             "model_name": model.name,
             "farm_id": farm_id,
             "random_seed": RANDOM_SEED,
+            "training_initialization": "from_scratch_seed_2026",
+            "pretrained_weights_loaded": False,
             "history_len": HISTORY_LEN,
             "forecast_len": FORECAST_LEN,
             "input_dim": INPUT_DIM,
@@ -1057,7 +1413,29 @@ def run_worker(args: argparse.Namespace) -> int:
             "requested_batch_size": DEFAULT_BATCH_SIZE,
             "effective_batch_size": batch_size,
             "batch_size": batch_size,
-            "fallback_triggered": batch_size != DEFAULT_BATCH_SIZE,
+            # The formal task starts directly at the batch frozen by the
+            # preflight policy; it is not itself an OOM retry.
+            "fallback_triggered": False,
+            "task_retry_after_oom": False,
+            "global_policy_fallback_active": bool(
+                batch_policy
+                and batch_policy.get("hr_moe_global_fallback_triggered")
+                and model_id == HEAVY_FALLBACK_MODEL
+            ),
+            "global_fallback_triggered": bool(
+                batch_policy
+                and batch_policy.get("hr_moe_global_fallback_triggered")
+                and model_id == HEAVY_FALLBACK_MODEL
+            ),
+            "global_batch_policy_path": (
+                str(BATCH_POLICY_PATH.resolve()) if batch_policy else None
+            ),
+            "global_batch_policy_sha256": (
+                sha256_file(BATCH_POLICY_PATH) if batch_policy else None
+            ),
+            "global_batch_policy_reason": (
+                batch_policy.get("hr_moe_batch_reason") if batch_policy else None
+            ),
             "attempted_batch_sizes": [batch_size],
             "epochs_requested": epochs,
             "epochs_ran": int(len(history_frame)),
@@ -1095,8 +1473,11 @@ def run_worker(args: argparse.Namespace) -> int:
             "history_path": str(paths["history"].resolve()),
             "history_sha256": sha256_file(paths["history"]),
             "history_plot_path": str(paths["history_plot"].resolve()),
+            "history_plot_sha256": sha256_file(paths["history_plot"]),
             "validation_path": str(paths["validation"].resolve()),
+            "validation_sha256": sha256_file(paths["validation"]),
             "overfit_path": str(paths["overfit"].resolve()),
+            "overfit_sha256": sha256_file(paths["overfit"]),
             "array_path": prepared["array_path"],
             "array_sha256": prepared["array_sha256"],
             "preprocess_bundle_path": prepared["bundle_path"],
@@ -1156,7 +1537,7 @@ def run_worker(args: argparse.Namespace) -> int:
         return 0
     except Exception as exc:
         text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        oom = is_oom_text(text)
+        oom = is_confirmed_cuda_oom(exc, text, tf, model)
         atomic_json(
             attempt_marker,
             {
@@ -1207,6 +1588,217 @@ def worker_command(
     return command
 
 
+def preflight_worker_command(
+    model_id: str,
+    farm_id: str,
+    batch_size: int,
+    attempt_dir: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--preflight-worker",
+        "--model",
+        model_id,
+        "--farm",
+        farm_id,
+        "--batch-size",
+        str(batch_size),
+        "--attempt-dir",
+        str(attempt_dir.resolve()),
+    ]
+
+
+def launch_preflight_worker(
+    model_id: str,
+    farm_id: str,
+    batch_size: int,
+) -> tuple[int, Path, Path, str]:
+    attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    attempt_dir = (
+        RESULT_ROOT
+        / "partial_runs"
+        / "gpu_preflight"
+        / model_id
+        / farm_id
+        / f"batch_{batch_size}"
+        / f"attempt_{attempt_id}"
+    )
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = attempt_dir / "preflight_attempt.json"
+    marker_path.unlink(missing_ok=True)
+    log_path = attempt_dir / "worker.log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CUDA_VISIBLE_DEVICES": environment.get("CUDA_VISIBLE_DEVICES", "0"),
+            "TF_FORCE_GPU_ALLOW_GROWTH": "true",
+            "TF_DETERMINISTIC_OPS": "1",
+            "PYTHONHASHSEED": str(RANDOM_SEED),
+        }
+    )
+    command = preflight_worker_command(
+        model_id, farm_id, batch_size, attempt_dir
+    )
+    print(
+        f"\n[preflight launch] {model_id}/{farm_id}, batch={batch_size}; "
+        f"log={log_path}"
+    )
+    tail: list[str] = []
+    with open(log_path, "w", encoding="utf-8") as log_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path.cwd()),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            log_handle.write(line)
+            log_handle.flush()
+            print(line, end="")
+            tail.append(line)
+            if len(tail) > 300:
+                tail.pop(0)
+        code = int(process.wait())
+    return code, marker_path, log_path, "".join(tail)
+
+
+def read_preflight_attempt(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"预检worker未生成marker: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def ensure_global_preflight(force: bool = False) -> dict[str, Any]:
+    """执行/复用三模型全局预检并冻结HR-MoE的统一batch。"""
+    if force and load_formal_markers_fast():
+        raise RuntimeError(
+            "已有正式训练task marker，禁止重建全局batch策略；"
+            "若确需重建，必须先人工归档并清理全部正式任务"
+        )
+    if BATCH_POLICY_PATH.exists() and not force:
+        try:
+            policy = load_batch_policy(require_valid_sources=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "已有batch策略身份无效；请审计后使用--force-preflight重建"
+            ) from exc
+        print(
+            "[preflight resume] "
+            f"farm={policy['preflight_farm_id']}, "
+            f"HR batch={policy['hr_moe_effective_batch_size']}"
+        )
+        return policy
+    if force:
+        BATCH_POLICY_PATH.unlink(missing_ok=True)
+
+    farm_id = largest_training_farm()
+    paths = artifact_paths("patchtst", farm_id)
+    attempts: list[dict[str, Any]] = []
+    successful: dict[str, dict[str, Any]] = {}
+    hr_effective_batch = DEFAULT_BATCH_SIZE
+    hr_fallback = False
+
+    for model_id in PREFLIGHT_MODELS:
+        code, marker_path, log_path, tail = launch_preflight_worker(
+            model_id, farm_id, DEFAULT_BATCH_SIZE
+        )
+        attempt = read_preflight_attempt(marker_path)
+        attempt["log_path"] = str(log_path.resolve())
+        attempts.append(attempt)
+        if code == 0 and attempt.get("status") == "complete":
+            successful[model_id] = attempt
+            continue
+        oom = (
+            code == OOM_EXIT_CODE
+            and bool(attempt.get("cuda_oom_confirmed"))
+        )
+        if model_id != HEAVY_FALLBACK_MODEL:
+            reason = "CUDA OOM" if oom else "非CUDA OOM失败"
+            raise RuntimeError(
+                f"{model_id} batch=192 GPU预检{reason}；协议不允许自动降batch。"
+                f"log={log_path}"
+            )
+        if not oom:
+            raise RuntimeError(
+                "HR-MoE预检失败但未确认CUDA OOM，不得自动降batch；"
+                f"log={log_path}"
+            )
+        hr_fallback = True
+        hr_effective_batch = OOM_FALLBACK_BATCH_SIZE
+        code, marker_path, log_path, tail = launch_preflight_worker(
+            model_id, farm_id, OOM_FALLBACK_BATCH_SIZE
+        )
+        fallback_attempt = read_preflight_attempt(marker_path)
+        fallback_attempt["log_path"] = str(log_path.resolve())
+        attempts.append(fallback_attempt)
+        if code != 0 or fallback_attempt.get("status") != "complete":
+            raise RuntimeError(
+                "HR-MoE batch=128 GPU预检仍失败，停止正式训练；"
+                f"log={log_path}; tail={tail[-2000:]}"
+            )
+        successful[model_id] = fallback_attempt
+
+    if set(successful) != set(PREFLIGHT_MODELS):
+        raise AssertionError("GPU预检未完整覆盖三个模型")
+    summary = pd.DataFrame(attempts)
+    atomic_csv(PREFLIGHT_SUMMARY_PATH, summary)
+    policy = {
+        "status": "complete",
+        "created_at": utc_now(),
+        "protocol_version": PROTOCOL_VERSION,
+        "preflight_kind": "full_train_validation_single_epoch",
+        "preflight_farm_id": farm_id,
+        "preflight_models": list(PREFLIGHT_MODELS),
+        "gpu_preflight_verified": True,
+        "preflight_gpu_names_by_model": {
+            model_id: payload.get("physical_gpu_names", [])
+            for model_id, payload in successful.items()
+        },
+        "default_batch_size": DEFAULT_BATCH_SIZE,
+        "hr_moe_effective_batch_size": hr_effective_batch,
+        "hr_moe_global_fallback_triggered": hr_fallback,
+        "hr_moe_batch_reason": (
+            "global_preflight_cuda_oom_192_then_128_passed"
+            if hr_fallback
+            else "global_preflight_192_passed"
+        ),
+        "model_effective_batch_sizes": {
+            model_id: int(payload["batch_size"])
+            for model_id, payload in successful.items()
+        },
+        "preflight_attempts": [
+            {
+                "model_id": item.get("model_id"),
+                "batch_size": item.get("batch_size"),
+                "status": item.get("status"),
+                "cuda_oom_confirmed": item.get("cuda_oom_confirmed", False),
+                "fit_seconds": item.get("fit_seconds"),
+                "elapsed_seconds": item.get("elapsed_seconds"),
+                "peak_gpu_memory_bytes": item.get("peak_gpu_memory_bytes"),
+                "log_path": item.get("log_path"),
+            }
+            for item in attempts
+        ],
+        "preflight_summary_path": str(PREFLIGHT_SUMMARY_PATH.resolve()),
+        "preflight_summary_sha256": sha256_file(PREFLIGHT_SUMMARY_PATH),
+        "array_sha256": sha256_file(paths["array"]),
+        "preprocess_bundle_sha256": sha256_file(paths["bundle"]),
+        "training_code_sha256": sha256_file(__file__),
+    }
+    atomic_json(BATCH_POLICY_PATH, policy)
+    print(
+        f"[preflight complete] 最大训练场站={farm_id}, "
+        f"HR-MoE正式batch={hr_effective_batch}"
+    )
+    return policy
+
+
 def launch_worker(
     model_id: str,
     farm_id: str,
@@ -1214,7 +1806,11 @@ def launch_worker(
     smoke: bool,
 ) -> tuple[int, Path, str]:
     paths = artifact_paths(model_id, farm_id, smoke=smoke)
-    attempt_dir = paths["attempt_root"] / f"attempt_bs{batch_size}"
+    attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    attempt_dir = (
+        paths["attempt_root"]
+        / f"attempt_bs{batch_size}_{attempt_id}"
+    )
     attempt_dir.mkdir(parents=True, exist_ok=True)
     log_path = attempt_dir / "worker.log"
     environment = os.environ.copy()
@@ -1254,38 +1850,6 @@ def launch_worker(
     return code, log_path, "".join(tail)
 
 
-def record_fallback(
-    marker_path: Path,
-    first_log: Path,
-    second_log: Path,
-) -> None:
-    with open(marker_path, "r", encoding="utf-8") as handle:
-        marker = json.load(handle)
-    first_attempt_marker = first_log.parent / "attempt.json"
-    first_attempt: dict[str, Any] = {}
-    if first_attempt_marker.is_file():
-        with open(first_attempt_marker, "r", encoding="utf-8") as handle:
-            first_attempt = json.load(handle)
-    marker.update(
-        {
-            "requested_batch_size": DEFAULT_BATCH_SIZE,
-            "effective_batch_size": OOM_FALLBACK_BATCH_SIZE,
-            "batch_size": OOM_FALLBACK_BATCH_SIZE,
-            "fallback_triggered": True,
-            "attempted_batch_sizes": [
-                DEFAULT_BATCH_SIZE,
-                OOM_FALLBACK_BATCH_SIZE,
-            ],
-            "fallback_reason": "cuda_oom_in_fresh_bs192_worker",
-            "oom_exception_type": first_attempt.get("exception_type"),
-            "oom_message": first_attempt.get("message"),
-            "batch192_log_path": str(first_log.resolve()),
-            "batch128_log_path": str(second_log.resolve()),
-        }
-    )
-    atomic_json(marker_path, marker)
-
-
 def load_all_formal_markers() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for model_id in MODEL_IDS:
@@ -1301,7 +1865,246 @@ def load_all_formal_markers() -> list[dict[str, Any]]:
     return rows
 
 
-def write_summaries(markers: list[dict[str, Any]]) -> dict[str, str]:
+def load_formal_markers_fast() -> dict[tuple[str, str], dict[str, Any]]:
+    markers: dict[tuple[str, str], dict[str, Any]] = {}
+    for model_id in MODEL_IDS:
+        for farm_id in EXPECTED_FARMS:
+            path = artifact_paths(model_id, farm_id)["marker"]
+            if not path.is_file():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception:
+                continue
+            if (
+                payload.get("status") == "complete"
+                and payload.get("model_id") == model_id
+                and payload.get("farm_id") == farm_id
+            ):
+                markers[(model_id, farm_id)] = payload
+    return markers
+
+
+def ordered_formal_tasks(
+    models: Iterable[str],
+    farms: Iterable[str],
+    largest_farm: str,
+) -> list[tuple[str, str]]:
+    model_set, farm_set = set(models), set(farms)
+    priority = [
+        (model_id, largest_farm)
+        for model_id in CALIBRATION_MODELS
+        if model_id in model_set and largest_farm in farm_set
+    ]
+    stable = [
+        (model_id, farm_id)
+        for model_id in MODEL_IDS
+        if model_id in model_set
+        for farm_id in EXPECTED_FARMS
+        if farm_id in farm_set
+    ]
+    return priority + [task for task in stable if task not in set(priority)]
+
+
+def write_initial_resource_plan(
+    policy: dict[str, Any],
+    largest_farm: str,
+) -> dict[str, Any]:
+    central_seconds = 14.0 * sum(
+        seconds
+        * HISTORICAL_BATCH_SIZE
+        / formal_batch_size(model_id, policy)
+        for model_id, seconds in HISTORICAL_TASK_SECONDS.items()
+    )
+    payload = {
+        "status": "initial",
+        "created_at": utc_now(),
+        "protocol_version": PROTOCOL_VERSION,
+        "estimation_basis": (
+            "predeclared 80-120 GPU-hour planning envelope; per-model "
+            "historical timing priors are diagnostic only and are replaced "
+            "by formal calibration tasks"
+        ),
+        "expected_task_count": len(MODEL_IDS) * len(EXPECTED_FARMS),
+        "largest_training_farm": largest_farm,
+        "calibration_task_order": [
+            {"model_id": model_id, "farm_id": largest_farm}
+            for model_id in CALIBRATION_MODELS
+        ],
+        "hr_moe_effective_batch_size": policy["hr_moe_effective_batch_size"],
+        "estimated_training_gpu_hours_center": 100.0,
+        "estimated_training_gpu_hours_lower": 80.0,
+        "estimated_training_gpu_hours_upper": 120.0,
+        "historical_prior_scaled_task_sum_gpu_hours": (
+            central_seconds / 3600.0
+        ),
+        "historical_task_seconds_at_batch256": HISTORICAL_TASK_SECONDS,
+        "resource_reservation_gpu_hours": [80.0, 130.0],
+        "batch_policy_path": str(BATCH_POLICY_PATH.resolve()),
+        "batch_policy_sha256": sha256_file(BATCH_POLICY_PATH),
+        "preflight_elapsed_gpu_hours": float(
+            sum(
+                float(item.get("elapsed_seconds") or 0.0)
+                for item in policy.get("preflight_attempts", ())
+            )
+            / 3600.0
+        ),
+    }
+    atomic_json(RESOURCE_PLAN_INITIAL_PATH, payload)
+    return payload
+
+
+def update_runtime_progress(
+    policy: dict[str, Any],
+    largest_farm: str,
+) -> dict[str, Any]:
+    policy_sha = sha256_file(BATCH_POLICY_PATH)
+    markers: dict[tuple[str, str], dict[str, Any]] = {}
+    for (model_id, farm_id), marker in load_formal_markers_fast().items():
+        marker_path = artifact_paths(model_id, farm_id)["marker"]
+        if not completed_marker_valid(marker_path):
+            continue
+        if marker.get("global_batch_policy_sha256") != policy_sha:
+            continue
+        if int(marker.get("effective_batch_size", -1)) != formal_batch_size(
+            model_id,
+            policy,
+        ):
+            continue
+        markers[(model_id, farm_id)] = marker
+    rates: dict[str, list[float]] = {model_id: [] for model_id in MODEL_IDS}
+    epoch_counts: dict[str, list[int]] = {model_id: [] for model_id in MODEL_IDS}
+    overheads: dict[str, list[float]] = {model_id: [] for model_id in MODEL_IDS}
+    for (model_id, _), marker in markers.items():
+        batch = int(marker["effective_batch_size"])
+        epochs = max(1, int(marker["epochs_ran"]))
+        steps = int(np.ceil(int(marker["train_windows"]) / batch)) + int(
+            np.ceil(int(marker["validation_windows"]) / batch)
+        )
+        fit_seconds = float(marker["fit_seconds"])
+        rates[model_id].append(fit_seconds / max(1, epochs * steps))
+        epoch_counts[model_id].append(epochs)
+        overheads[model_id].append(
+            max(0.0, float(marker["elapsed_seconds"]) - fit_seconds)
+        )
+
+    rows: list[dict[str, Any]] = []
+    for model_id in MODEL_IDS:
+        for farm_id in EXPECTED_FARMS:
+            marker = markers.get((model_id, farm_id))
+            summary = preprocess_summary(farm_id)
+            batch = formal_batch_size(model_id, policy)
+            train_windows = int(summary["train_windows"])
+            val_windows = int(summary["validation_windows"])
+            steps = int(np.ceil(train_windows / batch)) + int(
+                np.ceil(val_windows / batch)
+            )
+            if marker:
+                center = float(marker["elapsed_seconds"])
+                lower = upper = center
+                status = "complete"
+            elif rates[model_id]:
+                rate = float(np.median(rates[model_id]))
+                expected_epochs = float(np.median(epoch_counts[model_id]))
+                overhead = float(np.median(overheads[model_id]))
+                center = overhead + rate * steps * expected_epochs
+                lower = overhead + rate * steps * max(1.0, expected_epochs * 0.75)
+                upper = overhead + rate * steps * EPOCHS[model_id]
+                status = "pending_calibrated"
+            else:
+                center = (
+                    float(HISTORICAL_TASK_SECONDS[model_id])
+                    * HISTORICAL_BATCH_SIZE
+                    / batch
+                )
+                lower, upper = 0.75 * center, 1.75 * center
+                status = "pending_historical"
+            rows.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    "status": status,
+                    "train_windows": train_windows,
+                    "validation_windows": val_windows,
+                    "effective_batch_size": batch,
+                    "epochs_ran": marker.get("epochs_ran") if marker else None,
+                    "observed_fit_seconds": (
+                        marker.get("fit_seconds") if marker else None
+                    ),
+                    "observed_elapsed_seconds": (
+                        marker.get("elapsed_seconds") if marker else None
+                    ),
+                    "estimated_seconds_lower": lower,
+                    "estimated_seconds_center": center,
+                    "estimated_seconds_upper": upper,
+                }
+            )
+    frame = pd.DataFrame(rows)
+    atomic_csv(RUNTIME_PROGRESS_PATH, frame)
+    pending = frame[~frame["status"].eq("complete")]
+    completed_frame = frame[frame["status"].eq("complete")]
+    observed_seconds = float(
+        completed_frame["observed_elapsed_seconds"].fillna(0.0).sum()
+    )
+    summary_payload = {
+        "created_at": utc_now(),
+        "protocol_version": PROTOCOL_VERSION,
+        "completed_task_count": int(frame["status"].eq("complete").sum()),
+        "verified_task_count": len(markers),
+        "remaining_task_count": int(len(pending)),
+        "remaining_gpu_hours_lower": float(
+            pending["estimated_seconds_lower"].sum() / 3600.0
+        ),
+        "remaining_gpu_hours_center": float(
+            pending["estimated_seconds_center"].sum() / 3600.0
+        ),
+        "remaining_gpu_hours_upper": float(
+            pending["estimated_seconds_upper"].sum() / 3600.0
+        ),
+        "observed_training_gpu_hours": observed_seconds / 3600.0,
+        "estimated_total_gpu_hours_center": float(
+            (
+                observed_seconds
+                + pending["estimated_seconds_center"].sum()
+            )
+            / 3600.0
+        ),
+        "runtime_progress_path": str(RUNTIME_PROGRESS_PATH.resolve()),
+        "runtime_progress_sha256": sha256_file(RUNTIME_PROGRESS_PATH),
+    }
+    calibration_tasks = {
+        (model_id, largest_farm) for model_id in CALIBRATION_MODELS
+    }
+    if calibration_tasks.issubset(markers):
+        summary_payload.update(
+            {
+                "status": "calibrated",
+                "largest_training_farm": largest_farm,
+                "calibration_tasks": [
+                    {
+                        "model_id": model_id,
+                        "farm_id": largest_farm,
+                        "fit_seconds": markers[(model_id, largest_farm)][
+                            "fit_seconds"
+                        ],
+                        "epochs_ran": markers[(model_id, largest_farm)][
+                            "epochs_ran"
+                        ],
+                    }
+                    for model_id in CALIBRATION_MODELS
+                ],
+                "batch_policy_sha256": sha256_file(BATCH_POLICY_PATH),
+            }
+        )
+        atomic_json(RESOURCE_PLAN_CALIBRATED_PATH, summary_payload)
+    return summary_payload
+
+
+def write_summaries(
+    markers: list[dict[str, Any]],
+    report_root: Path,
+) -> dict[str, str]:
     summary_rows: list[dict[str, Any]] = []
     validation_rows: list[dict[str, Any]] = []
     complexity_rows: list[dict[str, Any]] = []
@@ -1360,26 +2163,33 @@ def write_summaries(markers: list[dict[str, Any]]) -> dict[str, str]:
                 "requested_batch_size": marker.get("requested_batch_size"),
                 "effective_batch_size": marker.get("effective_batch_size"),
                 "fallback_triggered": marker.get("fallback_triggered"),
+                "global_policy_fallback_active": marker.get(
+                    "global_policy_fallback_active"
+                ),
+                "task_retry_after_oom": marker.get("task_retry_after_oom"),
                 "attempted_batch_sizes": json.dumps(
                     marker.get("attempted_batch_sizes", []), ensure_ascii=False
                 ),
-                "fallback_reason": marker.get("fallback_reason"),
+                "fallback_reason": marker.get(
+                    "global_batch_policy_reason",
+                    marker.get("fallback_reason"),
+                ),
                 "oom_exception_type": marker.get("oom_exception_type"),
                 "oom_message": marker.get("oom_message"),
             }
         )
     outputs = {
-        "summary": RESULT_ROOT / "round3_external14_training_summary.csv",
-        "validation": RESULT_ROOT
+        "summary": report_root / "round3_external14_training_summary.csv",
+        "validation": report_root
         / "validation_metrics"
         / "round3_external14_validation_metrics.csv",
-        "complexity": RESULT_ROOT
+        "complexity": report_root
         / "complexity"
         / "round3_external14_training_complexity_runtime.csv",
-        "overfit": RESULT_ROOT
+        "overfit": report_root
         / "validation_metrics"
         / "round3_overfit_diagnostics.csv",
-        "fallback": RESULT_ROOT
+        "fallback": report_root
         / "complexity"
         / "round3_batch_fallback_summary.csv",
     }
@@ -1393,10 +2203,45 @@ def write_summaries(markers: list[dict[str, Any]]) -> dict[str, str]:
 
 def finalize_bundle() -> dict[str, Any]:
     markers = load_all_formal_markers()
-    outputs = write_summaries(markers)
+    policy = load_batch_policy(require_valid_sources=True)
+    policy_sha = sha256_file(BATCH_POLICY_PATH)
+    batches_by_model: dict[str, set[int]] = {
+        model_id: set() for model_id in MODEL_IDS
+    }
+    for marker in markers:
+        model_id = str(marker["model_id"])
+        batches_by_model[model_id].add(int(marker["effective_batch_size"]))
+        if marker.get("global_batch_policy_sha256") != policy_sha:
+            raise ValueError(
+                f"{model_id}/{marker['farm_id']}使用的全局batch策略SHA已漂移"
+            )
+    mixed = {
+        model_id: sorted(values)
+        for model_id, values in batches_by_model.items()
+        if len(values) > 1
+    }
+    if mixed:
+        raise ValueError(f"同一模型跨场站混用batch: {mixed}")
+    expected_hr_batch = int(policy["hr_moe_effective_batch_size"])
+    observed_hr = batches_by_model[HEAVY_FALLBACK_MODEL]
+    if observed_hr and observed_hr != {expected_hr_batch}:
+        raise ValueError(
+            f"HR-MoE正式batch{sorted(observed_hr)}与全局策略"
+            f"{expected_hr_batch}不一致"
+        )
+    for model_id in MODEL_IDS:
+        if model_id != HEAVY_FALLBACK_MODEL and batches_by_model[model_id]:
+            if batches_by_model[model_id] != {DEFAULT_BATCH_SIZE}:
+                raise ValueError(f"{model_id}正式batch不是统一192")
     identities = {(item["model_id"], item["farm_id"]) for item in markers}
     expected = {(model, farm) for model in MODEL_IDS for farm in EXPECTED_FARMS}
     complete = identities == expected and len(markers) == len(expected)
+    report_root = (
+        RESULT_ROOT
+        if complete
+        else RESULT_ROOT / "partial_runs" / "training_summary"
+    )
+    outputs = write_summaries(markers, report_root)
     payload = {
         "status": "complete" if complete else "partial",
         "created_at": utc_now(),
@@ -1409,9 +2254,82 @@ def finalize_bundle() -> dict[str, Any]:
             {"model_id": item["model_id"], "farm_id": item["farm_id"]}
             for item in markers
         ],
-        "summary_outputs": outputs,
+        "summary_outputs": {
+            name: {
+                "path": path,
+                "sha256": sha256_file(path),
+                "size_bytes": Path(path).stat().st_size,
+            }
+            for name, path in outputs.items()
+        },
+        "task_marker_records": [
+            {
+                "model_id": item["model_id"],
+                "farm_id": item["farm_id"],
+                "path": str(
+                    artifact_paths(
+                        item["model_id"],
+                        item["farm_id"],
+                    )["marker"].resolve()
+                ),
+                "sha256": sha256_file(
+                    artifact_paths(
+                        item["model_id"],
+                        item["farm_id"],
+                    )["marker"]
+                ),
+            }
+            for item in markers
+        ],
         "batch_fallback_count": int(
-            sum(bool(item.get("fallback_triggered")) for item in markers)
+            bool(policy["hr_moe_global_fallback_triggered"])
+        ),
+        "fallback_event_count": int(
+            bool(policy["hr_moe_global_fallback_triggered"])
+        ),
+        "tasks_using_fallback_batch": int(
+            sum(
+                item["model_id"] == HEAVY_FALLBACK_MODEL
+                and int(item["effective_batch_size"])
+                == OOM_FALLBACK_BATCH_SIZE
+                for item in markers
+            )
+        ),
+        "global_batch_policy_path": str(BATCH_POLICY_PATH.resolve()),
+        "global_batch_policy_sha256": policy_sha,
+        "hr_moe_effective_batch_size": expected_hr_batch,
+        "hr_moe_global_fallback_triggered": bool(
+            policy["hr_moe_global_fallback_triggered"]
+        ),
+        "effective_batches_by_model": {
+            model_id: sorted(values)
+            for model_id, values in batches_by_model.items()
+        },
+        "resource_plan_initial_path": str(RESOURCE_PLAN_INITIAL_PATH.resolve()),
+        "resource_plan_initial_sha256": (
+            sha256_file(RESOURCE_PLAN_INITIAL_PATH)
+            if RESOURCE_PLAN_INITIAL_PATH.is_file()
+            else None
+        ),
+        "resource_plan_calibrated_path": (
+            str(RESOURCE_PLAN_CALIBRATED_PATH.resolve())
+            if RESOURCE_PLAN_CALIBRATED_PATH.is_file()
+            else None
+        ),
+        "resource_plan_calibrated_sha256": (
+            sha256_file(RESOURCE_PLAN_CALIBRATED_PATH)
+            if RESOURCE_PLAN_CALIBRATED_PATH.is_file()
+            else None
+        ),
+        "runtime_progress_path": (
+            str(RUNTIME_PROGRESS_PATH.resolve())
+            if RUNTIME_PROGRESS_PATH.is_file()
+            else None
+        ),
+        "runtime_progress_sha256": (
+            sha256_file(RUNTIME_PROGRESS_PATH)
+            if RUNTIME_PROGRESS_PATH.is_file()
+            else None
         ),
         "all_default_batch_192": bool(
             markers
@@ -1420,6 +2338,9 @@ def finalize_bundle() -> dict[str, Any]:
     }
     if complete:
         marker_path = RESULT_ROOT / "round3_training_bundle_complete.json"
+        (RESULT_ROOT / "partial_runs" / "round3_training_partial.json").unlink(
+            missing_ok=True
+        )
     else:
         marker_path = RESULT_ROOT / "partial_runs" / "round3_training_partial.json"
     atomic_json(marker_path, payload)
@@ -1430,72 +2351,86 @@ def run_parent(args: argparse.Namespace) -> int:
     ensure_preprocess_complete()
     models = parse_selection(args.models, MODEL_IDS, "模型")
     farms = parse_selection(args.farms, EXPECTED_FARMS, "场站")
+    if args.smoke and args.preflight_only:
+        raise ValueError("--smoke与--preflight-only不能同时使用")
     if args.smoke and args.farms.strip().lower() == "all":
         farms = [EXPECTED_FARMS[0]]
         print(f"[smoke] 未显式指定场站，仅使用{farms[0]}验证全部所选模型")
     if args.force and args.resume:
         raise ValueError("--force与--resume不能同时使用")
+    policy = None
+    largest_farm = largest_training_farm()
     if not args.smoke:
+        policy = ensure_global_preflight(force=bool(args.force_preflight))
+        if args.preflight_only:
+            write_initial_resource_plan(policy, largest_farm)
+            update_runtime_progress(policy, largest_farm)
+            print(
+                f"[preflight-only complete] farm={largest_farm}, "
+                f"HR batch={policy['hr_moe_effective_batch_size']}"
+            )
+            return 0
         # 任一正式调度开始即撤销旧全局complete；只有重新核验140项后才发布。
         (RESULT_ROOT / "round3_training_bundle_complete.json").unlink(
             missing_ok=True
         )
+        if args.force:
+            for model_id, farm_id in ordered_formal_tasks(
+                models, farms, largest_farm
+            ):
+                artifact_paths(model_id, farm_id)["marker"].unlink(
+                    missing_ok=True
+                )
+        RESOURCE_PLAN_CALIBRATED_PATH.unlink(missing_ok=True)
+        write_initial_resource_plan(policy, largest_farm)
+        update_runtime_progress(policy, largest_farm)
+    elif args.force_preflight:
+        raise ValueError("--force-preflight不能与--smoke同时使用")
 
     completed = 0
     skipped = 0
-    for model_id in models:
-        for farm_id in farms:
-            paths = artifact_paths(model_id, farm_id, smoke=args.smoke)
-            if completed_marker_valid(paths["marker"]):
-                if args.resume:
-                    print(f"[resume] {model_id}/{farm_id}已完成，跳过")
-                    skipped += 1
-                    continue
-                if not args.force:
-                    raise FileExistsError(
-                        f"{model_id}/{farm_id}已有完整产物；使用--resume或--force"
-                    )
-            code, first_log, tail = launch_worker(
-                model_id,
-                farm_id,
-                DEFAULT_BATCH_SIZE,
-                smoke=args.smoke,
+    tasks = ordered_formal_tasks(models, farms, largest_farm)
+    for model_id, farm_id in tasks:
+        paths = artifact_paths(model_id, farm_id, smoke=args.smoke)
+        if completed_marker_valid(paths["marker"]):
+            if args.resume:
+                if policy is not None:
+                    validate_task_policy(paths["marker"], model_id, policy)
+                print(f"[resume] {model_id}/{farm_id}已完成，跳过")
+                skipped += 1
+                continue
+            if not args.force:
+                raise FileExistsError(
+                    f"{model_id}/{farm_id}已有完整产物；使用--resume或--force"
+                )
+        batch_size = (
+            DEFAULT_BATCH_SIZE
+            if args.smoke
+            else formal_batch_size(model_id, policy)
+        )
+        code, worker_log, tail = launch_worker(
+            model_id,
+            farm_id,
+            batch_size,
+            smoke=args.smoke,
+        )
+        if code != 0:
+            oom = code == OOM_EXIT_CODE
+            if oom:
+                raise RuntimeError(
+                    f"{model_id}/{farm_id}按全局policy batch={batch_size}"
+                    "仍发生CUDA OOM；禁止逐场站降batch，以免协议混用。"
+                    f"log={worker_log}"
+                )
+            raise RuntimeError(
+                f"{model_id}/{farm_id}非CUDA OOM训练失败；"
+                f"code={code}, log={worker_log}, tail={tail[-2000:]}"
             )
-            if code != 0:
-                oom = code == OOM_EXIT_CODE or is_oom_text(tail)
-                if (
-                    oom
-                    and model_id == HEAVY_FALLBACK_MODEL
-                ):
-                    print(
-                        f"[oom-fallback] {model_id}/{farm_id} batch=192 OOM；"
-                        "启动全新batch=128 worker"
-                    )
-                    code, second_log, second_tail = launch_worker(
-                        model_id,
-                        farm_id,
-                        OOM_FALLBACK_BATCH_SIZE,
-                        smoke=args.smoke,
-                    )
-                    if code != 0:
-                        raise RuntimeError(
-                            f"{model_id}/{farm_id} batch=128重试仍失败；"
-                            f"log={second_log}; tail={second_tail[-2000:]}"
-                        )
-                    record_fallback(paths["marker"], first_log, second_log)
-                else:
-                    explanation = (
-                        "检测到OOM，但只有HR-MoE允许自动回退128"
-                        if oom
-                        else "非OOM训练失败"
-                    )
-                    raise RuntimeError(
-                        f"{model_id}/{farm_id}: {explanation}; "
-                        f"code={code}, log={first_log}, tail={tail[-2000:]}"
-                    )
-            if not completed_marker_valid(paths["marker"]):
-                raise RuntimeError(f"worker成功退出但任务marker无效: {paths['marker']}")
-            completed += 1
+        if not completed_marker_valid(paths["marker"]):
+            raise RuntimeError(f"worker成功退出但任务marker无效: {paths['marker']}")
+        completed += 1
+        if policy is not None:
+            update_runtime_progress(policy, largest_farm)
 
     if args.smoke:
         payload = {
@@ -1515,17 +2450,21 @@ def run_parent(args: argparse.Namespace) -> int:
         print(f"[smoke complete] {completed} tasks, {skipped} skipped")
         return 0
 
+    runtime = update_runtime_progress(policy, largest_farm)
     bundle = finalize_bundle()
     print(
         f"[training {bundle['status']}] 本轮完成={completed}, 跳过={skipped}, "
         f"全局进度={bundle['completed_task_count']}/{bundle['expected_task_count']}, "
-        f"batch回退={bundle['batch_fallback_count']}"
+        f"HR全局batch={bundle['hr_moe_effective_batch_size']}, "
+        f"剩余ETA中心={runtime['remaining_gpu_hours_center']:.2f} GPU小时"
     )
     return 0
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.preflight_worker:
+        raise SystemExit(run_preflight_worker(args))
     if args.worker:
         raise SystemExit(run_worker(args))
     try:
