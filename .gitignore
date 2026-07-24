@@ -31,6 +31,9 @@
 !/wind_part3_round3_external14_all_models_train.py
 !/wind_part3_round3_external14_all_models_predict.py
 
+# Keep the dependency manifest.
+!/requirements.txt
+
 # Keep the current FeTS-PatchTST model handoff document on this branch.
 !/docs/
 /docs/*

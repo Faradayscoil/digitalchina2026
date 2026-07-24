@@ -1,0 +1,23 @@
+# Part 3 Round 3 — JSFD14 Leakage-Free External Benchmark
+#
+# Install: pip install -r requirements.txt
+#
+# Core deep-learning framework (Keras is bundled inside TF 2.14).
+tensorflow==2.14.0
+keras==2.14.0
+
+# Numerical / data manipulation.
+numpy==1.26.4
+pandas==1.5.1
+scipy==1.13.1
+
+# Machine-learning utilities.
+scikit-learn==1.6.1
+joblib==1.5.3
+
+# Raw Excel reading (preprocess stage — no TensorFlow needed).
+openpyxl>=3.1.0
+
+# Visualisation.
+matplotlib==3.9.4
+seaborn==0.13.2
