@@ -33,6 +33,8 @@
 
 # Keep the dependency manifest.
 !/requirements.txt
+!/requirements-round3-lock-linux-py39-gpu.txt
+!/ROUND3_REMOTE_TRAINING_README.md
 
 # Keep the current FeTS-PatchTST model handoff document on this branch.
 !/docs/

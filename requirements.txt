@@ -1,23 +1,31 @@
-# Part 3 Round 3 — JSFD14 Leakage-Free External Benchmark
+# Part 3 Round 3 — JSFD14 leakage-free external benchmark
 #
-# Install: pip install -r requirements.txt
+# Validated runtime:
+#   Linux x86_64, Python 3.9.25, TensorFlow/Keras 2.14.0
 #
-# Core deep-learning framework (Keras is bundled inside TF 2.14).
-tensorflow==2.14.0
-keras==2.14.0
+# Install the exact, transitive GPU lock for the remote training server:
+#   python -m pip install -r requirements-round3-lock-linux-py39-gpu.txt
+#
+# This shorter file pins every project-level runtime dependency.  The lock file
+# additionally freezes TensorFlow/Matplotlib/TensorBoard transitive packages.
 
-# Numerical / data manipulation.
+# Deep learning and Keras HDF5 checkpoints.  The `and-cuda` extra pins the
+# TensorFlow 2.14 CUDA 11.8/cuDNN 8.7 userspace libraries on Linux.
+tensorflow[and-cuda]==2.14.0
+keras==2.14.0
+h5py==3.14.0
+tensorboard==2.14.1
+
+# Numerical, tabular and statistical processing.
 numpy==1.26.4
 pandas==1.5.1
 scipy==1.13.1
-
-# Machine-learning utilities.
 scikit-learn==1.6.1
 joblib==1.5.3
 
-# Raw Excel reading (preprocess stage — no TensorFlow needed).
-openpyxl>=3.1.0
+# Raw Excel input and generated Parquet/Zstandard artifacts.
+openpyxl==3.1.5
+pyarrow==21.0.0
 
-# Visualisation.
+# Headless training/prediction figures.
 matplotlib==3.9.4
-seaborn==0.13.2
