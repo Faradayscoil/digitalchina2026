@@ -1,12 +1,19 @@
-"""Part 3 / Round 3：JSFD001--JSFD014 十模型统一外部测试。
+"""Part 3 / Round 3：JSFD001--JSFD014 强基线统一外部测试。
 
 正式模式具有严格的 ``test-once`` 冻结门：在读取任何测试数组之前，必须确认
-14 个场站、10 个模型的训练 task marker 和总 training complete marker 全部
-存在且文件哈希有效。局部调试必须显式使用 ``--partial`` 或 ``--smoke``，输出
-自动进入 ``partial_runs``，不会污染正式测试目录。
+所有场站、所有可训练模型的 training task marker、总 training complete marker
+以及无需训练的 Persistence 解析式规范全部存在且文件哈希有效。局部调试必须
+显式使用 ``--partial`` 或 ``--smoke``，输出自动进入 ``partial_runs``，不会
+污染正式测试目录。
 
 本文件只消费 Round 3 的无泄漏 preprocessing bundle 和从零训练产物；禁止读取
 ``processed_npz``。完整逐样本预测使用 gzip CSV，汇总指标使用普通 CSV。
+
+当前统一追加协议严格冻结并复用原10模型的140份预测，仅新增
+``iTransformer``、``TimesNet``、``TimeMixer``、``DLinear`` 与无需训练的
+``Persistence`` 各14份预测，最终重建15模型统一CSV、统计、图形和选型报告。
+历史分阶段产物仍兼容从13模型/182份或14模型/196份预测继续追加；旧预测始终
+绑定其原始代际快照，不用当前代码字节误判历史产物。
 """
 
 from __future__ import annotations
@@ -18,7 +25,9 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -58,7 +67,7 @@ EXPECTED_FEATURE_SCHEMA_HASH = (
     "a2f44e932044c2609a8c0e1cf6a446f37b4a0cfb71b8bf232a5bae6c568c680c"
 )
 EXPECTED_FARMS = tuple(f"JSFD{i:03d}" for i in range(1, 15))
-MODEL_IDS = (
+LEGACY_MODEL_IDS = (
     "patchtst",
     "bilstm",
     "cnn_lstm",
@@ -69,6 +78,26 @@ MODEL_IDS = (
     "autoformer",
     "hr_moe_fets_patchtst",
     "windprism_f7_g0",
+)
+ITRANSFORMER_BASELINE_IDS = ("itransformer",)
+PRE_TIMESNET_MODEL_IDS = LEGACY_MODEL_IDS + ITRANSFORMER_BASELINE_IDS
+TIMESNET_BASELINE_IDS = ("timesnet",)
+PRE_TIMEMIXER_MODEL_IDS = PRE_TIMESNET_MODEL_IDS + TIMESNET_BASELINE_IDS
+TIMEMIXER_BASELINE_IDS = ("timemixer",)
+PRE_DLINEAR_MODEL_IDS = PRE_TIMEMIXER_MODEL_IDS + TIMEMIXER_BASELINE_IDS
+DLINEAR_BASELINE_IDS = ("dlinear",)
+MODERN_TRAINABLE_MODEL_IDS = (
+    ITRANSFORMER_BASELINE_IDS
+    + TIMESNET_BASELINE_IDS
+    + TIMEMIXER_BASELINE_IDS
+    + DLINEAR_BASELINE_IDS
+)
+TRAINED_MODEL_IDS = LEGACY_MODEL_IDS + MODERN_TRAINABLE_MODEL_IDS
+PERSISTENCE_BASELINE_IDS = ("persistence",)
+MODEL_IDS = TRAINED_MODEL_IDS + PERSISTENCE_BASELINE_IDS
+STAGED_EXTENSION_LINEAGE = "historical_staged_modern_extensions_v1"
+UNIFIED_MODERN_EXTENSION_LINEAGE = (
+    "base10_unified_four_modern_baselines_v1"
 )
 MODEL_DISPLAY_NAMES = {
     "patchtst": "PatchTST",
@@ -81,17 +110,59 @@ MODEL_DISPLAY_NAMES = {
     "autoformer": "Autoformer",
     "hr_moe_fets_patchtst": "HR-MoE FeTS-PatchTST (B6/v5ab)",
     "windprism_f7_g0": "WindPRISM (F7/G0)",
+    "itransformer": "iTransformer",
+    "timesnet": "TimesNet",
+    "timemixer": "TimeMixer",
+    "dlinear": "DLinear",
+    "persistence": "Persistence",
 }
 PRIMARY_MODEL_ID = "windprism_f7_g0"
 TIE_TOLERANCE = 1e-6
+TRAINING_MODEL_MATRIX_REVISION = (
+    "base10_plus_itransformer_plus_timesnet_plus_timemixer_plus_dlinear_"
+    "extension_v4"
+)
+PRE_PERSISTENCE_MODEL_MATRIX_REVISION = TRAINING_MODEL_MATRIX_REVISION
+MODEL_MATRIX_REVISION = (
+    "base10_plus_itransformer_plus_timesnet_plus_timemixer_plus_dlinear_"
+    "plus_persistence_extension_v5"
+)
+PRE_DLINEAR_MODEL_MATRIX_REVISION = (
+    "base10_plus_itransformer_plus_timesnet_plus_timemixer_extension_v3"
+)
+LEGACY_SNAPSHOT_NAME = "frozen_training_snapshot.json"
+ITRANSFORMER_SNAPSHOT_NAME = (
+    "frozen_training_snapshot_itransformer_extension.json"
+)
+TIMESNET_SNAPSHOT_NAME = "frozen_training_snapshot_timesnet_extension.json"
+TIMEMIXER_SNAPSHOT_NAME = (
+    "frozen_training_snapshot_timemixer_extension.json"
+)
+DLINEAR_SNAPSHOT_NAME = "frozen_training_snapshot_dlinear_extension.json"
+UNIFIED_MODERN_SNAPSHOT_NAME = (
+    "frozen_training_snapshot_unified_modern_extensions.json"
+)
+PERSISTENCE_SNAPSHOT_NAME = (
+    "frozen_training_snapshot_persistence_extension.json"
+)
+PERSISTENCE_SPEC_NAME = "persistence_baseline_spec.json"
 
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _test_evaluation_provenance(formal):
+def _test_evaluation_provenance(
+    formal,
+    additive_extension=False,
+    extension_lineage=None,
+):
     """Return precise test-use claims without overstating global blindness."""
+    additive_extension = bool(formal and additive_extension)
+    unified_modern_extension = bool(
+        additive_extension
+        and extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+    )
     return {
         "test_reuse_status": (
             "frozen_current_round_external_evaluation_with_"
@@ -107,17 +178,43 @@ def _test_evaluation_provenance(formal):
         "test_used_for_selection": bool(formal),
         "selection_is_descriptive_not_confirmatory": True,
         "confirmatory_evaluation_scope": (
-            "predeclared frozen-model comparisons and primary WindPRISM hypothesis"
+            (
+                "frozen WindPRISM hypothesis plus post-hoc modern-baseline "
+                + (
+                    "benchmark extension (iTransformer, TimesNet, TimeMixer, "
+                    "DLinear, and Persistence added in one frozen run)"
+                    if unified_modern_extension
+                    else "benchmark extensions (iTransformer, TimesNet, "
+                    "TimeMixer, then DLinear and Persistence)"
+                )
+                if additive_extension
+                else "predeclared frozen-model comparisons and primary WindPRISM hypothesis"
+            )
             if formal
             else "none_nonformal_run"
         ),
         "winner_selection_scope": "descriptive test-set ranking",
         "test_execution_mode": (
-            "one_shot_after_140_training_tasks_frozen"
+            (
+                (
+                    "additive_unified_four_modern_plus_persistence_extension_"
+                    "reusing_base10_outputs"
+                    if unified_modern_extension
+                    else "additive_dlinear_persistence_extension_reusing_"
+                    "frozen_outputs"
+                )
+                if additive_extension
+                else "one_shot_after_base10_training_tasks_frozen"
+            )
             if formal
             else "partial_or_smoke_after_selected_tasks_frozen"
         ),
-        "all_models_frozen_before_first_formal_test_prediction": bool(formal),
+        "all_models_frozen_before_first_formal_test_prediction": bool(
+            formal and not additive_extension
+        ),
+        "all_selected_models_frozen_before_their_own_formal_prediction": bool(
+            formal
+        ),
         "test_targets_used_for_training_or_validation_selection": False,
         "post_test_training_or_hyperparameter_changes_in_this_run": False,
         "test_results_used_for_further_tuning_within_this_run": False,
@@ -135,9 +232,24 @@ def _test_evaluation_provenance(formal):
         "legacy_processed_npz_used": False,
         "legacy_processed_npz_used_as_model_input": False,
         "legacy_weights_reused": False,
-        "all_station_models_trained_from_scratch": bool(formal),
+        "all_station_models_trained_from_scratch": False,
+        "all_trainable_station_models_trained_from_scratch": bool(formal),
+        "training_free_baseline_ids": (
+            list(PERSISTENCE_BASELINE_IDS) if formal else []
+        ),
         "architecture_definitions_reused": True,
         "prediction_resume_allowed_only_with_identical_frozen_snapshot": True,
+        "additive_baseline_extension": additive_extension,
+        "extension_lineage": extension_lineage,
+        "windprism_changed_after_base10_test": False,
+        "windprism_changed_after_itransformer_test": False,
+        "windprism_changed_after_timesnet_test": False,
+        "windprism_changed_after_timemixer_test": False,
+        "windprism_changed_after_dlinear_test": False,
+        "windprism_changed_after_persistence_test": False,
+        "timesnet_changed_after_timemixer_test": False,
+        "timemixer_changed_after_dlinear_test": False,
+        "dlinear_changed_after_persistence_test": False,
     }
 
 
@@ -199,6 +311,54 @@ def _atomic_text(text, path):
         handle.write(str(text))
     os.replace(temp, path)
     return path
+
+
+def _ensure_persistence_baseline_spec(output_root):
+    """Freeze the analytic rule before any station test arrays are loaded."""
+    path = Path(output_root) / "manifests" / PERSISTENCE_SPEC_NAME
+    payload = {
+        "status": "complete",
+        "complete": True,
+        "protocol_version": PROTOCOL_VERSION,
+        "model_matrix_revision": MODEL_MATRIX_REVISION,
+        "baseline_id": "persistence",
+        "baseline_family": "deterministic_naive_last_observation",
+        "training_required": False,
+        "model_artifact_required": False,
+        "learned_parameters": 0,
+        "model_size_bytes": 0,
+        "history_steps": HISTORY_LEN,
+        "forecast_steps": FORECAST_LEN,
+        "target_index": EXPECTED_TARGET_INDEX,
+        "history_source_offset": -1,
+        "forecast_rule": (
+            "y_hat[o,h] = power[o-1] for h=1..16, "
+            "history=[o-96,o), target=[o,o+16)"
+        ),
+        "scale_conversion": (
+            "input-target z-score to output-target z-score using only "
+            "train-fitted scaler statistics"
+        ),
+        "uses_future_covariates": False,
+        "uses_future_targets": False,
+        "available_at_guard": (
+            "source index o-1 is the final history point already admitted by "
+            "the leakage-free preprocessing window"
+        ),
+        "prediction_backend": "numpy_cpu_closed_form",
+        "prediction_batch_affects_model_selection": False,
+        "postprocessing": "inverse target scaler then lower clip at 0 MW",
+    }
+    if path.is_file():
+        existing = _read_json(path)
+        if existing != payload:
+            raise ValueError(
+                "已有Persistence规范与当前冻结公式不同，拒绝混合结果: "
+                f"{path}"
+            )
+    else:
+        _atomic_json(payload, path)
+    return _file_record(path)
 
 
 def _json_safe(value):
@@ -367,6 +527,8 @@ def _training_source_hash(marker, role):
 def _assert_station_matches_training(station, frozen_tasks, models, farm_id, formal):
     missing = []
     for model_id in models:
+        if model_id in PERSISTENCE_BASELINE_IDS:
+            continue
         marker = frozen_tasks[(model_id, farm_id)]["marker"]
         bundle_hash = _training_source_hash(marker, "bundle")
         array_hash = _training_source_hash(marker, "array")
@@ -433,7 +595,7 @@ def _validate_preprocess_complete(root):
 
 
 def _validate_all_training_frozen(root):
-    """在测试数组被读取前冻结并验证全部 140 个训练任务。"""
+    """在测试数组被读取前冻结并验证完整模型×场站训练矩阵。"""
     root = Path(root).resolve()
     complete_path = root / "round3_training_bundle_complete.json"
     if not complete_path.is_file():
@@ -447,7 +609,7 @@ def _validate_all_training_frozen(root):
         raise ValueError(f"训练complete marker不是Round-3 v2: {complete_path}")
     expected_pairs = {
         (model_id, farm_id)
-        for model_id in MODEL_IDS
+        for model_id in TRAINED_MODEL_IDS
         for farm_id in EXPECTED_FARMS
     }
     declared_pairs = {
@@ -455,12 +617,70 @@ def _validate_all_training_frozen(root):
         for item in complete.get("completed_tasks", ())
     }
     if (
-        int(complete.get("expected_task_count", -1)) != len(expected_pairs)
+        complete.get("model_matrix_revision")
+        != TRAINING_MODEL_MATRIX_REVISION
+        or tuple(complete.get("expected_models", ())) != TRAINED_MODEL_IDS
+        or tuple(complete.get("expected_farms", ())) != EXPECTED_FARMS
+        or int(complete.get("expected_task_count", -1)) != len(expected_pairs)
         or int(complete.get("completed_task_count", -1)) != len(expected_pairs)
         or declared_pairs != expected_pairs
     ):
-        raise ValueError("训练complete marker未精确声明10×14任务矩阵")
+        raise ValueError(
+            "训练complete marker未精确声明"
+            f"{len(TRAINED_MODEL_IDS)}×{len(EXPECTED_FARMS)}任务矩阵"
+        )
     hash_cache = {}
+    extension_lineage = complete.get(
+        "extension_lineage", STAGED_EXTENSION_LINEAGE
+    )
+    if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE:
+        base10_archive = complete.get("base10_training_complete_archive")
+        if not isinstance(base10_archive, dict):
+            raise ValueError("统一现代基线训练complete缺少base10冻结归档")
+        base10_archive_path = _validate_record(base10_archive, hash_cache)
+        base10_archive_payload = _read_json(base10_archive_path)
+        if (
+            not _completion_declared(base10_archive_payload)
+            or tuple(base10_archive_payload.get("expected_models", ()))
+            != LEGACY_MODEL_IDS
+            or int(base10_archive_payload.get("expected_task_count", -1))
+            != len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+        ):
+            raise ValueError("统一现代基线训练归档的base10/140任务身份漂移")
+        modern_training_code_sha = str(
+            complete.get("modern_extension_training_code_sha256", "")
+        )
+        if not modern_training_code_sha:
+            raise ValueError(
+                "统一现代基线训练complete缺少现代四模型训练代码SHA"
+            )
+    elif extension_lineage == STAGED_EXTENSION_LINEAGE:
+        pre_dlinear_archive = complete.get(
+            "pre_dlinear_training_complete_archive"
+        )
+        if not isinstance(pre_dlinear_archive, dict):
+            raise ValueError("分阶段训练complete缺少pre-DLinear 13模型冻结归档")
+        pre_dlinear_archive_path = _validate_record(
+            pre_dlinear_archive, hash_cache
+        )
+        pre_dlinear_archive_payload = _read_json(pre_dlinear_archive_path)
+        if (
+            not _completion_declared(pre_dlinear_archive_payload)
+            or pre_dlinear_archive_payload.get(
+                "model_matrix_revision_at_archive"
+            )
+            != PRE_DLINEAR_MODEL_MATRIX_REVISION
+            or tuple(pre_dlinear_archive_payload.get("expected_models", ()))
+            != PRE_DLINEAR_MODEL_IDS
+            or int(
+                pre_dlinear_archive_payload.get("expected_task_count", -1)
+            )
+            != len(PRE_DLINEAR_MODEL_IDS) * len(EXPECTED_FARMS)
+        ):
+            raise ValueError("pre-DLinear训练归档的13模型/182任务身份漂移")
+        modern_training_code_sha = None
+    else:
+        raise ValueError(f"未知训练扩展代际: {extension_lineage}")
     for record in complete.get("summary_outputs", {}).values():
         _validate_record(record, hash_cache)
     batch_policy_path = _validate_record(
@@ -476,10 +696,12 @@ def _validate_all_training_frozen(root):
         for item in complete.get("task_marker_records", ())
     }
     if set(task_records) != expected_pairs:
-        raise ValueError("训练complete marker缺少140个task marker哈希快照")
+        raise ValueError(
+            f"训练complete marker缺少{len(expected_pairs)}个task marker哈希快照"
+        )
     tasks = {}
     for farm_id in EXPECTED_FARMS:
-        for model_id in MODEL_IDS:
+        for model_id in TRAINED_MODEL_IDS:
             path = _task_marker_path(root, model_id, farm_id)
             if not path.is_file():
                 raise FileNotFoundError(f"正式测试缺少训练task marker: {path}")
@@ -512,6 +734,15 @@ def _validate_all_training_frozen(root):
                 != complete.get("global_batch_policy_sha256")
             ):
                 raise ValueError(f"训练task全局batch策略哈希漂移: {path}")
+            if (
+                extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+                and model_id in MODERN_TRAINABLE_MODEL_IDS
+                and marker.get("training_code_sha256")
+                != modern_training_code_sha
+            ):
+                raise ValueError(
+                    f"统一现代基线训练task代码SHA漂移: {model_id}/{farm_id}"
+                )
             model_record = _extract_artifact_record(marker, "model")
             _validate_record(model_record, hash_cache)
             for optional_role in ("weights", "artifact", "history"):
@@ -535,6 +766,7 @@ def _validate_all_training_frozen(root):
     return {
         "training_complete": _file_record(complete_path),
         "tasks": tasks,
+        "extension_lineage": extension_lineage,
     }
 
 
@@ -544,6 +776,8 @@ def _validate_selected_training(root, models, farms):
     tasks = {}
     for farm_id in farms:
         for model_id in models:
+            if model_id in PERSISTENCE_BASELINE_IDS:
+                continue
             candidates = (
                 _task_marker_path(root, model_id, farm_id),
                 (
@@ -961,6 +1195,45 @@ def _register_custom_layers(model_id):
             "wind_part3_round3_external14_all_models_train"
         )
         custom_objects.update(round3_train.get_round3_custom_objects())
+    elif model_id == "itransformer":
+        round3_train = __import__(
+            "wind_part3_round3_external14_all_models_train"
+        )
+        custom_objects.update(
+            round3_train.get_itransformer_custom_objects()
+        )
+    elif model_id == "timesnet":
+        round3_train = __import__(
+            "wind_part3_round3_external14_all_models_train"
+        )
+        custom_objects.update(round3_train.get_timesnet_custom_objects())
+    elif model_id == "timemixer":
+        round3_train = __import__(
+            "wind_part3_round3_external14_all_models_train"
+        )
+        custom_objects.update(
+            round3_train.get_timemixer_custom_objects()
+        )
+    elif model_id == "dlinear":
+        round3_train = __import__(
+            "wind_part3_round3_external14_all_models_train"
+        )
+        custom_objects.update(
+            round3_train.get_dlinear_custom_objects()
+        )
+        required = {
+            "DLinearSeriesDecomposition",
+            "DLinearForecastCore",
+        }
+        missing = required.difference(custom_objects)
+        if missing:
+            raise ValueError(
+                "DLinear自定义层注册契约不完整: "
+                + ", ".join(sorted(missing))
+            )
+    elif model_id == "persistence":
+        # Analytic baseline: intentionally has no Keras model or custom layer.
+        return {}
     else:
         raise ValueError(model_id)
     return custom_objects
@@ -1483,6 +1756,8 @@ def _prediction_marker_valid(
     expected_formal=None,
     expected_bundle_hash=None,
     expected_snapshot_hash=None,
+    expected_prediction_code_hash=None,
+    expected_batch_size=None,
 ):
     if not Path(path).is_file():
         return None
@@ -1507,7 +1782,11 @@ def _prediction_marker_valid(
             and marker.get("formal") is not bool(expected_formal)
         ):
             return None
-        if marker.get("training_task_marker_sha256") != frozen_task_hash:
+        if (
+            frozen_task_hash is not None
+            and marker.get("training_task_marker_sha256")
+            != frozen_task_hash
+        ):
             return None
         if marker.get("test_array_sha256") != array_hash:
             return None
@@ -1521,6 +1800,18 @@ def _prediction_marker_valid(
             expected_snapshot_hash is not None
             and marker.get("frozen_snapshot_sha256")
             != expected_snapshot_hash
+        ):
+            return None
+        if (
+            expected_prediction_code_hash is not None
+            and marker.get("prediction_code_sha256")
+            != expected_prediction_code_hash
+        ):
+            return None
+        if (
+            expected_batch_size is not None
+            and int(marker.get("batch_size", -1))
+            != int(expected_batch_size)
         ):
             return None
         if not marker.get("power_reference_kind"):
@@ -1539,12 +1830,106 @@ def _prediction_marker_valid(
             "sample_predictions",
             "farm_metrics",
             "horizon_metrics",
+            "plot_complete_curve",
+            "plot_local_window",
+            "plot_error_distribution",
+            "plot_horizon_metrics",
         }
         if not required_outputs.issubset(marker.get("output_files", {})):
             return None
         for record in marker.get("output_files", {}).values():
             if isinstance(record, dict) and record.get("path"):
                 _validate_record(record)
+        return marker
+    except Exception:
+        return None
+
+
+def _persistence_prediction_marker_valid(
+    path,
+    array_hash,
+    *,
+    farm_id,
+    formal,
+    bundle_hash,
+    snapshot_hash,
+    prediction_code_hash,
+    baseline_spec_record,
+):
+    """Validate a training-free Persistence marker without fake artifacts."""
+    marker = _prediction_marker_valid(
+        path,
+        None,
+        array_hash,
+        expected_model_id="persistence",
+        expected_farm_id=farm_id,
+        expected_formal=formal,
+        expected_bundle_hash=bundle_hash,
+        expected_snapshot_hash=snapshot_hash,
+        expected_prediction_code_hash=prediction_code_hash,
+        expected_batch_size=None,
+    )
+    if marker is None:
+        return None
+    try:
+        explicit_null_fields = {
+            "training_task_marker_path",
+            "training_task_marker_sha256",
+            "model_path",
+            "model_sha256",
+        }
+        required_plot_outputs = {
+            "plot_complete_curve",
+            "plot_local_window",
+            "plot_error_distribution",
+            "plot_horizon_metrics",
+        }
+        if (
+            not explicit_null_fields.issubset(marker)
+            or marker.get("training_required") is not False
+            or marker.get("model_artifact_required") is not False
+            or marker.get("training_task_marker_path") is not None
+            or marker.get("training_task_marker_sha256") is not None
+            or marker.get("model_path") is not None
+            or marker.get("model_sha256") is not None
+            or marker.get("batch_size") is not None
+            or int(marker.get("learned_parameters", -1)) != 0
+            or int(marker.get("metrics", {}).get("total_params", -1)) != 0
+            or int(marker.get("metrics", {}).get("model_size_bytes", -1))
+            != 0
+            or int(
+                marker.get("metrics", {}).get(
+                    "effective_batch_size", -1
+                )
+            )
+            != 0
+            or int(
+                marker.get("metrics", {}).get(
+                    "peak_gpu_memory_bytes", -1
+                )
+            )
+            != 0
+            or marker.get("model_matrix_revision")
+            != MODEL_MATRIX_REVISION
+            or marker.get("baseline_family")
+            != "deterministic_naive_last_observation"
+            or int(marker.get("history_source_offset", 0)) != -1
+            or marker.get("uses_future_covariates") is not False
+            or marker.get("uses_future_targets") is not False
+            or marker.get("inference_backend")
+            != "numpy_cpu_closed_form"
+            or marker.get("baseline_spec_sha256")
+            != baseline_spec_record["sha256"]
+            or Path(marker.get("baseline_spec_path", "")).resolve()
+            != Path(baseline_spec_record["path"]).resolve()
+            or marker.get("prediction_batch_affects_model_selection")
+            is not False
+            or not required_plot_outputs.issubset(
+                marker.get("output_files", {})
+            )
+        ):
+            return None
+        _validate_record(baseline_spec_record)
         return marker
     except Exception:
         return None
@@ -1561,28 +1946,108 @@ def _run_prediction_task(
     batch_size,
     formal,
     snapshot_record,
+    additive_extension=False,
+    baseline_spec_record=None,
+    extension_lineage=None,
 ):
     import numpy as np
 
-    keras.backend.clear_session()
-    gc.collect()
-    custom_objects = _register_custom_layers(model_id)
-    model_path = _validate_record(frozen_task["model_record"])
-    model = keras.models.load_model(
-        model_path,
-        custom_objects=custom_objects,
-        compile=False,
-    )
-    if len(model.inputs) != 1:
-        raise ValueError(f"{model_id}/{farm_id}模型输入数量不是1")
-    if tuple(model.input_shape[1:]) != (HISTORY_LEN, EXPECTED_INPUT_DIM):
-        raise ValueError(
-            f"{model_id}/{farm_id}输入形状漂移: {model.input_shape}"
+    is_persistence = model_id in PERSISTENCE_BASELINE_IDS
+    model = None
+    dataset = None
+    model_path = None
+    if is_persistence:
+        if frozen_task is not None:
+            raise ValueError("Persistence不得绑定伪训练任务")
+        if baseline_spec_record is None:
+            raise ValueError("Persistence缺少冻结公式规范")
+        _validate_record(baseline_spec_record)
+        origins = np.asarray(station["test_origins"], dtype=np.int64)
+        started = time.monotonic()
+        last_x_scaled = np.asarray(
+            station["features"][
+                origins - 1,
+                station["target_index"],
+            ],
+            dtype=np.float64,
         )
-    dataset = _make_test_dataset(tf, station, batch_size)
-    prediction_scaled, diagnostics, elapsed, peak_gpu = _predict_with_diagnostics(
-        tf, keras, model, model_id, dataset
-    )
+        scale_ratio = (
+            station["scaler_x_scale"][station["target_index"]]
+            / station["scaler_y_scale"]
+        )
+        scale_offset = (
+            station["scaler_x_mean"][station["target_index"]]
+            - station["scaler_y_mean"]
+        ) / station["scaler_y_scale"]
+        last_y_scaled = last_x_scaled * scale_ratio + scale_offset
+        prediction_scaled = np.repeat(
+            last_y_scaled[:, None],
+            FORECAST_LEN,
+            axis=1,
+        )
+        elapsed = float(time.monotonic() - started)
+        reconstructed_mw = (
+            last_x_scaled
+            * station["scaler_x_scale"][station["target_index"]]
+            + station["scaler_x_mean"][station["target_index"]]
+        )
+        historical_truth_mw = station["target_mw"][origins - 1]
+        reconstruction_atol = max(
+            1e-6,
+            float(station["power_reference_mw"]) * 1e-6,
+        )
+        if not np.allclose(
+            reconstructed_mw,
+            historical_truth_mw,
+            rtol=2e-6,
+            atol=reconstruction_atol,
+        ):
+            raise ValueError(
+                f"Persistence/{farm_id}输入功率通道与历史功率不一致"
+            )
+        if not np.array_equal(
+            prediction_scaled,
+            np.repeat(prediction_scaled[:, :1], FORECAST_LEN, axis=1),
+        ):
+            raise ValueError("Persistence的16步输出不再是严格常值")
+        diagnostics = {}
+        peak_gpu = 0
+        parameter_count = 0
+        model_bytes = 0
+        effective_batch_size = 0
+    else:
+        if tf is None or keras is None:
+            raise RuntimeError(f"{model_id}预测需要TensorFlow/Keras")
+        keras.backend.clear_session()
+        gc.collect()
+        custom_objects = _register_custom_layers(model_id)
+        model_path = _validate_record(frozen_task["model_record"])
+        model = keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+            compile=False,
+        )
+        if len(model.inputs) != 1:
+            raise ValueError(f"{model_id}/{farm_id}模型输入数量不是1")
+        if tuple(model.input_shape[1:]) != (
+            HISTORY_LEN,
+            EXPECTED_INPUT_DIM,
+        ):
+            raise ValueError(
+                f"{model_id}/{farm_id}输入形状漂移: {model.input_shape}"
+            )
+        dataset = _make_test_dataset(tf, station, batch_size)
+        (
+            prediction_scaled,
+            diagnostics,
+            elapsed,
+            peak_gpu,
+        ) = _predict_with_diagnostics(
+            tf, keras, model, model_id, dataset
+        )
+        parameter_count = int(model.count_params())
+        model_bytes = int(model_path.stat().st_size)
+        effective_batch_size = int(batch_size)
     expected_shape = (len(station["test_origins"]), FORECAST_LEN)
     if prediction_scaled.shape != expected_shape:
         raise ValueError(
@@ -1592,6 +2057,21 @@ def _run_prediction_task(
         raise ValueError(f"{model_id}/{farm_id}预测含非有限值")
     truth = station["target_mw"][station["target_indices"]]
     prediction = np.clip(_inverse_scaled(station, prediction_scaled), 0.0, None)
+    if is_persistence:
+        expected_persistence_mw = np.repeat(
+            np.clip(reconstructed_mw, 0.0, None)[:, None],
+            FORECAST_LEN,
+            axis=1,
+        )
+        if not np.allclose(
+            prediction,
+            expected_persistence_mw,
+            rtol=2e-6,
+            atol=reconstruction_atol,
+        ):
+            raise ValueError(
+                f"Persistence/{farm_id}反标准化预测与历史功率不一致"
+            )
     overall, horizon_rows = _task_metrics(
         model_id, farm_id, station, truth, prediction, prediction_scaled
     )
@@ -1601,9 +2081,9 @@ def _run_prediction_task(
             "samples_per_second": len(truth) / max(elapsed, 1e-9),
             "forecast_points_per_second": truth.size / max(elapsed, 1e-9),
             "peak_gpu_memory_bytes": peak_gpu,
-            "total_params": int(model.count_params()),
-            "model_size_bytes": int(model_path.stat().st_size),
-            "effective_batch_size": int(batch_size),
+            "total_params": parameter_count,
+            "model_size_bytes": model_bytes,
+            "effective_batch_size": effective_batch_size,
         }
     )
     paths = _final_paths(output_root, model_id, farm_id)
@@ -1651,10 +2131,16 @@ def _run_prediction_task(
         "model_display_name": MODEL_DISPLAY_NAMES[model_id],
         "farm_id": farm_id,
         "formal": bool(formal),
-        "training_task_marker_path": frozen_task["path"],
-        "training_task_marker_sha256": frozen_task["sha256"],
-        "model_path": str(model_path),
-        "model_sha256": _sha256(model_path),
+        "training_task_marker_path": (
+            None if is_persistence else frozen_task["path"]
+        ),
+        "training_task_marker_sha256": (
+            None if is_persistence else frozen_task["sha256"]
+        ),
+        "model_path": None if is_persistence else str(model_path),
+        "model_sha256": (
+            None if is_persistence else _sha256(model_path)
+        ),
         "preprocessing_bundle_path": station["bundle_path"],
         "preprocessing_bundle_sha256": station["bundle_sha256"],
         "test_array_path": station["array_path"],
@@ -1664,12 +2150,125 @@ def _run_prediction_task(
         "frozen_snapshot_sha256": snapshot_record["sha256"],
         "power_reference_kind": station["power_reference_kind"],
         "test_samples": len(station["test_origins"]),
-        "batch_size": int(batch_size),
-        **_test_evaluation_provenance(formal),
+        "batch_size": None if is_persistence else int(batch_size),
+        **_test_evaluation_provenance(
+            formal,
+            additive_extension=additive_extension,
+            extension_lineage=extension_lineage,
+        ),
         "metrics": overall,
         "horizon_metrics": horizon_rows,
         "output_files": output_files,
     }
+    if model_id == "itransformer":
+        marker.update(
+            {
+                "model_matrix_revision": MODEL_MATRIX_REVISION,
+                "architecture_source": (
+                    "https://github.com/thuml/iTransformer"
+                ),
+                "forecast_interface": "96x45 history -> 16-step target power",
+                "prediction_code_path": str(Path(__file__).resolve()),
+                "prediction_code_sha256": _sha256(__file__),
+            }
+        )
+    elif model_id == "timesnet":
+        marker.update(
+            {
+                "model_matrix_revision": MODEL_MATRIX_REVISION,
+                "architecture_source": (
+                    "https://github.com/thuml/Time-Series-Library"
+                ),
+                "upstream_model": "TimesNet",
+                "forecast_interface": (
+                    "96x45 history -> dynamic temporal 2D variation -> "
+                    "16-step target power"
+                ),
+                "prediction_batch_affects_global_fft_period_selection": True,
+                "prediction_code_path": str(Path(__file__).resolve()),
+                "prediction_code_sha256": _sha256(__file__),
+            }
+        )
+    elif model_id == "timemixer":
+        marker.update(
+            {
+                "model_matrix_revision": MODEL_MATRIX_REVISION,
+                "architecture_source": (
+                    "https://github.com/kwuking/TimeMixer"
+                ),
+                "architecture_paper": (
+                    "https://arxiv.org/abs/2405.14616"
+                ),
+                "upstream_model": "TimeMixer",
+                "upstream_variant": "original_TimeMixer_not_TimeMixer++",
+                "forecast_interface": (
+                    "96x45 history -> PDM multiscale mixing -> "
+                    "summed FMM -> 16-step target power"
+                ),
+                "prediction_batch_affects_model_selection": False,
+                "prediction_code_path": str(Path(__file__).resolve()),
+                "prediction_code_sha256": _sha256(__file__),
+            }
+        )
+    elif model_id == "dlinear":
+        marker.update(
+            {
+                "model_matrix_revision": MODEL_MATRIX_REVISION,
+                "architecture_source": (
+                    "https://github.com/honeywell21/DLinear"
+                ),
+                "architecture_paper": (
+                    "https://arxiv.org/abs/2205.13504"
+                ),
+                "upstream_model": "DLinear",
+                "upstream_variant": (
+                    "decomposition_linear_shared_temporal_heads"
+                ),
+                "individual": False,
+                "moving_average_kernel": 25,
+                "direct_multi_step_forecast": True,
+                "cross_variate_mixing": False,
+                "forecast_interface": (
+                    "96x45 history -> moving-average decomposition -> "
+                    "seasonal/trend linear projection -> 16-step target power"
+                ),
+                "prediction_batch_affects_model_selection": False,
+                "prediction_code_path": str(Path(__file__).resolve()),
+                "prediction_code_sha256": _sha256(__file__),
+            }
+        )
+    elif model_id == "persistence":
+        marker.update(
+            {
+                "model_matrix_revision": MODEL_MATRIX_REVISION,
+                "baseline_family": (
+                    "deterministic_naive_last_observation"
+                ),
+                "training_required": False,
+                "model_artifact_required": False,
+                "learned_parameters": 0,
+                "history_source_offset": -1,
+                "forecast_rule": (
+                    "y_hat[o,h]=power[o-1], h=1..16"
+                ),
+                "forecast_interface": (
+                    "last available target-power input at origin-1 -> "
+                    "constant 16-step forecast"
+                ),
+                "scale_conversion": (
+                    "input-target z-score to output-target z-score via "
+                    "train-fitted affine statistics"
+                ),
+                "uses_future_covariates": False,
+                "uses_future_targets": False,
+                "inference_backend": "numpy_cpu_closed_form",
+                "prediction_batch_affects_model_selection": False,
+                "baseline_spec_path": baseline_spec_record["path"],
+                "baseline_spec_sha256": baseline_spec_record["sha256"],
+                "prediction_code_path": str(Path(__file__).resolve()),
+                "prediction_code_sha256": _sha256(__file__),
+            }
+        )
     marker_path = _prediction_marker_path(output_root, model_id, farm_id)
     _atomic_json(marker, marker_path)
     print(
@@ -1677,7 +2276,8 @@ def _run_prediction_task(
         f"NMAE={overall['nmae']:.6f}, R2={overall['r2']:.6f}"
     )
     del model, dataset, diagnostics, prediction_scaled, prediction, truth
-    keras.backend.clear_session()
+    if keras is not None:
+        keras.backend.clear_session()
     gc.collect()
     return marker
 
@@ -1926,6 +2526,16 @@ def _complexity_rows(markers, average_rank_rows, macro_micro):
                 "forecast_points_per_second": metric.get("forecast_points_per_second"),
                 "peak_gpu_memory_bytes": metric.get("peak_gpu_memory_bytes"),
                 "effective_batch_size": metric.get("effective_batch_size"),
+                "training_required": bool(
+                    task.get(
+                        "training_required",
+                        task["model_id"]
+                        not in PERSISTENCE_BASELINE_IDS,
+                    )
+                ),
+                "inference_backend": task.get(
+                    "inference_backend", "keras_model_forward"
+                ),
             }
         )
     summary = []
@@ -1937,6 +2547,12 @@ def _complexity_rows(markers, average_rank_rows, macro_micro):
                 "model_id": model_id,
                 "model_display_name": MODEL_DISPLAY_NAMES[model_id],
                 "farm_count": len(selected),
+                "training_required": bool(
+                    selected[0]["training_required"]
+                ),
+                "inference_backend": selected[0][
+                    "inference_backend"
+                ],
                 "total_params": int(round(np.median(params))),
                 "mean_model_size_bytes": float(
                     np.mean([row["model_size_bytes"] for row in selected])
@@ -2026,8 +2642,10 @@ def _plot_overview(output_root, per_farm, macro_micro, average_ranks, complexity
             textcoords="offset points",
             fontsize=8,
         )
-    ax.set_xscale("log")
-    ax.set_xlabel("Trainable model parameters (log scale)")
+    ax.set_xscale("symlog", linthresh=1)
+    ax.set_xlabel(
+        "Trainable model parameters (symlog; Persistence = 0)"
+    )
     ax.set_ylabel("Macro NRMSE")
     ax.set_title("Accuracy–complexity Pareto view")
     ax.grid(alpha=0.25)
@@ -2065,6 +2683,8 @@ def _save_final_selection(
     average_ranks,
     complexity_summary,
     formal,
+    additive_extension=False,
+    extension_lineage=None,
 ):
     """Select the test winner using the frozen equal-farm protocol."""
     macro = {
@@ -2114,7 +2734,11 @@ def _save_final_selection(
         "secondary_metric": "equal-farm macro NMAE",
         "tertiary_metric": "average per-farm NRMSE rank",
         "final_tiebreaker": "total parameter count",
-        **_test_evaluation_provenance(formal),
+        **_test_evaluation_provenance(
+            formal,
+            additive_extension=additive_extension,
+            extension_lineage=extension_lineage,
+        ),
         "selection_eligible": bool(formal),
         "publication_result_eligible": bool(formal),
         "ranking": ranking,
@@ -2186,8 +2810,15 @@ def _save_final_selection(
                 "It is not labelled globally blind: JSFD001--JSFD014 had "
                 "historical exposure in a separate teacher-data workflow, "
                 + (
-                    "while formal Round-3 evaluation starts only after its "
-                    "140 from-scratch tasks are frozen."
+                    (
+                        "while prior learned-model predictions remain frozen; "
+                        "DLinear is evaluated only after its 14 from-scratch "
+                        "tasks are frozen, and Persistence uses a frozen "
+                        "training-free last-observation rule."
+                        if additive_extension
+                        else "while formal Round-3 evaluation starts only "
+                        "after all from-scratch tasks are frozen."
+                    )
                     if formal
                     else "and this partial/smoke ranking is diagnostic only."
                 )
@@ -2202,7 +2833,15 @@ def _save_final_selection(
     }
 
 
-def _aggregate_and_save(output_root, markers, models, farms, formal):
+def _aggregate_and_save(
+    output_root,
+    markers,
+    models,
+    farms,
+    formal,
+    additive_extension=False,
+    extension_lineage=None,
+):
     per_farm = [dict(marker["metrics"]) for marker in markers]
     per_horizon = [
         dict(row) for marker in markers for row in marker["horizon_metrics"]
@@ -2268,6 +2907,8 @@ def _aggregate_and_save(output_root, markers, models, farms, formal):
             average_ranks,
             complexity_summary,
             formal,
+            additive_extension=additive_extension,
+            extension_lineage=extension_lineage,
         )
     )
     return paths
@@ -2327,14 +2968,1987 @@ def _validate_inventory(output_root, inventory_record):
         )
 
 
-def _freeze_snapshot(output_root, frozen, preprocess_record, formal):
-    path = Path(output_root) / "manifests" / "frozen_training_snapshot.json"
+def _copy_exact_artifact(source, destination):
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    source_sha = _sha256(source)
+    if destination.is_file():
+        if _sha256(destination) != source_sha:
+            raise ValueError(f"既有归档文件与源SHA不一致: {destination}")
+        return _file_record(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    with open(source, "rb") as input_handle, open(
+        temporary, "wb"
+    ) as output_handle:
+        for block in iter(lambda: input_handle.read(1024 * 1024), b""):
+            output_handle.write(block)
+    os.replace(temporary, destination)
+    if _sha256(destination) != source_sha:
+        raise ValueError(f"归档复制后SHA不一致: {destination}")
+    return _file_record(destination)
+
+
+def _base10_completion_declared(payload):
+    return (
+        _completion_declared(payload)
+        and payload.get("protocol_version") == PROTOCOL_VERSION
+        and payload.get("formal") is True
+        and tuple(payload.get("model_ids", ())) == LEGACY_MODEL_IDS
+        and tuple(payload.get("farm_ids", ())) == EXPECTED_FARMS
+        and int(payload.get("task_count", -1))
+        == len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+        and int(payload.get("expected_formal_task_count", -1))
+        == len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+    )
+
+
+def _pre_timesnet_completion_declared(payload):
+    return (
+        _completion_declared(payload)
+        and tuple(payload.get("model_ids", ())) == PRE_TIMESNET_MODEL_IDS
+        and tuple(payload.get("farm_ids", ())) == EXPECTED_FARMS
+        and int(payload.get("task_count", -1))
+        == len(PRE_TIMESNET_MODEL_IDS) * len(EXPECTED_FARMS)
+    )
+
+
+def _pre_timemixer_completion_declared(payload):
+    """Return true only for the exact frozen 12-model/168-task generation."""
+    return (
+        _completion_declared(payload)
+        and tuple(payload.get("model_ids", ())) == PRE_TIMEMIXER_MODEL_IDS
+        and tuple(payload.get("farm_ids", ())) == EXPECTED_FARMS
+        and int(payload.get("task_count", -1))
+        == len(PRE_TIMEMIXER_MODEL_IDS) * len(EXPECTED_FARMS)
+    )
+
+
+def _pre_dlinear_completion_declared(payload):
+    """Return true only for the exact frozen 13-model/182-task generation."""
+    return (
+        _completion_declared(payload)
+        and payload.get("protocol_version") == PROTOCOL_VERSION
+        and payload.get("model_matrix_revision")
+        == PRE_DLINEAR_MODEL_MATRIX_REVISION
+        and tuple(payload.get("model_ids", ())) == PRE_DLINEAR_MODEL_IDS
+        and tuple(payload.get("farm_ids", ())) == EXPECTED_FARMS
+        and int(payload.get("task_count", -1))
+        == len(PRE_DLINEAR_MODEL_IDS) * len(EXPECTED_FARMS)
+    )
+
+
+def _pre_persistence_completion_declared(payload):
+    """Return true only for the exact DLinear-era 14-model/196-task state."""
+    return (
+        _completion_declared(payload)
+        and payload.get("protocol_version") == PROTOCOL_VERSION
+        and payload.get("model_matrix_revision")
+        == PRE_PERSISTENCE_MODEL_MATRIX_REVISION
+        and tuple(payload.get("model_ids", ())) == TRAINED_MODEL_IDS
+        and tuple(payload.get("farm_ids", ())) == EXPECTED_FARMS
+        and int(payload.get("task_count", -1))
+        == len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)
+    )
+
+
+def _expected_pre_timemixer_snapshot_name(model_id):
+    """Map each prior model to the immutable snapshot generation it used."""
+    if model_id in LEGACY_MODEL_IDS:
+        return LEGACY_SNAPSHOT_NAME
+    if model_id in ITRANSFORMER_BASELINE_IDS:
+        return ITRANSFORMER_SNAPSHOT_NAME
+    if model_id in TIMESNET_BASELINE_IDS:
+        return TIMESNET_SNAPSHOT_NAME
+    raise ValueError(f"不是pre-TimeMixer模型: {model_id}")
+
+
+def _expected_pre_dlinear_snapshot_name(model_id):
+    """Map each of the 13 prior models to its immutable snapshot generation."""
+    if model_id in LEGACY_MODEL_IDS:
+        return LEGACY_SNAPSHOT_NAME
+    if model_id in ITRANSFORMER_BASELINE_IDS:
+        return ITRANSFORMER_SNAPSHOT_NAME
+    if model_id in TIMESNET_BASELINE_IDS:
+        return TIMESNET_SNAPSHOT_NAME
+    if model_id in TIMEMIXER_BASELINE_IDS:
+        return TIMEMIXER_SNAPSHOT_NAME
+    raise ValueError(f"不是pre-DLinear模型: {model_id}")
+
+
+def _expected_pre_persistence_snapshot_name(model_id):
+    """Map each trained model to its original immutable snapshot."""
+    if model_id in PRE_DLINEAR_MODEL_IDS:
+        return _expected_pre_dlinear_snapshot_name(model_id)
+    if model_id in DLINEAR_BASELINE_IDS:
+        return DLINEAR_SNAPSHOT_NAME
+    raise ValueError(f"不是pre-Persistence模型: {model_id}")
+
+
+def _validate_old_timesnet_prediction_binding(marker, snapshot_record):
+    """Bind an old TimesNet marker to its historical source SHA and batch."""
+    if int(marker.get("batch_size", -1)) != int(DEFAULT_BATCH_SIZE):
+        raise ValueError(
+            "旧TimesNet预测batch漂移: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    if (
+        marker.get("prediction_batch_affects_global_fft_period_selection")
+        is not True
+    ):
+        raise ValueError(
+            "旧TimesNet marker未声明batch依赖FFT周期选择: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    marker_code_sha = marker.get("prediction_code_sha256")
+    if not marker_code_sha:
+        raise ValueError(
+            "旧TimesNet marker缺少prediction_code_sha256: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_payload = _read_json(snapshot_path)
+    snapshot_code_record = snapshot_payload.get("prediction_code")
+    if not isinstance(snapshot_code_record, dict):
+        raise ValueError(
+            f"TimesNet冻结快照缺少prediction_code记录: {snapshot_path}"
+        )
+    if marker_code_sha != snapshot_code_record.get("sha256"):
+        raise ValueError(
+            "旧TimesNet marker与其代际快照中的prediction code SHA不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    # snapshot中的源代码路径指向同一预测文件；加入TimeMixer后当前字节必然
+    # 改变，不能用_validate_record误判旧TimesNet。快照文件本身及其内部SHA
+    # 绑定才是历史来源证明。
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+        raise ValueError(
+            "旧TimesNet marker绑定的快照路径与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    if marker.get("frozen_snapshot_sha256") != snapshot_record["sha256"]:
+        raise ValueError(
+            "旧TimesNet marker绑定的快照SHA与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+
+
+def _validate_old_timemixer_prediction_binding(marker, snapshot_record):
+    """Bind an old TimeMixer marker to its historical prediction source."""
+    if (
+        marker.get("model_matrix_revision")
+        != PRE_DLINEAR_MODEL_MATRIX_REVISION
+    ):
+        raise ValueError(
+            "旧TimeMixer marker的模型矩阵代际漂移: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    if int(marker.get("batch_size", -1)) != int(DEFAULT_BATCH_SIZE):
+        raise ValueError(
+            "旧TimeMixer预测batch漂移: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    if marker.get("prediction_batch_affects_model_selection") is not False:
+        raise ValueError(
+            "旧TimeMixer marker缺少batch无关声明: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    marker_code_sha = marker.get("prediction_code_sha256")
+    if not marker_code_sha:
+        raise ValueError(
+            "旧TimeMixer marker缺少prediction_code_sha256: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_payload = _read_json(snapshot_path)
+    snapshot_code_record = snapshot_payload.get("prediction_code")
+    if not isinstance(snapshot_code_record, dict):
+        raise ValueError(
+            f"TimeMixer冻结快照缺少prediction_code记录: {snapshot_path}"
+        )
+    if marker_code_sha != snapshot_code_record.get("sha256"):
+        raise ValueError(
+            "旧TimeMixer marker与其代际快照中的prediction code SHA不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    # 加入DLinear后当前预测文件的字节必然变化。这里有意只验证旧marker
+    # 与旧快照内部记录的SHA，而不把历史代码路径当作当前文件重新哈希。
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+        raise ValueError(
+            "旧TimeMixer marker绑定的快照路径与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    if marker.get("frozen_snapshot_sha256") != snapshot_record["sha256"]:
+        raise ValueError(
+            "旧TimeMixer marker绑定的快照SHA与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+
+
+def _validate_old_dlinear_prediction_binding(marker, snapshot_record):
+    """Bind an old DLinear marker to its historical v4 prediction source."""
+    if (
+        marker.get("model_matrix_revision")
+        != PRE_PERSISTENCE_MODEL_MATRIX_REVISION
+    ):
+        raise ValueError(
+            "旧DLinear marker的模型矩阵代际漂移: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    if int(marker.get("batch_size", -1)) != int(DEFAULT_BATCH_SIZE):
+        raise ValueError(
+            "旧DLinear预测batch漂移: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    if marker.get("prediction_batch_affects_model_selection") is not False:
+        raise ValueError(
+            "旧DLinear marker缺少batch无关声明: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    marker_code_sha = marker.get("prediction_code_sha256")
+    if not marker_code_sha:
+        raise ValueError(
+            "旧DLinear marker缺少prediction_code_sha256: "
+            f"{marker.get('model_id')}/{marker.get('farm_id')}"
+        )
+    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_payload = _read_json(snapshot_path)
+    snapshot_code_record = snapshot_payload.get("prediction_code")
+    if (
+        not isinstance(snapshot_code_record, dict)
+        or marker_code_sha != snapshot_code_record.get("sha256")
+    ):
+        raise ValueError(
+            "旧DLinear marker与其历史快照prediction code SHA不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+        raise ValueError(
+            "旧DLinear marker绑定的快照路径与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+    if marker.get("frozen_snapshot_sha256") != snapshot_record["sha256"]:
+        raise ValueError(
+            "旧DLinear marker绑定的快照SHA与归档映射不一致: "
+            f"{marker.get('farm_id')}"
+        )
+
+
+def _validate_pre_timemixer_live_marker(
+    output_root,
+    frozen,
+    model_id,
+    farm_id,
+    snapshot_record,
+    frozen_marker_record=None,
+):
+    """Validate one prior live marker without current-source SHA checks."""
+    pair = (model_id, farm_id)
+    marker_path = _prediction_marker_path(
+        output_root, model_id, farm_id
+    )
+    if not marker_path.is_file():
+        raise FileNotFoundError(f"缺少pre-TimeMixer预测marker: {marker_path}")
+    if frozen_marker_record is not None:
+        if (
+            Path(frozen_marker_record["path"]).resolve()
+            != marker_path.resolve()
+        ):
+            raise ValueError(f"pre-TimeMixer冻结预测marker路径漂移: {pair}")
+        if _sha256(marker_path) != frozen_marker_record["sha256"]:
+            raise ValueError(f"pre-TimeMixer冻结预测marker漂移: {pair}")
+    marker = _read_json(marker_path)
+    task = frozen["tasks"][pair]
+    expected_snapshot_name = _expected_pre_timemixer_snapshot_name(
+        model_id
+    )
+    if Path(snapshot_record["path"]).name != expected_snapshot_name:
+        raise ValueError(
+            f"{model_id}绑定的冻结快照代际错误: "
+            f"{snapshot_record['path']}"
+        )
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
+        snapshot_record["path"]
+    ).resolve():
+        raise ValueError(f"{model_id}/{farm_id}冻结快照路径漂移")
+    valid = _prediction_marker_valid(
+        marker_path,
+        task["sha256"],
+        _sha256(marker["test_array_path"]),
+        expected_model_id=model_id,
+        expected_farm_id=farm_id,
+        expected_formal=True,
+        expected_bundle_hash=_sha256(
+            marker["preprocessing_bundle_path"]
+        ),
+        expected_snapshot_hash=snapshot_record["sha256"],
+        expected_prediction_code_hash=None,
+        expected_batch_size=(
+            DEFAULT_BATCH_SIZE
+            if model_id in TIMESNET_BASELINE_IDS
+            else None
+        ),
+    )
+    if valid is None:
+        raise ValueError(
+            f"pre-TimeMixer旧预测任务恢复校验失败: {model_id}/{farm_id}"
+        )
+    if model_id in TIMESNET_BASELINE_IDS:
+        _validate_old_timesnet_prediction_binding(valid, snapshot_record)
+    return valid
+
+
+def _validate_pre_dlinear_live_marker(
+    output_root,
+    frozen,
+    model_id,
+    farm_id,
+    snapshot_record,
+    frozen_marker_record=None,
+):
+    """Validate one of the 182 prior predictions without current-code drift."""
+    pair = (model_id, farm_id)
+    marker_path = _prediction_marker_path(
+        output_root, model_id, farm_id
+    )
+    if not marker_path.is_file():
+        raise FileNotFoundError(f"缺少pre-DLinear预测marker: {marker_path}")
+    if frozen_marker_record is not None:
+        if (
+            Path(frozen_marker_record["path"]).resolve()
+            != marker_path.resolve()
+        ):
+            raise ValueError(f"pre-DLinear冻结预测marker路径漂移: {pair}")
+        if _sha256(marker_path) != frozen_marker_record["sha256"]:
+            raise ValueError(f"pre-DLinear冻结预测marker漂移: {pair}")
+    marker = _read_json(marker_path)
+    task = frozen["tasks"][pair]
+    expected_snapshot_name = _expected_pre_dlinear_snapshot_name(model_id)
+    if Path(snapshot_record["path"]).name != expected_snapshot_name:
+        raise ValueError(
+            f"{model_id}绑定的冻结快照代际错误: "
+            f"{snapshot_record['path']}"
+        )
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
+        snapshot_record["path"]
+    ).resolve():
+        raise ValueError(f"{model_id}/{farm_id}冻结快照路径漂移")
+    valid = _prediction_marker_valid(
+        marker_path,
+        task["sha256"],
+        _sha256(marker["test_array_path"]),
+        expected_model_id=model_id,
+        expected_farm_id=farm_id,
+        expected_formal=True,
+        expected_bundle_hash=_sha256(
+            marker["preprocessing_bundle_path"]
+        ),
+        expected_snapshot_hash=snapshot_record["sha256"],
+        expected_prediction_code_hash=None,
+        expected_batch_size=(
+            DEFAULT_BATCH_SIZE
+            if model_id
+            in TIMESNET_BASELINE_IDS + TIMEMIXER_BASELINE_IDS
+            else None
+        ),
+    )
+    if valid is None:
+        raise ValueError(
+            f"pre-DLinear旧预测任务恢复校验失败: {model_id}/{farm_id}"
+        )
+    if model_id in TIMESNET_BASELINE_IDS:
+        _validate_old_timesnet_prediction_binding(valid, snapshot_record)
+    elif model_id in TIMEMIXER_BASELINE_IDS:
+        _validate_old_timemixer_prediction_binding(valid, snapshot_record)
+    return valid
+
+
+def _validate_pre_persistence_live_marker(
+    output_root,
+    frozen,
+    model_id,
+    farm_id,
+    snapshot_record,
+    frozen_marker_record=None,
+):
+    """Validate one of 196 prior trained-model predictions byte-for-byte."""
+    pair = (model_id, farm_id)
+    marker_path = _prediction_marker_path(
+        output_root, model_id, farm_id
+    )
+    if not marker_path.is_file():
+        raise FileNotFoundError(
+            f"缺少pre-Persistence预测marker: {marker_path}"
+        )
+    if frozen_marker_record is not None:
+        if (
+            Path(frozen_marker_record["path"]).resolve()
+            != marker_path.resolve()
+            or _sha256(marker_path) != frozen_marker_record["sha256"]
+        ):
+            raise ValueError(f"pre-Persistence冻结预测marker漂移: {pair}")
+    marker = _read_json(marker_path)
+    task = frozen["tasks"][pair]
+    expected_snapshot_name = _expected_pre_persistence_snapshot_name(
+        model_id
+    )
+    if Path(snapshot_record["path"]).name != expected_snapshot_name:
+        raise ValueError(
+            f"{model_id}绑定的冻结快照代际错误: "
+            f"{snapshot_record['path']}"
+        )
+    valid = _prediction_marker_valid(
+        marker_path,
+        task["sha256"],
+        _sha256(marker["test_array_path"]),
+        expected_model_id=model_id,
+        expected_farm_id=farm_id,
+        expected_formal=True,
+        expected_bundle_hash=_sha256(
+            marker["preprocessing_bundle_path"]
+        ),
+        expected_snapshot_hash=snapshot_record["sha256"],
+        expected_prediction_code_hash=None,
+        expected_batch_size=(
+            DEFAULT_BATCH_SIZE
+            if model_id
+            in (
+                TIMESNET_BASELINE_IDS
+                + TIMEMIXER_BASELINE_IDS
+                + DLINEAR_BASELINE_IDS
+            )
+            else None
+        ),
+    )
+    if valid is None:
+        raise ValueError(
+            "pre-Persistence旧预测任务恢复校验失败: "
+            f"{model_id}/{farm_id}"
+        )
+    if model_id in TIMESNET_BASELINE_IDS:
+        _validate_old_timesnet_prediction_binding(valid, snapshot_record)
+    elif model_id in TIMEMIXER_BASELINE_IDS:
+        _validate_old_timemixer_prediction_binding(valid, snapshot_record)
+    elif model_id in DLINEAR_BASELINE_IDS:
+        _validate_old_dlinear_prediction_binding(valid, snapshot_record)
+    return valid
+
+
+def _validate_base10_live_marker(
+    output_root,
+    frozen,
+    model_id,
+    farm_id,
+    snapshot_record,
+    frozen_marker_record=None,
+):
+    """Validate one original base10 prediction without current-code binding."""
+    pair = (model_id, farm_id)
+    marker_path = _prediction_marker_path(
+        output_root, model_id, farm_id
+    )
+    if not marker_path.is_file():
+        raise FileNotFoundError(f"缺少base10预测marker: {marker_path}")
+    if frozen_marker_record is not None:
+        if (
+            Path(frozen_marker_record["path"]).resolve()
+            != marker_path.resolve()
+            or _sha256(marker_path) != frozen_marker_record["sha256"]
+        ):
+            raise ValueError(f"base10冻结预测marker漂移: {pair}")
+    marker = _read_json(marker_path)
+    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
+        snapshot_record["path"]
+    ).resolve():
+        raise ValueError(f"base10预测marker快照路径漂移: {pair}")
+    task = frozen["tasks"][pair]
+    valid = _prediction_marker_valid(
+        marker_path,
+        task["sha256"],
+        _sha256(marker["test_array_path"]),
+        expected_model_id=model_id,
+        expected_farm_id=farm_id,
+        expected_formal=True,
+        expected_bundle_hash=_sha256(
+            marker["preprocessing_bundle_path"]
+        ),
+        expected_snapshot_hash=snapshot_record["sha256"],
+        expected_prediction_code_hash=None,
+        expected_batch_size=None,
+    )
+    if valid is None:
+        raise ValueError(
+            f"base10旧预测任务恢复校验失败: {model_id}/{farm_id}"
+        )
+    return valid
+
+
+def _load_or_archive_base10_prediction_state(output_root, frozen):
+    """Freeze and revalidate the old 10×14 state before unified extension."""
+    output_root = Path(output_root).resolve()
+    archive_root = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "unified_modern"
+        / "base10_prediction_state"
+    )
+    manifest_path = archive_root / "archive_manifest.json"
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in LEGACY_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("extension_lineage")
+            != UNIFIED_MODERN_EXTENSION_LINEAGE
+            or tuple(manifest.get("legacy_model_ids", ()))
+            != LEGACY_MODEL_IDS
+            or tuple(manifest.get("legacy_farm_ids", ()))
+            != EXPECTED_FARMS
+            or int(manifest.get("legacy_task_count", -1))
+            != len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+        ):
+            raise ValueError(f"base10预测归档manifest身份漂移: {manifest_path}")
+        for record in manifest.get("archived_records", {}).values():
+            _validate_record(record)
+        archived_complete = manifest.get("archived_records", {}).get(
+            "prediction_complete"
+        )
+        if (
+            not archived_complete
+            or archived_complete.get("sha256")
+            != manifest.get("legacy_complete_sha256")
+        ):
+            raise ValueError("base10预测归档complete证据SHA绑定漂移")
+        legacy_snapshot = manifest.get("legacy_snapshot_source")
+        _validate_record(legacy_snapshot)
+        frozen_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get(
+                "frozen_prediction_marker_records", ()
+            )
+        }
+        if set(frozen_markers) != expected_pairs:
+            raise ValueError("base10预测归档缺少140个预测marker记录")
+        snapshot_by_model = {
+            model_id: legacy_snapshot for model_id in LEGACY_MODEL_IDS
+        }
+        for model_id, farm_id in sorted(expected_pairs):
+            _validate_base10_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                legacy_snapshot,
+                frozen_marker_record=frozen_markers[
+                    (model_id, farm_id)
+                ],
+            )
+        return {
+            "archive_manifest": _file_record(manifest_path),
+            "snapshot_by_model": snapshot_by_model,
+            "prior_complete_sha256": manifest[
+                "legacy_complete_sha256"
+            ],
+            "frozen_prediction_marker_records": frozen_markers,
+        }
+
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    if not complete_path.is_file():
+        return None
+    complete = _read_json(complete_path)
+    if not _base10_completion_declared(complete):
+        return None
+
+    # Validate the old tree before the archive directory itself becomes a new
+    # inventory entry.
+    for record in complete.get("summary_files", {}).values():
+        _validate_record(record)
+    _validate_inventory(output_root, complete["inventory"])
+    legacy_snapshot = dict(complete["frozen_snapshot"])
+    _validate_record(legacy_snapshot)
+    marker_records = []
+    for model_id, farm_id in sorted(expected_pairs):
+        marker_path = _prediction_marker_path(
+            output_root, model_id, farm_id
+        )
+        _validate_base10_live_marker(
+            output_root,
+            frozen,
+            model_id,
+            farm_id,
+            legacy_snapshot,
+        )
+        marker_records.append(
+            {
+                "model_id": model_id,
+                "farm_id": farm_id,
+                **_file_record(marker_path),
+            }
+        )
+
+    if archive_root.exists():
+        raise ValueError(f"base10预测归档目录不完整，拒绝覆盖: {archive_root}")
+    staging_parent = output_root.parent / "partial_runs" / "archive_staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="base10_prediction_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_archive_record(record):
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "prediction_complete": final_archive_record(
+                _copy_exact_artifact(
+                    complete_path,
+                    staging_root / "base10_prediction_bundle_complete.json",
+                )
+            ),
+            "frozen_training_snapshot": final_archive_record(
+                _copy_exact_artifact(
+                    legacy_snapshot["path"],
+                    staging_root / LEGACY_SNAPSHOT_NAME,
+                )
+            ),
+            "output_inventory": final_archive_record(
+                _copy_exact_artifact(
+                    complete["inventory"]["path"],
+                    staging_root / "round3_external14_output_inventory.csv",
+                )
+            ),
+        }
+        for key, record in complete.get("summary_files", {}).items():
+            source = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_archive_record(
+                _copy_exact_artifact(
+                    source,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source.suffix}",
+                )
+            )
+        manifest = {
+            "status": "complete",
+            "created_at_utc": _utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "extension_lineage": UNIFIED_MODERN_EXTENSION_LINEAGE,
+            "extension_model_ids": list(MODERN_TRAINABLE_MODEL_IDS),
+            "legacy_model_ids": list(LEGACY_MODEL_IDS),
+            "legacy_farm_ids": list(EXPECTED_FARMS),
+            "legacy_task_count": len(LEGACY_MODEL_IDS)
+            * len(EXPECTED_FARMS),
+            "legacy_complete_sha256": _sha256(complete_path),
+            "legacy_snapshot_source": legacy_snapshot,
+            "frozen_prediction_marker_records": marker_records,
+            "archived_records": archived_records,
+            "legacy_task_prediction_artifacts_modified": False,
+        }
+        _atomic_json(manifest, staging_root / "archive_manifest.json")
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return {
+        "archive_manifest": _file_record(manifest_path),
+        "snapshot_by_model": {
+            model_id: legacy_snapshot for model_id in LEGACY_MODEL_IDS
+        },
+        "prior_complete_sha256": manifest["legacy_complete_sha256"],
+        "frozen_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in marker_records
+        },
+    }
+
+
+def _load_or_archive_pre_timesnet_prediction_state(output_root, frozen):
+    """Atomically freeze and revalidate the prior 11-model prediction state."""
+    output_root = Path(output_root).resolve()
+    archive_root = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "timesnet"
+        / "pre_timesnet_11_prediction_state"
+    )
+    manifest_path = archive_root / "archive_manifest.json"
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_TIMESNET_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or tuple(manifest.get("prior_model_ids", ()))
+            != PRE_TIMESNET_MODEL_IDS
+            or int(manifest.get("prior_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(
+                f"pre-TimesNet预测归档manifest身份漂移: {manifest_path}"
+            )
+        for record in manifest.get("archived_records", {}).values():
+            _validate_record(record)
+        frozen_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get("frozen_prediction_marker_records", ())
+        }
+        if set(frozen_markers) != expected_pairs:
+            raise ValueError("pre-TimesNet归档缺少154个预测marker记录")
+        for pair, record in frozen_markers.items():
+            path = Path(record["path"])
+            if not path.is_file() or _sha256(path) != record["sha256"]:
+                raise ValueError(
+                    f"pre-TimesNet冻结预测marker漂移: {pair}"
+                )
+        snapshots = {
+            str(model_id): dict(record)
+            for model_id, record in manifest.get(
+                "snapshot_sources_by_model", {}
+            ).items()
+        }
+        if set(snapshots) != set(PRE_TIMESNET_MODEL_IDS):
+            raise ValueError("pre-TimesNet归档缺少逐模型快照映射")
+        for record in snapshots.values():
+            _validate_record(record)
+        return {
+            "archive_manifest": _file_record(manifest_path),
+            "snapshot_by_model": snapshots,
+            "prior_complete_sha256": manifest[
+                "prior_prediction_complete_sha256"
+            ],
+            "frozen_prediction_marker_records": frozen_markers,
+        }
+
+    if archive_root.exists():
+        raise ValueError(f"pre-TimesNet预测归档目录不完整: {archive_root}")
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    if not complete_path.is_file():
+        raise FileNotFoundError(
+            "缺少iTransformer扩展后的11模型prediction complete marker"
+        )
+    complete = _read_json(complete_path)
+    if not _pre_timesnet_completion_declared(complete):
+        raise ValueError(
+            "TimesNet正式追加要求先完成11模型×14站的154项预测；"
+            "禁止从base10状态静默重算或跨代合并"
+        )
+    for record in complete.get("summary_files", {}).values():
+        _validate_record(record)
+    _validate_inventory(output_root, complete["inventory"])
+
+    marker_records = []
+    snapshot_by_model = {}
+    for model_id in PRE_TIMESNET_MODEL_IDS:
+        model_snapshots = {}
+        for farm_id in EXPECTED_FARMS:
+            pair = (model_id, farm_id)
+            marker_path = _prediction_marker_path(
+                output_root, model_id, farm_id
+            )
+            marker_record = _file_record(marker_path)
+            marker = _read_json(marker_path)
+            frozen_task = frozen["tasks"][pair]
+            snapshot_record = _file_record(marker["frozen_snapshot_path"])
+            if (
+                snapshot_record["sha256"]
+                != marker.get("frozen_snapshot_sha256")
+            ):
+                raise ValueError(f"{model_id}/{farm_id}冻结快照SHA漂移")
+            valid = _prediction_marker_valid(
+                marker_path,
+                frozen_task["sha256"],
+                _sha256(marker["test_array_path"]),
+                expected_model_id=model_id,
+                expected_farm_id=farm_id,
+                expected_formal=True,
+                expected_bundle_hash=_sha256(
+                    marker["preprocessing_bundle_path"]
+                ),
+                expected_snapshot_hash=snapshot_record["sha256"],
+            )
+            if valid is None:
+                raise ValueError(
+                    f"pre-TimesNet旧预测任务恢复校验失败: {model_id}/{farm_id}"
+                )
+            model_snapshots[
+                (
+                    snapshot_record["path"],
+                    snapshot_record["sha256"],
+                    snapshot_record["size_bytes"],
+                )
+            ] = snapshot_record
+            marker_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    **marker_record,
+                }
+            )
+        if len(model_snapshots) != 1:
+            raise ValueError(f"{model_id}跨场站绑定了不同冻结快照")
+        snapshot_by_model[model_id] = next(iter(model_snapshots.values()))
+        expected_snapshot_name = (
+            LEGACY_SNAPSHOT_NAME
+            if model_id in LEGACY_MODEL_IDS
+            else ITRANSFORMER_SNAPSHOT_NAME
+        )
+        if (
+            Path(snapshot_by_model[model_id]["path"]).name
+            != expected_snapshot_name
+        ):
+            raise ValueError(
+                f"{model_id}绑定的冻结快照代际错误: "
+                f"{snapshot_by_model[model_id]['path']}"
+            )
+
+    staging_parent = (
+        output_root.parent / "partial_runs" / "archive_staging"
+    )
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_timesnet_prediction_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_archive_record(record):
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "prediction_complete": final_archive_record(
+                _copy_exact_artifact(
+                    complete_path,
+                    staging_root
+                    / "pre_timesnet_11_prediction_bundle_complete.json",
+                )
+            ),
+            "output_inventory": final_archive_record(
+                _copy_exact_artifact(
+                    complete["inventory"]["path"],
+                    staging_root
+                    / "round3_external14_output_inventory.csv",
+                )
+            ),
+        }
+        for key, record in complete.get("summary_files", {}).items():
+            source = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_archive_record(
+                _copy_exact_artifact(
+                    source,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source.suffix}",
+                )
+            )
+        unique_snapshots = {
+            (record["path"], record["sha256"]): record
+            for record in snapshot_by_model.values()
+        }
+        for index, record in enumerate(unique_snapshots.values(), start=1):
+            source = Path(record["path"])
+            archived_records[f"frozen_snapshot_{index}"] = (
+                final_archive_record(
+                    _copy_exact_artifact(
+                        source,
+                        staging_root
+                        / "frozen_snapshots"
+                        / f"{index}_{source.name}",
+                    )
+                )
+            )
+        manifest = {
+            "status": "complete",
+            "created_at_utc": _utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "prior_model_ids": list(PRE_TIMESNET_MODEL_IDS),
+            "prior_farm_ids": list(EXPECTED_FARMS),
+            "prior_task_count": len(expected_pairs),
+            "prior_prediction_complete_sha256": _sha256(complete_path),
+            "snapshot_sources_by_model": snapshot_by_model,
+            "frozen_prediction_marker_records": marker_records,
+            "archived_records": archived_records,
+            "pre_timesnet_prediction_artifacts_modified": False,
+        }
+        _atomic_json(manifest, staging_root / "archive_manifest.json")
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return {
+        "archive_manifest": _file_record(manifest_path),
+        "snapshot_by_model": snapshot_by_model,
+        "prior_complete_sha256": manifest[
+            "prior_prediction_complete_sha256"
+        ],
+        "frozen_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in marker_records
+        },
+    }
+
+
+def _load_or_archive_pre_timemixer_prediction_state(
+    output_root, frozen
+):
+    """Atomically freeze and revalidate the prior 12-model prediction state."""
+    output_root = Path(output_root).resolve()
+    archive_root = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "timemixer"
+        / "pre_timemixer_12_prediction_state"
+    )
+    manifest_path = archive_root / "archive_manifest.json"
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_TIMEMIXER_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or tuple(manifest.get("prior_model_ids", ()))
+            != PRE_TIMEMIXER_MODEL_IDS
+            or tuple(manifest.get("prior_farm_ids", ()))
+            != EXPECTED_FARMS
+            or int(manifest.get("prior_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(
+                f"pre-TimeMixer预测归档manifest身份漂移: {manifest_path}"
+            )
+        for record in manifest.get("archived_records", {}).values():
+            _validate_record(record)
+        archived_complete = manifest.get("archived_records", {}).get(
+            "prediction_complete"
+        )
+        if (
+            not archived_complete
+            or archived_complete.get("sha256")
+            != manifest.get("prior_prediction_complete_sha256")
+        ):
+            raise ValueError("pre-TimeMixer归档complete证据SHA绑定漂移")
+        frozen_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get(
+                "frozen_prediction_marker_records", ()
+            )
+        }
+        if set(frozen_markers) != expected_pairs:
+            raise ValueError("pre-TimeMixer归档缺少168个预测marker记录")
+        snapshots = {
+            str(model_id): dict(record)
+            for model_id, record in manifest.get(
+                "snapshot_sources_by_model", {}
+            ).items()
+        }
+        if set(snapshots) != set(PRE_TIMEMIXER_MODEL_IDS):
+            raise ValueError("pre-TimeMixer归档缺少逐模型快照映射")
+        for model_id, record in snapshots.items():
+            _validate_record(record)
+            if Path(record["path"]).name != (
+                _expected_pre_timemixer_snapshot_name(model_id)
+            ):
+                raise ValueError(f"{model_id}归档快照代际漂移")
+        for model_id, farm_id in sorted(expected_pairs):
+            _validate_pre_timemixer_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshots[model_id],
+                frozen_marker_record=frozen_markers[
+                    (model_id, farm_id)
+                ],
+            )
+        return {
+            "archive_manifest": _file_record(manifest_path),
+            "snapshot_by_model": snapshots,
+            "prior_complete_sha256": manifest[
+                "prior_prediction_complete_sha256"
+            ],
+            "frozen_prediction_marker_records": frozen_markers,
+        }
+
+    if archive_root.exists():
+        raise ValueError(
+            f"pre-TimeMixer预测归档目录不完整，拒绝覆盖: {archive_root}"
+        )
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    if not complete_path.is_file():
+        raise FileNotFoundError(
+            "缺少TimesNet扩展后的12模型prediction complete marker"
+        )
+    complete = _read_json(complete_path)
+    if not _pre_timemixer_completion_declared(complete):
+        raise ValueError(
+            "TimeMixer正式追加要求先完成12模型×14站的168项预测；"
+            "禁止从pre-TimesNet状态静默重算或跨代合并"
+        )
+    for record in complete.get("summary_files", {}).values():
+        _validate_record(record)
+    _validate_inventory(output_root, complete["inventory"])
+
+    marker_records = []
+    snapshot_by_model = {}
+    for model_id in PRE_TIMEMIXER_MODEL_IDS:
+        model_snapshots = {}
+        for farm_id in EXPECTED_FARMS:
+            marker_path = _prediction_marker_path(
+                output_root, model_id, farm_id
+            )
+            marker = _read_json(marker_path)
+            snapshot_record = _file_record(
+                marker["frozen_snapshot_path"]
+            )
+            if (
+                snapshot_record["sha256"]
+                != marker.get("frozen_snapshot_sha256")
+            ):
+                raise ValueError(f"{model_id}/{farm_id}冻结快照SHA漂移")
+            _validate_pre_timemixer_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshot_record,
+            )
+            model_snapshots[
+                (
+                    snapshot_record["path"],
+                    snapshot_record["sha256"],
+                    snapshot_record["size_bytes"],
+                )
+            ] = snapshot_record
+            marker_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    **_file_record(marker_path),
+                }
+            )
+        if len(model_snapshots) != 1:
+            raise ValueError(f"{model_id}跨场站绑定了不同冻结快照")
+        snapshot_by_model[model_id] = next(
+            iter(model_snapshots.values())
+        )
+        if Path(snapshot_by_model[model_id]["path"]).name != (
+            _expected_pre_timemixer_snapshot_name(model_id)
+        ):
+            raise ValueError(
+                f"{model_id}绑定的冻结快照代际错误: "
+                f"{snapshot_by_model[model_id]['path']}"
+            )
+
+    staging_parent = (
+        output_root.parent / "partial_runs" / "archive_staging"
+    )
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_timemixer_prediction_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_archive_record(record):
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "prediction_complete": final_archive_record(
+                _copy_exact_artifact(
+                    complete_path,
+                    staging_root
+                    / "pre_timemixer_12_prediction_bundle_complete.json",
+                )
+            ),
+            "output_inventory": final_archive_record(
+                _copy_exact_artifact(
+                    complete["inventory"]["path"],
+                    staging_root
+                    / "round3_external14_output_inventory.csv",
+                )
+            ),
+        }
+        for key, record in complete.get("summary_files", {}).items():
+            source = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_archive_record(
+                _copy_exact_artifact(
+                    source,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source.suffix}",
+                )
+            )
+        unique_snapshots = {
+            (record["path"], record["sha256"]): record
+            for record in snapshot_by_model.values()
+        }
+        if len(unique_snapshots) != 3:
+            raise ValueError(
+                "pre-TimeMixer状态应精确包含legacy/iTransformer/"
+                "TimesNet三代冻结快照"
+            )
+        for index, record in enumerate(
+            unique_snapshots.values(), start=1
+        ):
+            source = Path(record["path"])
+            archived_records[f"frozen_snapshot_{index}"] = (
+                final_archive_record(
+                    _copy_exact_artifact(
+                        source,
+                        staging_root
+                        / "frozen_snapshots"
+                        / f"{index}_{source.name}",
+                    )
+                )
+            )
+        manifest = {
+            "status": "complete",
+            "complete": True,
+            "created_at_utc": _utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "extension_model_id": "timemixer",
+            "prior_model_ids": list(PRE_TIMEMIXER_MODEL_IDS),
+            "prior_farm_ids": list(EXPECTED_FARMS),
+            "prior_task_count": len(expected_pairs),
+            "prior_prediction_complete_sha256": _sha256(complete_path),
+            "snapshot_sources_by_model": snapshot_by_model,
+            "frozen_prediction_marker_records": marker_records,
+            "archived_records": archived_records,
+            "pre_timemixer_prediction_artifacts_modified": False,
+            "old_timesnet_prediction_code_bound_to_old_snapshot": True,
+            "old_timesnet_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+        }
+        _atomic_json(manifest, staging_root / "archive_manifest.json")
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return {
+        "archive_manifest": _file_record(manifest_path),
+        "snapshot_by_model": snapshot_by_model,
+        "prior_complete_sha256": manifest[
+            "prior_prediction_complete_sha256"
+        ],
+        "frozen_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in marker_records
+        },
+    }
+
+
+def _load_or_archive_pre_dlinear_prediction_state(output_root, frozen):
+    """Atomically freeze and revalidate the prior 13-model prediction state."""
+    output_root = Path(output_root).resolve()
+    archive_root = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "dlinear"
+        / "pre_dlinear_13_prediction_state"
+    )
+    manifest_path = archive_root / "archive_manifest.json"
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_DLINEAR_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("model_matrix_revision")
+            not in {
+                PRE_PERSISTENCE_MODEL_MATRIX_REVISION,
+                MODEL_MATRIX_REVISION,
+            }
+            or manifest.get("extension_model_id") != "dlinear"
+            or tuple(manifest.get("prior_model_ids", ()))
+            != PRE_DLINEAR_MODEL_IDS
+            or tuple(manifest.get("prior_farm_ids", ()))
+            != EXPECTED_FARMS
+            or int(manifest.get("prior_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(
+                f"pre-DLinear预测归档manifest身份漂移: {manifest_path}"
+            )
+        for record in manifest.get("archived_records", {}).values():
+            _validate_record(record)
+        archived_complete = manifest.get("archived_records", {}).get(
+            "prediction_complete"
+        )
+        if (
+            not archived_complete
+            or archived_complete.get("sha256")
+            != manifest.get("prior_prediction_complete_sha256")
+        ):
+            raise ValueError("pre-DLinear归档complete证据SHA绑定漂移")
+        frozen_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get(
+                "frozen_prediction_marker_records", ()
+            )
+        }
+        if set(frozen_markers) != expected_pairs:
+            raise ValueError("pre-DLinear归档缺少182个预测marker记录")
+        snapshots = {
+            str(model_id): dict(record)
+            for model_id, record in manifest.get(
+                "snapshot_sources_by_model", {}
+            ).items()
+        }
+        if set(snapshots) != set(PRE_DLINEAR_MODEL_IDS):
+            raise ValueError("pre-DLinear归档缺少逐模型快照映射")
+        unique_snapshots = {
+            (record["path"], record["sha256"])
+            for record in snapshots.values()
+        }
+        if len(unique_snapshots) != 4:
+            raise ValueError(
+                "pre-DLinear归档应精确包含四个历史代际快照"
+            )
+        for model_id, record in snapshots.items():
+            _validate_record(record)
+            if Path(record["path"]).name != (
+                _expected_pre_dlinear_snapshot_name(model_id)
+            ):
+                raise ValueError(f"{model_id}归档快照代际漂移")
+        for model_id, farm_id in sorted(expected_pairs):
+            _validate_pre_dlinear_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshots[model_id],
+                frozen_marker_record=frozen_markers[
+                    (model_id, farm_id)
+                ],
+            )
+        return {
+            "archive_manifest": _file_record(manifest_path),
+            "snapshot_by_model": snapshots,
+            "prior_complete_sha256": manifest[
+                "prior_prediction_complete_sha256"
+            ],
+            "frozen_prediction_marker_records": frozen_markers,
+        }
+
+    if archive_root.exists():
+        raise ValueError(
+            f"pre-DLinear预测归档目录不完整，拒绝覆盖: {archive_root}"
+        )
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    if not complete_path.is_file():
+        raise FileNotFoundError(
+            "缺少TimeMixer扩展后的13模型prediction complete marker"
+        )
+    complete = _read_json(complete_path)
+    if not _pre_dlinear_completion_declared(complete):
+        raise ValueError(
+            "DLinear正式追加要求先完成13模型×14站的182项预测；"
+            "禁止从pre-TimeMixer状态静默重算或跨代合并"
+        )
+    for record in complete.get("summary_files", {}).values():
+        _validate_record(record)
+    _validate_inventory(output_root, complete["inventory"])
+
+    marker_records = []
+    snapshot_by_model = {}
+    for model_id in PRE_DLINEAR_MODEL_IDS:
+        model_snapshots = {}
+        for farm_id in EXPECTED_FARMS:
+            marker_path = _prediction_marker_path(
+                output_root, model_id, farm_id
+            )
+            marker = _read_json(marker_path)
+            snapshot_record = _file_record(
+                marker["frozen_snapshot_path"]
+            )
+            if (
+                snapshot_record["sha256"]
+                != marker.get("frozen_snapshot_sha256")
+            ):
+                raise ValueError(f"{model_id}/{farm_id}冻结快照SHA漂移")
+            _validate_pre_dlinear_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshot_record,
+            )
+            model_snapshots[
+                (
+                    snapshot_record["path"],
+                    snapshot_record["sha256"],
+                    snapshot_record["size_bytes"],
+                )
+            ] = snapshot_record
+            marker_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    **_file_record(marker_path),
+                }
+            )
+        if len(model_snapshots) != 1:
+            raise ValueError(f"{model_id}跨场站绑定了不同冻结快照")
+        snapshot_by_model[model_id] = next(
+            iter(model_snapshots.values())
+        )
+        if Path(snapshot_by_model[model_id]["path"]).name != (
+            _expected_pre_dlinear_snapshot_name(model_id)
+        ):
+            raise ValueError(
+                f"{model_id}绑定的冻结快照代际错误: "
+                f"{snapshot_by_model[model_id]['path']}"
+            )
+
+    unique_snapshots = {
+        (record["path"], record["sha256"]): record
+        for record in snapshot_by_model.values()
+    }
+    if len(unique_snapshots) != 4:
+        raise ValueError(
+            "pre-DLinear状态应精确包含legacy/iTransformer/"
+            "TimesNet/TimeMixer四代冻结快照"
+        )
+
+    staging_parent = (
+        output_root.parent / "partial_runs" / "archive_staging"
+    )
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_dlinear_prediction_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_archive_record(record):
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "prediction_complete": final_archive_record(
+                _copy_exact_artifact(
+                    complete_path,
+                    staging_root
+                    / "pre_dlinear_13_prediction_bundle_complete.json",
+                )
+            ),
+            "output_inventory": final_archive_record(
+                _copy_exact_artifact(
+                    complete["inventory"]["path"],
+                    staging_root
+                    / "round3_external14_output_inventory.csv",
+                )
+            ),
+        }
+        for key, record in complete.get("summary_files", {}).items():
+            source = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_archive_record(
+                _copy_exact_artifact(
+                    source,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source.suffix}",
+                )
+            )
+        for index, record in enumerate(
+            unique_snapshots.values(), start=1
+        ):
+            source = Path(record["path"])
+            archived_records[f"frozen_snapshot_{index}"] = (
+                final_archive_record(
+                    _copy_exact_artifact(
+                        source,
+                        staging_root
+                        / "frozen_snapshots"
+                        / f"{index}_{source.name}",
+                    )
+                )
+            )
+        manifest = {
+            "status": "complete",
+            "complete": True,
+            "created_at_utc": _utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "extension_model_id": "dlinear",
+            "prior_model_ids": list(PRE_DLINEAR_MODEL_IDS),
+            "prior_farm_ids": list(EXPECTED_FARMS),
+            "prior_task_count": len(expected_pairs),
+            "prior_prediction_complete_sha256": _sha256(complete_path),
+            "snapshot_sources_by_model": snapshot_by_model,
+            "frozen_prediction_marker_records": marker_records,
+            "archived_records": archived_records,
+            "pre_dlinear_prediction_artifacts_modified": False,
+            "old_timesnet_prediction_code_bound_to_old_snapshot": True,
+            "old_timemixer_prediction_code_bound_to_old_snapshot": True,
+            "old_timesnet_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+            "old_timemixer_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+        }
+        _atomic_json(manifest, staging_root / "archive_manifest.json")
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return {
+        "archive_manifest": _file_record(manifest_path),
+        "snapshot_by_model": snapshot_by_model,
+        "prior_complete_sha256": manifest[
+            "prior_prediction_complete_sha256"
+        ],
+        "frozen_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in marker_records
+        },
+    }
+
+
+def _load_or_archive_pre_persistence_prediction_state(
+    output_root,
+    frozen,
+):
+    """Atomically freeze and revalidate the 14-model/196-task prediction state."""
+    output_root = Path(output_root).resolve()
+    archive_root = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "persistence"
+        / "pre_persistence_14_prediction_state"
+    )
+    manifest_path = archive_root / "archive_manifest.json"
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in TRAINED_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("protocol_version") != PROTOCOL_VERSION
+            or manifest.get("model_matrix_revision")
+            != MODEL_MATRIX_REVISION
+            or manifest.get("prior_model_matrix_revision")
+            != PRE_PERSISTENCE_MODEL_MATRIX_REVISION
+            or manifest.get("extension_model_id") != "persistence"
+            or tuple(manifest.get("prior_model_ids", ()))
+            != TRAINED_MODEL_IDS
+            or tuple(manifest.get("prior_farm_ids", ()))
+            != EXPECTED_FARMS
+            or int(manifest.get("prior_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(
+                "pre-Persistence预测归档manifest身份漂移: "
+                f"{manifest_path}"
+            )
+
+        archived_records = {
+            str(key): dict(record)
+            for key, record in manifest.get(
+                "archived_records", {}
+            ).items()
+        }
+        for record in archived_records.values():
+            _validate_record(record)
+        archived_complete_record = archived_records.get(
+            "prediction_complete"
+        )
+        if (
+            not archived_complete_record
+            or archived_complete_record.get("sha256")
+            != manifest.get("prior_prediction_complete_sha256")
+        ):
+            raise ValueError(
+                "pre-Persistence归档complete证据SHA绑定漂移"
+            )
+        archived_complete = _read_json(
+            archived_complete_record["path"]
+        )
+        if not _pre_persistence_completion_declared(
+            archived_complete
+        ):
+            raise ValueError(
+                "pre-Persistence归档中的prediction complete身份漂移"
+            )
+
+        expected_summary_keys = {
+            f"summary_{key}"
+            for key in archived_complete.get("summary_files", {})
+        }
+        expected_marker_keys = {
+            f"prediction_marker_{model_id}_{farm_id}"
+            for model_id, farm_id in expected_pairs
+        }
+        expected_snapshot_keys = {
+            f"frozen_snapshot_{index}" for index in range(1, 6)
+        }
+        expected_archived_keys = (
+            {"prediction_complete", "output_inventory"}
+            | expected_summary_keys
+            | expected_marker_keys
+            | expected_snapshot_keys
+        )
+        if set(archived_records) != expected_archived_keys:
+            raise ValueError(
+                "pre-Persistence归档文件集合不完整或含额外文件"
+            )
+        archived_inventory = archived_records["output_inventory"]
+        if (
+            archived_inventory.get("sha256")
+            != archived_complete.get("inventory", {}).get("sha256")
+        ):
+            raise ValueError(
+                "pre-Persistence归档inventory与旧complete绑定漂移"
+            )
+        for key, source_record in archived_complete.get(
+            "summary_files", {}
+        ).items():
+            if (
+                archived_records[f"summary_{key}"].get("sha256")
+                != source_record.get("sha256")
+            ):
+                raise ValueError(
+                    f"pre-Persistence归档summary SHA漂移: {key}"
+                )
+
+        frozen_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get(
+                "frozen_prediction_marker_records", ()
+            )
+        }
+        archived_markers = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get(
+                "archived_prediction_marker_records", ()
+            )
+        }
+        if (
+            set(frozen_markers) != expected_pairs
+            or set(archived_markers) != expected_pairs
+        ):
+            raise ValueError(
+                "pre-Persistence归档缺少196个预测marker证据"
+            )
+        for pair in sorted(expected_pairs):
+            live_record = frozen_markers[pair]
+            archived_record = archived_markers[pair]
+            archive_key = (
+                f"prediction_marker_{pair[0]}_{pair[1]}"
+            )
+            if (
+                archived_record.get("sha256")
+                != live_record.get("sha256")
+                or any(
+                    archived_record.get(field)
+                    != archived_records[archive_key].get(field)
+                    for field in ("path", "sha256", "size_bytes")
+                )
+            ):
+                raise ValueError(
+                    "pre-Persistence归档marker副本与冻结SHA不一致: "
+                    f"{pair}"
+                )
+
+        snapshots = {
+            str(model_id): dict(record)
+            for model_id, record in manifest.get(
+                "snapshot_sources_by_model", {}
+            ).items()
+        }
+        if set(snapshots) != set(TRAINED_MODEL_IDS):
+            raise ValueError(
+                "pre-Persistence归档缺少逐模型快照映射"
+            )
+        unique_snapshots = {
+            (record["path"], record["sha256"])
+            for record in snapshots.values()
+        }
+        if len(unique_snapshots) != 5:
+            raise ValueError(
+                "pre-Persistence归档应精确包含五个历史代际快照"
+            )
+        archived_snapshot_hashes = {
+            archived_records[key]["sha256"]
+            for key in expected_snapshot_keys
+        }
+        if archived_snapshot_hashes != {
+            record["sha256"] for record in snapshots.values()
+        }:
+            raise ValueError(
+                "pre-Persistence归档快照副本与逐模型快照映射漂移"
+            )
+        for model_id, record in snapshots.items():
+            _validate_record(record)
+            if Path(record["path"]).name != (
+                _expected_pre_persistence_snapshot_name(model_id)
+            ):
+                raise ValueError(
+                    f"{model_id}归档快照代际漂移"
+                )
+        for model_id, farm_id in sorted(expected_pairs):
+            _validate_pre_persistence_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshots[model_id],
+                frozen_marker_record=frozen_markers[
+                    (model_id, farm_id)
+                ],
+            )
+        return {
+            "archive_manifest": _file_record(manifest_path),
+            "snapshot_by_model": snapshots,
+            "prior_complete_sha256": manifest[
+                "prior_prediction_complete_sha256"
+            ],
+            "frozen_prediction_marker_records": frozen_markers,
+            "archived_prediction_marker_records": archived_markers,
+        }
+
+    if archive_root.exists():
+        raise ValueError(
+            "pre-Persistence预测归档目录不完整，拒绝覆盖: "
+            f"{archive_root}"
+        )
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    if not complete_path.is_file():
+        raise FileNotFoundError(
+            "缺少DLinear扩展后的14模型prediction complete marker"
+        )
+    complete = _read_json(complete_path)
+    if not _pre_persistence_completion_declared(complete):
+        raise ValueError(
+            "Persistence正式追加要求先完成14模型×14站的196项预测；"
+            "禁止从pre-DLinear状态静默重算或跨代合并"
+        )
+    for record in complete.get("summary_files", {}).values():
+        _validate_record(record)
+    _validate_inventory(output_root, complete["inventory"])
+
+    marker_records = []
+    snapshot_by_model = {}
+    for model_id in TRAINED_MODEL_IDS:
+        model_snapshots = {}
+        for farm_id in EXPECTED_FARMS:
+            marker_path = _prediction_marker_path(
+                output_root, model_id, farm_id
+            )
+            if not marker_path.is_file():
+                raise FileNotFoundError(
+                    f"缺少pre-Persistence预测marker: {marker_path}"
+                )
+            marker = _read_json(marker_path)
+            snapshot_record = _file_record(
+                marker["frozen_snapshot_path"]
+            )
+            if (
+                snapshot_record["sha256"]
+                != marker.get("frozen_snapshot_sha256")
+            ):
+                raise ValueError(
+                    f"{model_id}/{farm_id}冻结快照SHA漂移"
+                )
+            _validate_pre_persistence_live_marker(
+                output_root,
+                frozen,
+                model_id,
+                farm_id,
+                snapshot_record,
+            )
+            model_snapshots[
+                (
+                    snapshot_record["path"],
+                    snapshot_record["sha256"],
+                    snapshot_record["size_bytes"],
+                )
+            ] = snapshot_record
+            marker_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    **_file_record(marker_path),
+                }
+            )
+        if len(model_snapshots) != 1:
+            raise ValueError(
+                f"{model_id}跨场站绑定了不同冻结快照"
+            )
+        snapshot_by_model[model_id] = next(
+            iter(model_snapshots.values())
+        )
+        if Path(snapshot_by_model[model_id]["path"]).name != (
+            _expected_pre_persistence_snapshot_name(model_id)
+        ):
+            raise ValueError(
+                f"{model_id}绑定的冻结快照代际错误: "
+                f"{snapshot_by_model[model_id]['path']}"
+            )
+
+    unique_snapshots = {
+        (record["path"], record["sha256"]): record
+        for record in snapshot_by_model.values()
+    }
+    if len(unique_snapshots) != 5:
+        raise ValueError(
+            "pre-Persistence状态应精确包含legacy/iTransformer/"
+            "TimesNet/TimeMixer/DLinear五代冻结快照"
+        )
+
+    staging_parent = (
+        output_root.parent / "partial_runs" / "archive_staging"
+    )
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_persistence_prediction_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_archive_record(record):
+        relative = Path(record["path"]).resolve().relative_to(
+            staging_root
+        )
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "prediction_complete": final_archive_record(
+                _copy_exact_artifact(
+                    complete_path,
+                    staging_root
+                    / "pre_persistence_14_prediction_bundle_complete.json",
+                )
+            ),
+            "output_inventory": final_archive_record(
+                _copy_exact_artifact(
+                    complete["inventory"]["path"],
+                    staging_root
+                    / "round3_external14_output_inventory.csv",
+                )
+            ),
+        }
+        for key, record in complete.get("summary_files", {}).items():
+            source = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_archive_record(
+                _copy_exact_artifact(
+                    source,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source.suffix}",
+                )
+            )
+
+        archived_marker_records = []
+        for item in marker_records:
+            model_id = item["model_id"]
+            farm_id = item["farm_id"]
+            archive_key = (
+                f"prediction_marker_{model_id}_{farm_id}"
+            )
+            archived_record = final_archive_record(
+                _copy_exact_artifact(
+                    item["path"],
+                    staging_root
+                    / "prediction_markers"
+                    / model_id
+                    / f"{model_id}_{farm_id}.json",
+                )
+            )
+            archived_records[archive_key] = archived_record
+            archived_marker_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    **archived_record,
+                }
+            )
+
+        for index, record in enumerate(
+            unique_snapshots.values(), start=1
+        ):
+            source = Path(record["path"])
+            archived_records[f"frozen_snapshot_{index}"] = (
+                final_archive_record(
+                    _copy_exact_artifact(
+                        source,
+                        staging_root
+                        / "frozen_snapshots"
+                        / f"{index}_{source.name}",
+                    )
+                )
+            )
+        manifest = {
+            "status": "complete",
+            "complete": True,
+            "created_at_utc": _utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "prior_model_matrix_revision": (
+                PRE_PERSISTENCE_MODEL_MATRIX_REVISION
+            ),
+            "extension_model_id": "persistence",
+            "extension_requires_training": False,
+            "prior_model_ids": list(TRAINED_MODEL_IDS),
+            "prior_farm_ids": list(EXPECTED_FARMS),
+            "prior_task_count": len(expected_pairs),
+            "prior_prediction_complete_sha256": _sha256(
+                complete_path
+            ),
+            "snapshot_sources_by_model": snapshot_by_model,
+            "frozen_prediction_marker_records": marker_records,
+            "archived_prediction_marker_records": (
+                archived_marker_records
+            ),
+            "archived_records": archived_records,
+            "pre_persistence_prediction_artifacts_modified": False,
+            "old_timesnet_prediction_code_bound_to_old_snapshot": True,
+            "old_timemixer_prediction_code_bound_to_old_snapshot": True,
+            "old_dlinear_prediction_code_bound_to_old_snapshot": True,
+            "old_timesnet_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+            "old_timemixer_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+            "old_dlinear_prediction_batch_size": int(
+                DEFAULT_BATCH_SIZE
+            ),
+        }
+        _atomic_json(
+            manifest,
+            staging_root / "archive_manifest.json",
+        )
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return {
+        "archive_manifest": _file_record(manifest_path),
+        "snapshot_by_model": snapshot_by_model,
+        "prior_complete_sha256": manifest[
+            "prior_prediction_complete_sha256"
+        ],
+        "frozen_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in marker_records
+        },
+        "archived_prediction_marker_records": {
+            (item["model_id"], item["farm_id"]): item
+            for item in archived_marker_records
+        },
+    }
+
+
+def _freeze_snapshot(
+    output_root,
+    frozen,
+    preprocess_record,
+    formal,
+    additive_extension=False,
+    snapshot_name=None,
+    snapshot_role=None,
+    bound_model_ids=None,
+):
+    if snapshot_name is None:
+        snapshot_name = (
+            PERSISTENCE_SNAPSHOT_NAME
+            if additive_extension
+            else LEGACY_SNAPSHOT_NAME
+        )
+    if snapshot_role is None:
+        snapshot_role = (
+            "persistence_extension"
+            if additive_extension
+            else "selected_prediction_run"
+        )
+    if bound_model_ids is None:
+        bound_model_ids = tuple()
+    path = Path(output_root) / "manifests" / snapshot_name
     payload = {
         "protocol_version": PROTOCOL_VERSION,
+        "model_matrix_revision": MODEL_MATRIX_REVISION,
         "formal": bool(formal),
+        "additive_baseline_extension": bool(additive_extension),
+        "snapshot_role": str(snapshot_role),
+        "bound_model_ids": list(bound_model_ids),
+        "prediction_code": _file_record(__file__),
         "created_at_utc": _utc_now(),
         "preprocess_complete": preprocess_record,
         "training_complete": frozen.get("training_complete"),
+        "trained_model_ids": list(TRAINED_MODEL_IDS),
+        "trained_task_count": len(frozen["tasks"]),
+        "training_free_baseline_ids": list(PERSISTENCE_BASELINE_IDS),
+        "training_free_baselines": frozen.get(
+            "training_free_baselines", {}
+        ),
         "tasks": {
             f"{model_id}/{farm_id}": {
                 "path": task["path"],
@@ -2368,11 +4982,13 @@ def _revalidate_frozen(frozen):
         if _sha256(path) != task["sha256"]:
             raise ValueError(f"预测期间训练task marker发生变化: {path}")
         _validate_record(task["model_record"])
+    for record in frozen.get("training_free_baselines", {}).values():
+        _validate_record(record)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Part 3 Round 3 JSFD14 ten-model frozen test prediction"
+        description="Part 3 Round 3 JSFD14 frozen strong-baseline test prediction"
     )
     parser.add_argument("--models", nargs="*", help="模型ID，空格或逗号分隔")
     parser.add_argument("--farms", nargs="*", help="JSFD场站ID，空格或逗号分隔")
@@ -2388,6 +5004,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    current_prediction_code_sha256 = _sha256(__file__)
     root = Path(args.result_root).resolve()
     models = _normalize_requested(args.models, MODEL_IDS, "模型")
     farms = _normalize_requested(args.farms, EXPECTED_FARMS, "场站")
@@ -2402,10 +5019,15 @@ def main(argv=None):
     formal = not args.partial and not args.smoke and not subset
     if subset and not (args.partial or args.smoke):
         raise ValueError("模型/场站子集预测必须显式使用--partial或--smoke")
+    if formal and args.batch_size != DEFAULT_BATCH_SIZE:
+        raise ValueError(
+            "正式预测固定batch_size=192；TimesNet的全局FFT周期选择"
+            "依赖batch组成，现代基线追加须保持统一正式CSV协议"
+        )
 
     preprocess_path, _ = _validate_preprocess_complete(root)
     preprocess_record = _file_record(preprocess_path)
-    # 关键因果门：正式模式在下方验证完140个冻结任务前，不读取任何NPZ测试值。
+    # 关键因果门：正式模式在下方验证完整冻结矩阵前，不读取任何NPZ测试值。
     frozen = (
         _validate_all_training_frozen(root)
         if formal
@@ -2430,14 +5052,267 @@ def main(argv=None):
             root / "partial_runs" / "prediction" / f"{stamp}_{tag}"
         )
     output_root.mkdir(parents=True, exist_ok=True)
+
+    # Determine the additive base before writing the Persistence spec, because
+    # the prior-generation inventory must still match byte-for-byte while it
+    # is being archived.  The current unified lineage starts from the original
+    # 10-model/140-prediction state and adds all four learned modern baselines
+    # plus Persistence.  Historical staged lineages still accept 182 or 196
+    # prior predictions without recomputing them.
+    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    existing_before_extension = None
+    if formal and complete_path.is_file():
+        candidate_complete = _read_json(complete_path)
+        if _completion_declared(candidate_complete):
+            existing_before_extension = candidate_complete
+    pre_persistence_manifest_path = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "persistence"
+        / "pre_persistence_14_prediction_state"
+        / "archive_manifest.json"
+    )
+    base10_manifest_path = (
+        output_root
+        / "manifests"
+        / "extensions"
+        / "unified_modern"
+        / "base10_prediction_state"
+        / "archive_manifest.json"
+    )
+    training_extension_lineage = frozen.get(
+        "extension_lineage", STAGED_EXTENSION_LINEAGE
+    )
+    use_unified_modern_generation = bool(
+        formal
+        and training_extension_lineage
+        == UNIFIED_MODERN_EXTENSION_LINEAGE
+        and (
+            base10_manifest_path.is_file()
+            or (
+                existing_before_extension is not None
+                and (
+                    _base10_completion_declared(existing_before_extension)
+                    or (
+                        _completion_declared(existing_before_extension)
+                        and existing_before_extension.get(
+                            "extension_lineage"
+                        )
+                        == UNIFIED_MODERN_EXTENSION_LINEAGE
+                    )
+                )
+            )
+        )
+    )
+    use_pre_persistence_generation = bool(
+        formal
+        and (
+            pre_persistence_manifest_path.is_file()
+            or (
+                existing_before_extension is not None
+                and _pre_persistence_completion_declared(
+                    existing_before_extension
+                )
+            )
+        )
+    )
+    pre_persistence_state = None
+    pre_dlinear_state = None
+    base10_state = None
+    if formal and use_unified_modern_generation:
+        base10_state = _load_or_archive_base10_prediction_state(
+            output_root, frozen
+        )
+        if base10_state is None:
+            raise ValueError(
+                "统一现代基线预测要求原base10/140预测complete或其冻结归档"
+            )
+        prior_prediction_state = base10_state
+        prior_model_ids = LEGACY_MODEL_IDS
+        current_extension_model_ids = (
+            MODERN_TRAINABLE_MODEL_IDS + PERSISTENCE_BASELINE_IDS
+        )
+        extension_base_generation = (
+            "base10_10_models_140_predictions_unified_modern_plus_persistence"
+        )
+    elif (
+        formal
+        and training_extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+    ):
+        raise ValueError(
+            "统一现代基线训练已冻结，但预测端缺少可验证的base10/140基态"
+        )
+    elif formal and use_pre_persistence_generation:
+        pre_persistence_state = (
+            _load_or_archive_pre_persistence_prediction_state(
+                output_root, frozen
+            )
+        )
+        prior_prediction_state = pre_persistence_state
+        prior_model_ids = TRAINED_MODEL_IDS
+        current_extension_model_ids = PERSISTENCE_BASELINE_IDS
+        extension_base_generation = (
+            "pre_persistence_14_models_196_predictions"
+        )
+    elif formal:
+        pre_dlinear_state = (
+            _load_or_archive_pre_dlinear_prediction_state(
+                output_root, frozen
+            )
+        )
+        prior_prediction_state = pre_dlinear_state
+        prior_model_ids = PRE_DLINEAR_MODEL_IDS
+        current_extension_model_ids = (
+            DLINEAR_BASELINE_IDS + PERSISTENCE_BASELINE_IDS
+        )
+        extension_base_generation = (
+            "pre_dlinear_13_models_182_predictions"
+        )
+    else:
+        prior_prediction_state = None
+        prior_model_ids = ()
+        current_extension_model_ids = tuple(models)
+        extension_base_generation = "nonformal_selected_models"
+
+    # The formula is frozen after the old inventory has been archived but
+    # still before any station NPZ/test values are loaded.
+    persistence_spec_record = _ensure_persistence_baseline_spec(
+        output_root
+    )
+    frozen["training_free_baselines"] = {
+        "persistence": persistence_spec_record
+    }
+    additive_extension_mode = bool(formal)
+
+    prior_pre_timesnet_archive = None
+    prior_pre_timesnet_complete_sha256 = None
+    prior_pre_timemixer_archive = None
+    prior_pre_timemixer_complete_sha256 = None
+    prior_pre_dlinear_archive = None
+    prior_pre_dlinear_complete_sha256 = None
+    prior_base10_archive = None
+    prior_base10_complete_sha256 = None
+    if formal:
+        prior_manifest = _read_json(
+            prior_prediction_state["archive_manifest"]["path"]
+        )
+        archived_prior_complete = _read_json(
+            prior_manifest["archived_records"][
+                "prediction_complete"
+            ]["path"]
+        )
+        prior_pre_timesnet_archive = archived_prior_complete.get(
+            "pre_timesnet_prediction_state_archive"
+        )
+        prior_pre_timesnet_complete_sha256 = archived_prior_complete.get(
+            "pre_timesnet_original_prediction_complete_sha256"
+        )
+        prior_pre_timemixer_archive = archived_prior_complete.get(
+            "pre_timemixer_prediction_state_archive"
+        )
+        prior_pre_timemixer_complete_sha256 = archived_prior_complete.get(
+            "pre_timemixer_original_prediction_complete_sha256"
+        )
+        if base10_state is not None:
+            prior_base10_archive = base10_state["archive_manifest"]
+            prior_base10_complete_sha256 = base10_state[
+                "prior_complete_sha256"
+            ]
+        if pre_dlinear_state is not None:
+            prior_pre_dlinear_archive = pre_dlinear_state[
+                "archive_manifest"
+            ]
+            prior_pre_dlinear_complete_sha256 = pre_dlinear_state[
+                "prior_complete_sha256"
+            ]
+        else:
+            prior_pre_dlinear_archive = archived_prior_complete.get(
+                "pre_dlinear_prediction_state_archive"
+            )
+            prior_pre_dlinear_complete_sha256 = (
+                archived_prior_complete.get(
+                    "pre_dlinear_original_prediction_complete_sha256"
+                )
+            )
     snapshot_path = _freeze_snapshot(
         output_root,
         frozen,
         preprocess_record,
         formal,
+        additive_extension=additive_extension_mode,
+        snapshot_name=(
+            PERSISTENCE_SNAPSHOT_NAME
+            if formal
+            else LEGACY_SNAPSHOT_NAME
+        ),
+        snapshot_role=(
+            "persistence_training_free_extension"
+            if formal
+            else "nonformal_selected_prediction_run"
+        ),
+        bound_model_ids=(
+            PERSISTENCE_BASELINE_IDS if formal else tuple(models)
+        ),
     )
     snapshot_record = _file_record(snapshot_path)
-    complete_path = output_root / PREDICTION_COMPLETE_NAME
+    unified_modern_extension_snapshot_record = None
+    if formal and base10_state is not None:
+        unified_modern_extension_snapshot_path = _freeze_snapshot(
+            output_root,
+            frozen,
+            preprocess_record,
+            formal,
+            additive_extension=True,
+            snapshot_name=UNIFIED_MODERN_SNAPSHOT_NAME,
+            snapshot_role="unified_four_modern_trainable_extensions",
+            bound_model_ids=MODERN_TRAINABLE_MODEL_IDS,
+        )
+        unified_modern_extension_snapshot_record = _file_record(
+            unified_modern_extension_snapshot_path
+        )
+    dlinear_extension_snapshot_record = None
+    if (
+        formal
+        and base10_state is None
+        and DLINEAR_BASELINE_IDS[0] in current_extension_model_ids
+    ):
+        dlinear_extension_snapshot_path = _freeze_snapshot(
+            output_root,
+            frozen,
+            preprocess_record,
+            formal,
+            additive_extension=True,
+            snapshot_name=DLINEAR_SNAPSHOT_NAME,
+            snapshot_role="dlinear_trainable_extension",
+            bound_model_ids=DLINEAR_BASELINE_IDS,
+        )
+        dlinear_extension_snapshot_record = _file_record(
+            dlinear_extension_snapshot_path
+        )
+    snapshot_by_model = (
+        prior_prediction_state["snapshot_by_model"]
+        if formal
+        else {model_id: snapshot_record for model_id in models}
+    )
+    snapshot_by_model = dict(snapshot_by_model)
+    for model_id in current_extension_model_ids:
+        if (
+            model_id in MODERN_TRAINABLE_MODEL_IDS
+            and unified_modern_extension_snapshot_record is not None
+        ):
+            snapshot_by_model[model_id] = (
+                unified_modern_extension_snapshot_record
+            )
+        elif (
+            model_id in DLINEAR_BASELINE_IDS
+            and dlinear_extension_snapshot_record is not None
+        ):
+            snapshot_by_model[model_id] = (
+                dlinear_extension_snapshot_record
+            )
+        else:
+            snapshot_by_model[model_id] = snapshot_record
     if formal and complete_path.is_file():
         existing = _read_json(complete_path)
         if _completion_declared(existing):
@@ -2446,11 +5321,115 @@ def main(argv=None):
                     "检测到旧协议正式预测marker；将在相同冻结训练条件下"
                     "重新生成v2预测归档"
                 )
-            else:
-                if int(existing.get("task_count", -1)) != (
-                    len(MODEL_IDS) * len(EXPECTED_FARMS)
+            elif _base10_completion_declared(existing):
+                if extension_base_generation != (
+                    "base10_10_models_140_predictions_"
+                    "unified_modern_plus_persistence"
                 ):
-                    raise ValueError("已有正式预测complete marker的任务数不完整")
+                    raise ValueError(
+                        "检测到base10预测bundle，但统一追加基态识别不一致"
+                    )
+                print(
+                    "检测到已归档的原10模型正式预测；将严格复用140项，"
+                    "仅新增四个现代可训练模型与Persistence共70项预测"
+                )
+            elif _pre_dlinear_completion_declared(existing):
+                if extension_base_generation != (
+                    "pre_dlinear_13_models_182_predictions"
+                ):
+                    raise ValueError(
+                        "检测到pre-DLinear预测bundle，但追加基态识别不一致"
+                    )
+                print(
+                    "检测到已归档的13模型正式预测；将严格复用182项，"
+                    "仅新增DLinear与无需训练的Persistence各14项预测"
+                )
+            elif _pre_persistence_completion_declared(existing):
+                if extension_base_generation != (
+                    "pre_persistence_14_models_196_predictions"
+                ):
+                    raise ValueError(
+                        "检测到pre-Persistence预测bundle，"
+                        "但追加基态识别不一致"
+                    )
+                print(
+                    "检测到已归档的14模型正式预测；将严格复用196项，"
+                    "仅新增14项Persistence预测"
+                )
+            else:
+                expected_task_count = len(MODEL_IDS) * len(EXPECTED_FARMS)
+                if (
+                    int(existing.get("task_count", -1))
+                    != expected_task_count
+                    or tuple(existing.get("model_ids", ())) != MODEL_IDS
+                    or tuple(existing.get("farm_ids", ()))
+                    != EXPECTED_FARMS
+                    or existing.get("formal") is not True
+                    or existing.get("model_matrix_revision")
+                    != MODEL_MATRIX_REVISION
+                    or existing.get(
+                        "extension_lineage", STAGED_EXTENSION_LINEAGE
+                    )
+                    != training_extension_lineage
+                    or existing.get("extension_base_generation")
+                    != extension_base_generation
+                    or int(
+                        existing.get(
+                            "expected_formal_task_count", -1
+                        )
+                    )
+                    != expected_task_count
+                    or int(existing.get("training_task_count", -1))
+                    != len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)
+                    or int(
+                        existing.get(
+                            "persistence_training_task_count", -1
+                        )
+                    )
+                    != 0
+                    or existing.get("training_complete")
+                    != frozen.get("training_complete")
+                    or existing.get("frozen_snapshot")
+                    != snapshot_record
+                    or existing.get(
+                        "persistence_extension_snapshot"
+                    )
+                    != snapshot_record
+                    or existing.get("persistence_baseline_spec")
+                    != persistence_spec_record
+                    or existing.get("dlinear_extension_snapshot")
+                    != dlinear_extension_snapshot_record
+                    or existing.get(
+                        "unified_modern_extension_snapshot"
+                    )
+                    != unified_modern_extension_snapshot_record
+                    or existing.get("base10_prediction_state_archive")
+                    != prior_base10_archive
+                    or existing.get(
+                        "base10_original_prediction_complete_sha256"
+                    )
+                    != prior_base10_complete_sha256
+                    or tuple(existing.get("trained_model_ids", ()))
+                    != TRAINED_MODEL_IDS
+                    or tuple(
+                        existing.get(
+                            "training_free_baseline_ids", ()
+                        )
+                    )
+                    != PERSISTENCE_BASELINE_IDS
+                    or int(
+                        existing.get(
+                            "training_free_baseline_prediction_task_count",
+                            -1,
+                        )
+                    )
+                    != len(PERSISTENCE_BASELINE_IDS) * len(
+                        EXPECTED_FARMS
+                    )
+                ):
+                    raise ValueError(
+                        "已有正式预测complete marker的顶层身份不完整或漂移"
+                    )
                 for record in existing.get("summary_files", {}).values():
                     _validate_record(record)
                 _validate_inventory(output_root, existing["inventory"])
@@ -2462,19 +5441,101 @@ def main(argv=None):
                             farm_id,
                         )
                         marker = _read_json(marker_path)
-                        task = frozen["tasks"][(model_id, farm_id)]
-                        if _prediction_marker_valid(
-                            marker_path,
-                            task["sha256"],
-                            _sha256(marker["test_array_path"]),
-                            expected_model_id=model_id,
-                            expected_farm_id=farm_id,
-                            expected_formal=True,
-                            expected_bundle_hash=_sha256(
-                                marker["preprocessing_bundle_path"]
-                            ),
-                            expected_snapshot_hash=snapshot_record["sha256"],
-                        ) is None:
+                        expected_snapshot = snapshot_by_model[model_id]
+                        if model_id in prior_model_ids:
+                            frozen_marker = prior_prediction_state[
+                                "frozen_prediction_marker_records"
+                            ][(model_id, farm_id)]
+                            if (
+                                _sha256(marker_path)
+                                != frozen_marker["sha256"]
+                            ):
+                                raise ValueError(
+                                    "已有追加前预测marker SHA漂移: "
+                                    f"{model_id}/{farm_id}"
+                                )
+                            if base10_state is not None:
+                                _validate_base10_live_marker(
+                                    output_root,
+                                    frozen,
+                                    model_id,
+                                    farm_id,
+                                    expected_snapshot,
+                                    frozen_marker_record=frozen_marker,
+                                )
+                            elif pre_persistence_state is not None:
+                                _validate_pre_persistence_live_marker(
+                                    output_root,
+                                    frozen,
+                                    model_id,
+                                    farm_id,
+                                    expected_snapshot,
+                                    frozen_marker_record=frozen_marker,
+                                )
+                            else:
+                                _validate_pre_dlinear_live_marker(
+                                    output_root,
+                                    frozen,
+                                    model_id,
+                                    farm_id,
+                                    expected_snapshot,
+                                    frozen_marker_record=frozen_marker,
+                                )
+                            continue
+                        if model_id in PERSISTENCE_BASELINE_IDS:
+                            valid_marker = (
+                                _persistence_prediction_marker_valid(
+                                    marker_path,
+                                    _sha256(marker["test_array_path"]),
+                                    farm_id=farm_id,
+                                    formal=True,
+                                    bundle_hash=_sha256(
+                                        marker[
+                                            "preprocessing_bundle_path"
+                                        ]
+                                    ),
+                                    snapshot_hash=expected_snapshot[
+                                        "sha256"
+                                    ],
+                                    prediction_code_hash=(
+                                        current_prediction_code_sha256
+                                    ),
+                                    baseline_spec_record=(
+                                        persistence_spec_record
+                                    ),
+                                )
+                            )
+                        else:
+                            task = frozen["tasks"][(model_id, farm_id)]
+                            valid_marker = _prediction_marker_valid(
+                                marker_path,
+                                task["sha256"],
+                                _sha256(marker["test_array_path"]),
+                                expected_model_id=model_id,
+                                expected_farm_id=farm_id,
+                                expected_formal=True,
+                                expected_bundle_hash=_sha256(
+                                    marker[
+                                        "preprocessing_bundle_path"
+                                    ]
+                                ),
+                                expected_snapshot_hash=(
+                                    expected_snapshot["sha256"]
+                                ),
+                                expected_prediction_code_hash=(
+                                    current_prediction_code_sha256
+                                    if model_id
+                                    in MODERN_TRAINABLE_MODEL_IDS
+                                    else None
+                                ),
+                                expected_batch_size=(
+                                    DEFAULT_BATCH_SIZE
+                                    if model_id
+                                    in MODERN_TRAINABLE_MODEL_IDS
+                                    else None
+                                ),
+                            )
+                        if valid_marker is None:
                             raise ValueError(
                                 f"已有正式预测task恢复校验失败: {marker_path}"
                             )
@@ -2495,6 +5556,7 @@ def main(argv=None):
     _atomic_json(
         {
             "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
             "created_at_utc": _utc_now(),
             "formal": formal,
             "models": models,
@@ -2514,18 +5576,87 @@ def main(argv=None):
                 "10,000-replicate paired farm bootstrap"
             ),
             "formal_test_gate": (
-                "all 140 training tasks and the training complete marker "
-                "validated before any test NPZ values are read"
+                f"all {len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)} "
+                "trainable model tasks, the training complete marker, and "
+                "the frozen zero-parameter Persistence formula validated "
+                "before any test NPZ values are read"
             ),
-            **_test_evaluation_provenance(formal),
+            "trained_model_count": len(TRAINED_MODEL_IDS),
+            "training_task_count": (
+                len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)
+            ),
+            "training_free_baseline_ids": list(
+                PERSISTENCE_BASELINE_IDS
+            ),
+            "final_prediction_model_count": len(MODEL_IDS),
+            "expected_final_prediction_task_count": (
+                len(MODEL_IDS) * len(EXPECTED_FARMS)
+            ),
+            "persistence_baseline_spec": persistence_spec_record,
+            "extension_lineage": training_extension_lineage,
+            "extension_base_generation": extension_base_generation,
+            "unified_modern_extension_snapshot": (
+                unified_modern_extension_snapshot_record
+            ),
+            "dlinear_extension_snapshot": (
+                dlinear_extension_snapshot_record
+            ),
+            "persistence_extension_snapshot": snapshot_record,
+            "pre_persistence_prediction_state_archive": (
+                pre_persistence_state["archive_manifest"]
+                if pre_persistence_state is not None
+                else None
+            ),
+            "pre_dlinear_prediction_state_archive": (
+                prior_pre_dlinear_archive
+            ),
+            "pre_timemixer_prediction_state_archive": (
+                prior_pre_timemixer_archive
+            ),
+            "pre_timesnet_prediction_state_archive": (
+                prior_pre_timesnet_archive
+            ),
+            "base10_prediction_state_archive": prior_base10_archive,
+            "base10_original_prediction_complete_sha256": (
+                prior_base10_complete_sha256
+            ),
+            **_test_evaluation_provenance(
+                formal,
+                additive_extension=additive_extension_mode,
+                extension_lineage=training_extension_lineage,
+            ),
         },
         output_root / "manifests" / "round3_prediction_protocol.json",
     )
 
-    tf, keras = _configure_tensorflow()
+    requires_tensorflow = any(
+        model_id not in PERSISTENCE_BASELINE_IDS
+        for model_id in current_extension_model_ids
+    )
+    if requires_tensorflow:
+        tf, keras = _configure_tensorflow()
+    else:
+        tf, keras = None, None
     completed = []
     reused_prediction_task_count = 0
     new_prediction_task_count = 0
+    pre_timesnet_reused_prediction_task_count = 0
+    pre_timemixer_reused_prediction_task_count = 0
+    pre_dlinear_reused_prediction_task_count = 0
+    pre_persistence_reused_prediction_task_count = 0
+    base10_reused_prediction_task_count = 0
+    itransformer_reused_prediction_task_count = 0
+    itransformer_new_prediction_task_count = 0
+    timesnet_reused_prediction_task_count = 0
+    timesnet_new_prediction_task_count = 0
+    timemixer_reused_prediction_task_count = 0
+    timemixer_new_prediction_task_count = 0
+    dlinear_reused_prediction_task_count = 0
+    dlinear_new_prediction_task_count = 0
+    persistence_reused_prediction_task_count = 0
+    persistence_new_prediction_task_count = 0
+    reused_pairs = set()
+    new_pairs = set()
     failures = []
     for farm_id in farms:
         print(f"\n===== Round 3 test farm={farm_id} =====")
@@ -2538,26 +5669,145 @@ def main(argv=None):
             station, frozen["tasks"], models, farm_id, formal
         )
         for model_id in models:
-            task = frozen["tasks"][(model_id, farm_id)]
-            marker_path = _prediction_marker_path(output_root, model_id, farm_id)
-            cached = (
-                _prediction_marker_valid(
-                    marker_path,
-                    task["sha256"],
-                    station["array_sha256"],
-                    expected_model_id=model_id,
-                    expected_farm_id=farm_id,
-                    expected_formal=formal,
-                    expected_bundle_hash=station["bundle_sha256"],
-                    expected_snapshot_hash=snapshot_record["sha256"],
-                )
-                if args.resume
-                else None
+            task = (
+                None
+                if model_id in PERSISTENCE_BASELINE_IDS
+                else frozen["tasks"][(model_id, farm_id)]
             )
+            marker_path = _prediction_marker_path(output_root, model_id, farm_id)
+            expected_task_snapshot = snapshot_by_model[model_id]
+            prior_reuse_required = bool(
+                formal and model_id in prior_model_ids
+            )
+            if prior_reuse_required:
+                frozen_marker = prior_prediction_state[
+                    "frozen_prediction_marker_records"
+                ][(model_id, farm_id)]
+                if (
+                    not marker_path.is_file()
+                    or _sha256(marker_path) != frozen_marker["sha256"]
+                ):
+                    raise ValueError(
+                        "追加协议要求旧预测marker保持逐字节不变: "
+                        f"{model_id}/{farm_id}"
+                    )
+                if base10_state is not None:
+                    cached = _validate_base10_live_marker(
+                        output_root,
+                        frozen,
+                        model_id,
+                        farm_id,
+                        expected_task_snapshot,
+                        frozen_marker_record=frozen_marker,
+                    )
+                elif pre_persistence_state is not None:
+                    cached = _validate_pre_persistence_live_marker(
+                        output_root,
+                        frozen,
+                        model_id,
+                        farm_id,
+                        expected_task_snapshot,
+                        frozen_marker_record=frozen_marker,
+                    )
+                else:
+                    cached = _validate_pre_dlinear_live_marker(
+                        output_root,
+                        frozen,
+                        model_id,
+                        farm_id,
+                        expected_task_snapshot,
+                        frozen_marker_record=frozen_marker,
+                    )
+            else:
+                cached = None
+                if args.resume:
+                    if model_id in PERSISTENCE_BASELINE_IDS:
+                        cached = _persistence_prediction_marker_valid(
+                            marker_path,
+                            station["array_sha256"],
+                            farm_id=farm_id,
+                            formal=formal,
+                            bundle_hash=station["bundle_sha256"],
+                            snapshot_hash=(
+                                expected_task_snapshot["sha256"]
+                            ),
+                            prediction_code_hash=(
+                                current_prediction_code_sha256
+                            ),
+                            baseline_spec_record=(
+                                persistence_spec_record
+                            ),
+                        )
+                    else:
+                        cached = _prediction_marker_valid(
+                            marker_path,
+                            task["sha256"],
+                            station["array_sha256"],
+                            expected_model_id=model_id,
+                            expected_farm_id=farm_id,
+                            expected_formal=formal,
+                            expected_bundle_hash=(
+                                station["bundle_sha256"]
+                            ),
+                            expected_snapshot_hash=(
+                                expected_task_snapshot["sha256"]
+                            ),
+                            expected_prediction_code_hash=(
+                                current_prediction_code_sha256
+                                if model_id
+                                in MODERN_TRAINABLE_MODEL_IDS
+                                else None
+                            ),
+                            expected_batch_size=(
+                                args.batch_size
+                                if model_id
+                                in MODERN_TRAINABLE_MODEL_IDS
+                                else None
+                            ),
+                        )
+            if prior_reuse_required and cached is None:
+                raise ValueError(
+                    f"追加协议禁止重算旧模型，但冻结预测校验失败: "
+                    f"{model_id}/{farm_id}"
+                )
             if cached is not None:
-                print(f"resume跳过 {model_id}/{farm_id}")
+                reason = (
+                    (
+                        "base10冻结复用"
+                        if base10_state is not None
+                        else (
+                            "pre-Persistence冻结复用"
+                            if pre_persistence_state is not None
+                            else "pre-DLinear冻结复用"
+                        )
+                    )
+                    if prior_reuse_required
+                    else "resume跳过"
+                )
+                print(f"{reason} {model_id}/{farm_id}")
                 completed.append(cached)
                 reused_prediction_task_count += 1
+                reused_pairs.add((model_id, farm_id))
+                if model_id in LEGACY_MODEL_IDS:
+                    base10_reused_prediction_task_count += 1
+                elif model_id == "itransformer":
+                    itransformer_reused_prediction_task_count += 1
+                elif model_id == "timesnet":
+                    timesnet_reused_prediction_task_count += 1
+                elif model_id == "timemixer":
+                    timemixer_reused_prediction_task_count += 1
+                elif model_id == "dlinear":
+                    dlinear_reused_prediction_task_count += 1
+                elif model_id == "persistence":
+                    persistence_reused_prediction_task_count += 1
+                if model_id in PRE_TIMESNET_MODEL_IDS:
+                    pre_timesnet_reused_prediction_task_count += 1
+                if model_id in PRE_TIMEMIXER_MODEL_IDS:
+                    pre_timemixer_reused_prediction_task_count += 1
+                if model_id in PRE_DLINEAR_MODEL_IDS:
+                    pre_dlinear_reused_prediction_task_count += 1
+                if model_id in TRAINED_MODEL_IDS:
+                    pre_persistence_reused_prediction_task_count += 1
                 continue
             try:
                 marker = _run_prediction_task(
@@ -2570,10 +5820,28 @@ def main(argv=None):
                     task,
                     args.batch_size,
                     formal,
-                    snapshot_record,
+                    expected_task_snapshot,
+                    additive_extension=additive_extension_mode,
+                    baseline_spec_record=(
+                        persistence_spec_record
+                        if model_id in PERSISTENCE_BASELINE_IDS
+                        else None
+                    ),
+                    extension_lineage=training_extension_lineage,
                 )
                 completed.append(marker)
                 new_prediction_task_count += 1
+                new_pairs.add((model_id, farm_id))
+                if model_id == "itransformer":
+                    itransformer_new_prediction_task_count += 1
+                elif model_id == "timesnet":
+                    timesnet_new_prediction_task_count += 1
+                elif model_id == "timemixer":
+                    timemixer_new_prediction_task_count += 1
+                elif model_id == "dlinear":
+                    dlinear_new_prediction_task_count += 1
+                elif model_id == "persistence":
+                    persistence_new_prediction_task_count += 1
             except Exception as exc:
                 failures.append(
                     {
@@ -2602,6 +5870,44 @@ def main(argv=None):
         raise RuntimeError(
             f"{len(failures)}个预测任务失败；未生成complete marker"
         )
+    if formal:
+        expected_prior_pairs = {
+            (model_id, farm_id)
+            for model_id in prior_model_ids
+            for farm_id in EXPECTED_FARMS
+        }
+        expected_current_pairs = {
+            (model_id, farm_id)
+            for model_id in current_extension_model_ids
+            for farm_id in EXPECTED_FARMS
+        }
+        if reused_pairs.intersection(expected_prior_pairs) != expected_prior_pairs:
+            raise ValueError(
+                "追加协议未精确复用既有冻结预测矩阵"
+            )
+        if new_pairs.intersection(expected_prior_pairs):
+            raise ValueError("追加期间发生了既有模型重新预测")
+        if (
+            reused_pairs.union(new_pairs).intersection(
+                expected_current_pairs
+            )
+            != expected_current_pairs
+        ):
+            raise ValueError(
+                "本轮新增模型预测未精确覆盖14个场站"
+            )
+        expected_persistence_pairs = {
+            ("persistence", farm_id) for farm_id in EXPECTED_FARMS
+        }
+        if (
+            reused_pairs.union(new_pairs).intersection(
+                expected_persistence_pairs
+            )
+            != expected_persistence_pairs
+        ):
+            raise ValueError(
+                "Persistence正式预测未精确覆盖14个场站"
+            )
     markers = _collect_prediction_markers(output_root, models, farms)
     summary_paths = _aggregate_and_save(
         output_root,
@@ -2609,6 +5915,8 @@ def main(argv=None):
         models,
         farms,
         formal,
+        additive_extension=additive_extension_mode,
+        extension_lineage=training_extension_lineage,
     )
     selection_payload = _read_json(summary_paths["selection_json"])
     _revalidate_frozen(frozen)
@@ -2617,25 +5925,182 @@ def main(argv=None):
         "status": "complete",
         "complete": True,
         "protocol_version": PROTOCOL_VERSION,
+        "model_matrix_revision": MODEL_MATRIX_REVISION,
         "created_at_utc": _utc_now(),
         "formal": formal,
         "model_ids": models,
         "farm_ids": farms,
         "task_count": len(markers),
         "expected_formal_task_count": len(MODEL_IDS) * len(EXPECTED_FARMS),
+        "trained_model_ids": list(TRAINED_MODEL_IDS),
+        "training_task_count": (
+            len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)
+            if formal
+            else len(frozen["tasks"])
+        ),
+        "training_free_baseline_ids": list(
+            PERSISTENCE_BASELINE_IDS
+        ),
+        "training_free_baseline_prediction_task_count": (
+            len(PERSISTENCE_BASELINE_IDS) * len(farms)
+        ),
+        "persistence_baseline_spec": persistence_spec_record,
+        "extension_lineage": training_extension_lineage,
+        "extension_base_generation": extension_base_generation,
         "new_prediction_task_count": new_prediction_task_count,
         "reused_prediction_task_count": reused_prediction_task_count,
-        "all_140_models_frozen_before_this_test_run": bool(formal),
+        "base10_reused_prediction_task_count": (
+            base10_reused_prediction_task_count
+        ),
+        "pre_timesnet_reused_prediction_task_count": (
+            pre_timesnet_reused_prediction_task_count
+        ),
+        "itransformer_reused_prediction_task_count": (
+            itransformer_reused_prediction_task_count
+        ),
+        "itransformer_new_prediction_task_count": (
+            itransformer_new_prediction_task_count
+        ),
+        "timesnet_new_prediction_task_count": (
+            timesnet_new_prediction_task_count
+        ),
+        "timesnet_reused_prediction_task_count": (
+            timesnet_reused_prediction_task_count
+        ),
+        "pre_timemixer_reused_prediction_task_count": (
+            pre_timemixer_reused_prediction_task_count
+        ),
+        "timemixer_new_prediction_task_count": (
+            timemixer_new_prediction_task_count
+        ),
+        "timemixer_reused_prediction_task_count": (
+            timemixer_reused_prediction_task_count
+        ),
+        "pre_dlinear_reused_prediction_task_count": (
+            pre_dlinear_reused_prediction_task_count
+        ),
+        "pre_persistence_reused_prediction_task_count": (
+            pre_persistence_reused_prediction_task_count
+        ),
+        "dlinear_new_prediction_task_count": (
+            dlinear_new_prediction_task_count
+        ),
+        "dlinear_reused_prediction_task_count": (
+            dlinear_reused_prediction_task_count
+        ),
+        "persistence_new_prediction_task_count": (
+            persistence_new_prediction_task_count
+        ),
+        "persistence_reused_prediction_task_count": (
+            persistence_reused_prediction_task_count
+        ),
+        "persistence_training_task_count": 0,
+        "persistence_learned_parameters": 0,
+        "persistence_model_size_bytes": 0,
+        "persistence_model_or_weight_artifacts_created": False,
+        "all_expected_training_tasks_frozen_before_extension_prediction": bool(
+            formal
+        ),
+        "all_140_base10_predictions_reused_without_recomputation": bool(
+            base10_state is not None
+            and base10_reused_prediction_task_count
+            == len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_56_unified_modern_predictions_present": bool(
+            base10_state is not None
+            and sum(
+                1
+                for pair in reused_pairs.union(new_pairs)
+                if pair[0] in MODERN_TRAINABLE_MODEL_IDS
+            )
+            == len(MODERN_TRAINABLE_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_154_pre_timesnet_predictions_reused_without_recomputation": bool(
+            additive_extension_mode
+            and pre_timesnet_reused_prediction_task_count
+            == len(PRE_TIMESNET_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_168_pre_timemixer_predictions_reused_without_recomputation": bool(
+            additive_extension_mode
+            and pre_timemixer_reused_prediction_task_count
+            == len(PRE_TIMEMIXER_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_182_pre_dlinear_predictions_reused_without_recomputation": bool(
+            additive_extension_mode
+            and pre_dlinear_reused_prediction_task_count
+            == len(PRE_DLINEAR_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_196_pre_persistence_predictions_reused_without_recomputation": bool(
+            pre_persistence_state is not None
+            and pre_persistence_reused_prediction_task_count
+            == len(TRAINED_MODEL_IDS) * len(EXPECTED_FARMS)
+        ),
+        "all_14_persistence_predictions_present": bool(
+            formal
+            and (
+                persistence_new_prediction_task_count
+                + persistence_reused_prediction_task_count
+            )
+            == len(EXPECTED_FARMS)
+        ),
         "selected_tasks_frozen_before_this_test_run": True,
         "selection_eligible": bool(formal),
         "selected_model_id": (
             selection_payload.get("selected_model_id") if formal else None
         ),
         "final_selection": _file_record(summary_paths["selection_json"]),
-        **_test_evaluation_provenance(formal),
+        **_test_evaluation_provenance(
+            formal,
+            additive_extension=additive_extension_mode,
+            extension_lineage=training_extension_lineage,
+        ),
         "preprocess_complete": preprocess_record,
         "training_complete": frozen.get("training_complete"),
         "frozen_snapshot": snapshot_record,
+        "unified_modern_extension_snapshot": (
+            unified_modern_extension_snapshot_record
+        ),
+        "dlinear_extension_snapshot": (
+            dlinear_extension_snapshot_record
+        ),
+        "persistence_extension_snapshot": snapshot_record,
+        "pre_timesnet_prediction_state_archive": (
+            prior_pre_timesnet_archive
+        ),
+        "base10_prediction_state_archive": prior_base10_archive,
+        "base10_original_prediction_complete_sha256": (
+            prior_base10_complete_sha256
+        ),
+        "pre_timesnet_original_prediction_complete_sha256": (
+            prior_pre_timesnet_complete_sha256
+        ),
+        "pre_timemixer_prediction_state_archive": (
+            prior_pre_timemixer_archive
+        ),
+        "pre_timemixer_original_prediction_complete_sha256": (
+            prior_pre_timemixer_complete_sha256
+        ),
+        "pre_dlinear_prediction_state_archive": (
+            prior_pre_dlinear_archive
+        ),
+        "pre_dlinear_original_prediction_complete_sha256": (
+            prior_pre_dlinear_complete_sha256
+        ),
+        "pre_persistence_prediction_state_archive": (
+            pre_persistence_state["archive_manifest"]
+            if pre_persistence_state is not None
+            else None
+        ),
+        "pre_persistence_original_prediction_complete_sha256": (
+            pre_persistence_state["prior_complete_sha256"]
+            if pre_persistence_state is not None
+            else None
+        ),
+        "legacy_task_prediction_artifacts_modified_by_extension": False,
+        "pre_timesnet_prediction_artifacts_modified_by_extension": False,
+        "pre_timemixer_prediction_artifacts_modified_by_extension": False,
+        "pre_dlinear_prediction_artifacts_modified_by_extension": False,
+        "pre_persistence_prediction_artifacts_modified_by_extension": False,
         "summary_files": {
             key: _file_record(path) for key, path in summary_paths.items()
         },

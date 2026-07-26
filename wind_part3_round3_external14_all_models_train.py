@@ -1,4 +1,4 @@
-"""Part 3 Round 3：JSFD001--JSFD014 十模型统一无泄漏训练。
+"""Part 3 Round 3：JSFD001--JSFD014 强基线统一无泄漏训练。
 
 父调度器本身不导入 TensorFlow。每个 ``model_id × farm_id`` 任务均在全新
 子进程中构建模型、训练并退出，以可靠释放 GPU 上下文。数据只来自 Round 3
@@ -6,6 +6,12 @@
 函数。正式训练前，三个重模型会在最大训练场站各用独立进程完成一个完整
 train+validation预检epoch；只有HR-MoE预检确认CUDA OOM时才锁定全局
 batch=128，随后14个HR场站全部使用同一batch。
+
+``itransformer``、``timesnet``、``timemixer`` 与 ``dlinear`` 是现代强
+基线。当前统一追加协议会逐项校验、归档并复用原10模型的 10×14 个训练
+产物，只训练四个新增模型的 4×14 个任务；不得重建原全局 batch policy，
+也不得覆盖旧模型、权重或 history。为兼容已经按代际运行过的历史目录，
+代码仍可从冻结的 13×14 pre-DLinear 状态仅补训 DLinear。
 """
 
 from __future__ import annotations
@@ -17,8 +23,10 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -36,7 +44,7 @@ RESULT_ROOT = Path(
     "03_external14_leakage_free_strong_baseline_benchmark"
 )
 EXPECTED_FARMS = tuple(f"JSFD{i:03d}" for i in range(1, 15))
-MODEL_IDS = (
+LEGACY_MODEL_IDS = (
     "patchtst",
     "bilstm",
     "cnn_lstm",
@@ -48,7 +56,25 @@ MODEL_IDS = (
     "hr_moe_fets_patchtst",
     "windprism_f7_g0",
 )
-OTHER_MODELS = frozenset(MODEL_IDS[1:8])
+ITRANSFORMER_BASELINE_IDS = ("itransformer",)
+PRE_TIMESNET_MODEL_IDS = LEGACY_MODEL_IDS + ITRANSFORMER_BASELINE_IDS
+TIMESNET_BASELINE_IDS = ("timesnet",)
+PRE_TIMEMIXER_MODEL_IDS = PRE_TIMESNET_MODEL_IDS + TIMESNET_BASELINE_IDS
+TIMEMIXER_BASELINE_IDS = ("timemixer",)
+PRE_DLINEAR_MODEL_IDS = PRE_TIMEMIXER_MODEL_IDS + TIMEMIXER_BASELINE_IDS
+DLINEAR_BASELINE_IDS = ("dlinear",)
+MODERN_TRAINABLE_MODEL_IDS = (
+    ITRANSFORMER_BASELINE_IDS
+    + TIMESNET_BASELINE_IDS
+    + TIMEMIXER_BASELINE_IDS
+    + DLINEAR_BASELINE_IDS
+)
+MODEL_IDS = LEGACY_MODEL_IDS + MODERN_TRAINABLE_MODEL_IDS
+STAGED_EXTENSION_LINEAGE = "historical_staged_modern_extensions_v1"
+UNIFIED_MODERN_EXTENSION_LINEAGE = (
+    "base10_unified_four_modern_baselines_v1"
+)
+OTHER_MODELS = frozenset(LEGACY_MODEL_IDS[1:8])
 HEAVY_FALLBACK_MODEL = "hr_moe_fets_patchtst"
 PREFLIGHT_MODELS = (
     "hr_moe_fets_patchtst",
@@ -77,11 +103,42 @@ EARLY_STOPPING_PATIENCE = 10
 REDUCE_LR_PATIENCE = 4
 REDUCE_LR_FACTOR = 0.5
 MIN_LEARNING_RATE = 1e-6
+ITRANSFORMER_D_MODEL = 512
+ITRANSFORMER_NUM_HEADS = 8
+ITRANSFORMER_ENCODER_LAYERS = 2
+ITRANSFORMER_D_FF = 2048
+ITRANSFORMER_DROPOUT = 0.1
+ITRANSFORMER_NORM_EPSILON = 1e-5
+TIMESNET_D_MODEL = 64
+TIMESNET_D_FF = 64
+TIMESNET_ENCODER_LAYERS = 2
+TIMESNET_TOP_K = 5
+TIMESNET_NUM_KERNELS = 6
+TIMESNET_DROPOUT = 0.1
+TIMESNET_NORM_EPSILON = 1e-5
+TIMEMIXER_D_MODEL = 16
+TIMEMIXER_D_FF = 32
+TIMEMIXER_PDM_LAYERS = 2
+TIMEMIXER_DOWNSAMPLING_LAYERS = 3
+TIMEMIXER_DOWNSAMPLING_WINDOW = 2
+TIMEMIXER_MOVING_AVERAGE = 25
+TIMEMIXER_DROPOUT = 0.1
+TIMEMIXER_NORM_EPSILON = 1e-5
+TIMEMIXER_SCALE_LENGTHS = tuple(
+    HISTORY_LEN // (TIMEMIXER_DOWNSAMPLING_WINDOW**level)
+    for level in range(TIMEMIXER_DOWNSAMPLING_LAYERS + 1)
+)
+DLINEAR_MOVING_AVERAGE = 25
+DLINEAR_INDIVIDUAL = False
 EPOCHS = {
     **{name: 60 for name in OTHER_MODELS},
     "patchtst": 80,
     "hr_moe_fets_patchtst": 80,
     "windprism_f7_g0": 80,
+    "itransformer": 60,
+    "timesnet": 60,
+    "timemixer": 60,
+    "dlinear": 60,
 }
 EXPECTED_PARAMETER_COUNTS = {
     "patchtst": 210_960,
@@ -94,8 +151,16 @@ EXPECTED_PARAMETER_COUNTS = {
     "autoformer": 212_737,
     "hr_moe_fets_patchtst": 885_395,
     "windprism_f7_g0": 20_969,
+    "itransformer": 6_363_664,
+    "timesnet": 4_709_917,
+    "timemixer": 61_017,
+    "dlinear": 3_104,
 }
 _MISSING_SAFE_REGIME_LAYER_CLASS: Any | None = None
+_ITRANSFORMER_LAYER_CLASSES: dict[str, Any] | None = None
+_TIMESNET_LAYER_CLASSES: dict[str, Any] | None = None
+_TIMEMIXER_LAYER_CLASSES: dict[str, Any] | None = None
+_DLINEAR_LAYER_CLASSES: dict[str, Any] | None = None
 OOM_EXIT_CODE = 86
 EXPLICIT_CUDA_OOM_PATTERNS = (
     "cuda_error_out_of_memory",
@@ -126,7 +191,68 @@ HISTORICAL_TASK_SECONDS = {
     "autoformer": 1755.0,
     "hr_moe_fets_patchtst": 3292.0,
     "windprism_f7_g0": 137.0,
+    # 首次扩展前没有本项目实测值，仅用于ETA；训练完成后会被实测耗时替代。
+    "itransformer": 900.0,
+    "timesnet": 900.0,
+    "timemixer": 900.0,
+    "dlinear": 300.0,
 }
+PRE_DLINEAR_MODEL_MATRIX_REVISION = (
+    "base10_plus_itransformer_plus_timesnet_plus_timemixer_extension_v3"
+)
+MODEL_MATRIX_REVISION = (
+    "base10_plus_itransformer_plus_timesnet_plus_timemixer_plus_dlinear_"
+    "extension_v4"
+)
+BASE10_TRAINING_CODE_SHA256 = (
+    "d37c17db911dcf95023e9636c2a7881df2d1a2c62202a55a532cae4139bbe530"
+)
+ITRANSFORMER_EXTENSION_TRAINING_CODE_SHA256 = (
+    "06072e0334fb9b785ceb5023d6808489505de27c048d67b19c90353442692e90"
+)
+TIMEMIXER_EXTENSION_TRAINING_CODE_SHA256 = (
+    "b2351214ebc18ec3c35d514d391323985f692d865207d9c424b57c30e0274860"
+)
+BASE10_TRAINING_COMPLETE_ARCHIVE_PATH = (
+    RESULT_ROOT
+    / "manifests"
+    / "extensions"
+    / "itransformer"
+    / "base10_training_bundle_complete.json"
+)
+BASE10_TRAINING_ARCHIVE_MANIFEST_PATH = (
+    BASE10_TRAINING_COMPLETE_ARCHIVE_PATH.parent / "archive_manifest.json"
+)
+PRE_TIMESNET_TRAINING_ARCHIVE_ROOT = (
+    RESULT_ROOT
+    / "manifests"
+    / "extensions"
+    / "timesnet"
+    / "pre_timesnet_11_training_state"
+)
+PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH = (
+    PRE_TIMESNET_TRAINING_ARCHIVE_ROOT / "archive_manifest.json"
+)
+PRE_TIMEMIXER_TRAINING_ARCHIVE_ROOT = (
+    RESULT_ROOT
+    / "manifests"
+    / "extensions"
+    / "timemixer"
+    / "pre_timemixer_12_training_state"
+)
+PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH = (
+    PRE_TIMEMIXER_TRAINING_ARCHIVE_ROOT / "archive_manifest.json"
+)
+PRE_DLINEAR_TRAINING_ARCHIVE_ROOT = (
+    RESULT_ROOT
+    / "manifests"
+    / "extensions"
+    / "dlinear"
+    / "pre_dlinear_13_training_state"
+)
+PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH = (
+    PRE_DLINEAR_TRAINING_ARCHIVE_ROOT / "archive_manifest.json"
+)
 
 
 def utc_now() -> str:
@@ -251,6 +377,1249 @@ def largest_training_farm() -> str:
     return max(rows, key=lambda item: (item[0], item[1]))[1]
 
 
+def legacy_base10_markers_valid_for_extension(policy_sha256: str) -> bool:
+    """Prove that an old batch policy is still bound to all frozen base tasks."""
+    for model_id in LEGACY_MODEL_IDS:
+        for farm_id in EXPECTED_FARMS:
+            path = artifact_paths(model_id, farm_id)["marker"]
+            if not completed_marker_valid(path):
+                return False
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    marker = json.load(handle)
+            except Exception:
+                return False
+            if (
+                marker.get("model_id") != model_id
+                or marker.get("farm_id") != farm_id
+                or marker.get("training_code_sha256")
+                != BASE10_TRAINING_CODE_SHA256
+                or marker.get("global_batch_policy_sha256")
+                != policy_sha256
+            ):
+                return False
+    return True
+
+
+def copy_exact_file(source: Path, destination: Path) -> dict[str, Any]:
+    """Copy one immutable artifact atomically and verify its content hash."""
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    source_sha = sha256_file(source)
+    if destination.is_file():
+        if sha256_file(destination) != source_sha:
+            raise ValueError(f"既有训练归档与源SHA不一致: {destination}")
+        return {
+            "path": str(destination),
+            "sha256": source_sha,
+            "size_bytes": destination.stat().st_size,
+        }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with open(source, "rb") as input_handle, open(
+        temporary, "wb"
+    ) as output_handle:
+        for block in iter(lambda: input_handle.read(1024 * 1024), b""):
+            output_handle.write(block)
+    os.replace(temporary, destination)
+    if sha256_file(destination) != source_sha:
+        raise ValueError(f"训练归档复制后SHA不一致: {destination}")
+    return {
+        "path": str(destination),
+        "sha256": source_sha,
+        "size_bytes": destination.stat().st_size,
+    }
+
+
+def archive_base10_training_complete() -> dict[str, Any]:
+    """Archive the immutable 10×14 completion proof before modern extensions."""
+    source = RESULT_ROOT / "round3_training_bundle_complete.json"
+    archive = BASE10_TRAINING_COMPLETE_ARCHIVE_PATH
+    manifest_path = BASE10_TRAINING_ARCHIVE_MANIFEST_PATH
+    if manifest_path.is_file():
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if (
+            manifest.get("status") != "complete"
+            or int(manifest.get("expected_task_count", -1))
+            != len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+            or tuple(manifest.get("expected_models", ())) != LEGACY_MODEL_IDS
+        ):
+            raise ValueError(f"base10训练归档身份漂移: {manifest_path}")
+        for record in manifest.get("archived_records", {}).values():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(record["size_bytes"])
+                or sha256_file(path) != record["sha256"]
+            ):
+                raise ValueError(f"base10训练归档文件漂移: {path}")
+        policy_sha = str(manifest.get("global_batch_policy_sha256", ""))
+        if not policy_sha:
+            archived_complete = Path(
+                manifest["archived_records"]["training_complete"]["path"]
+            )
+            with open(archived_complete, "r", encoding="utf-8") as handle:
+                archived_payload = json.load(handle)
+            policy_sha = str(
+                archived_payload.get("global_batch_policy_sha256", "")
+            )
+        if (
+            not BATCH_POLICY_PATH.is_file()
+            or sha256_file(BATCH_POLICY_PATH) != policy_sha
+            or not legacy_base10_markers_valid_for_extension(policy_sha)
+        ):
+            raise ValueError(
+                "base10训练归档与当前140个冻结marker/batch policy不一致"
+            )
+        frozen_records = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get("frozen_task_marker_records", ())
+        }
+        if frozen_records:
+            expected_pairs = {
+                (model_id, farm_id)
+                for model_id in LEGACY_MODEL_IDS
+                for farm_id in EXPECTED_FARMS
+            }
+            if set(frozen_records) != expected_pairs:
+                raise ValueError("base10训练归档缺少140个冻结marker记录")
+            for pair, record in frozen_records.items():
+                path = Path(record["path"])
+                if (
+                    not path.is_file()
+                    or sha256_file(path) != record["sha256"]
+                    or not completed_marker_valid(path)
+                ):
+                    raise ValueError(f"base10冻结训练marker漂移: {pair}")
+        return {
+            "path": str(manifest_path.resolve()),
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        }
+    if not source.is_file():
+        raise FileNotFoundError(f"缺少待归档base10训练complete marker: {source}")
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    expected_count = len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+    if (
+        payload.get("status") != "complete"
+        or payload.get("protocol_version") != PROTOCOL_VERSION
+        or int(payload.get("expected_task_count", -1)) != expected_count
+        or int(payload.get("completed_task_count", -1)) != expected_count
+        or tuple(payload.get("expected_models", ())) != LEGACY_MODEL_IDS
+    ):
+        raise ValueError(
+            "现有training complete不是可追加iTransformer的原10模型冻结矩阵"
+        )
+    policy_sha = str(payload.get("global_batch_policy_sha256", ""))
+    if not legacy_base10_markers_valid_for_extension(policy_sha):
+        raise ValueError("原10模型的140个训练marker未通过追加扩展身份校验")
+    frozen_records = []
+    for model_id in LEGACY_MODEL_IDS:
+        for farm_id in EXPECTED_FARMS:
+            marker_path = artifact_paths(model_id, farm_id)["marker"]
+            frozen_records.append(
+                {
+                    "model_id": model_id,
+                    "farm_id": farm_id,
+                    "path": str(marker_path.resolve()),
+                    "sha256": sha256_file(marker_path),
+                }
+            )
+    archived_records = {
+        "training_complete": copy_exact_file(source, archive),
+    }
+    for key, record in payload.get("summary_outputs", {}).items():
+        source_path = Path(record["path"])
+        if (
+            not source_path.is_file()
+            or source_path.stat().st_size != int(record["size_bytes"])
+            or sha256_file(source_path) != record["sha256"]
+        ):
+            raise ValueError(f"base10训练summary源记录漂移: {key}")
+        archived_records[f"summary_{key}"] = copy_exact_file(
+            source_path,
+            archive.parent / "summary_files" / f"{key}{source_path.suffix}",
+        )
+    for key in (
+        "resource_plan_initial",
+        "resource_plan_calibrated",
+        "runtime_progress",
+    ):
+        source_path = payload.get(f"{key}_path")
+        expected_sha = payload.get(f"{key}_sha256")
+        if source_path and expected_sha:
+            source_path = Path(source_path)
+            if sha256_file(source_path) != expected_sha:
+                raise ValueError(f"base10 {key}源SHA漂移")
+            archived_records[key] = copy_exact_file(
+                source_path,
+                archive.parent / "resource_state" / source_path.name,
+            )
+    manifest = {
+        "status": "complete",
+        "created_at": utc_now(),
+        "protocol_version": PROTOCOL_VERSION,
+        "model_matrix_revision_at_archive": payload.get(
+            "model_matrix_revision"
+        ),
+        "expected_models": list(LEGACY_MODEL_IDS),
+        "expected_farms": list(EXPECTED_FARMS),
+        "expected_task_count": expected_count,
+        "base10_training_complete_source_sha256": sha256_file(source),
+        "global_batch_policy_sha256": policy_sha,
+        "frozen_training_code_sha256_by_model": {
+            model_id: BASE10_TRAINING_CODE_SHA256
+            for model_id in LEGACY_MODEL_IDS
+        },
+        "frozen_task_marker_records": frozen_records,
+        "archived_records": archived_records,
+        "legacy_task_training_artifacts_modified": False,
+    }
+    atomic_json(manifest_path, manifest)
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+
+
+def archive_pre_timesnet_training_complete() -> dict[str, Any]:
+    """Atomically freeze the completed 11×14 matrix before TimesNet."""
+    source = RESULT_ROOT / "round3_training_bundle_complete.json"
+    archive_root = PRE_TIMESNET_TRAINING_ARCHIVE_ROOT
+    manifest_path = PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_TIMESNET_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+    if manifest_path.is_file():
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if (
+            manifest.get("status") != "complete"
+            or tuple(manifest.get("expected_models", ()))
+            != PRE_TIMESNET_MODEL_IDS
+            or int(manifest.get("expected_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(f"pre-TimesNet训练归档身份漂移: {manifest_path}")
+        for record in manifest.get("archived_records", {}).values():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(record["size_bytes"])
+                or sha256_file(path) != record["sha256"]
+            ):
+                raise ValueError(f"pre-TimesNet训练归档文件漂移: {path}")
+        frozen_records = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get("frozen_task_marker_records", ())
+        }
+        if set(frozen_records) != expected_pairs:
+            raise ValueError("pre-TimesNet归档缺少154个训练marker记录")
+        for record in frozen_records.values():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or sha256_file(path) != record["sha256"]
+                or not completed_marker_valid(path)
+            ):
+                raise ValueError(f"pre-TimesNet冻结训练marker漂移: {path}")
+        return {
+            "path": str(manifest_path.resolve()),
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        }
+
+    if archive_root.exists():
+        raise ValueError(f"pre-TimesNet训练归档目录不完整: {archive_root}")
+    if not source.is_file():
+        raise FileNotFoundError(
+            "缺少iTransformer扩展后的11模型training complete marker"
+        )
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    declared_pairs = {
+        (str(item.get("model_id")), str(item.get("farm_id")))
+        for item in payload.get("completed_tasks", ())
+    }
+    if (
+        payload.get("status") != "complete"
+        or payload.get("protocol_version") != PROTOCOL_VERSION
+        or tuple(payload.get("expected_models", ()))
+        != PRE_TIMESNET_MODEL_IDS
+        or int(payload.get("expected_task_count", -1))
+        != len(expected_pairs)
+        or int(payload.get("completed_task_count", -1))
+        != len(expected_pairs)
+        or declared_pairs != expected_pairs
+    ):
+        raise ValueError(
+            "TimesNet追加要求先完成11模型×14站矩阵；"
+            "当前training complete不是154任务冻结态"
+        )
+    policy_sha = str(payload.get("global_batch_policy_sha256", ""))
+    if (
+        not BATCH_POLICY_PATH.is_file()
+        or sha256_file(BATCH_POLICY_PATH) != policy_sha
+    ):
+        raise ValueError("pre-TimesNet训练complete绑定的batch policy已漂移")
+
+    task_records = {
+        (str(item.get("model_id")), str(item.get("farm_id"))): item
+        for item in payload.get("task_marker_records", ())
+    }
+    if set(task_records) != expected_pairs:
+        raise ValueError("pre-TimesNet训练complete缺少154个task marker哈希")
+    frozen_records = []
+    code_hashes_by_model: dict[str, set[str]] = {
+        model_id: set() for model_id in PRE_TIMESNET_MODEL_IDS
+    }
+    for pair in sorted(expected_pairs):
+        record = task_records[pair]
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or sha256_file(path) != record.get("sha256")
+            or not completed_marker_valid(path)
+        ):
+            raise ValueError(f"pre-TimesNet训练marker无效: {pair}")
+        with open(path, "r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+        if (
+            (str(marker.get("model_id")), str(marker.get("farm_id")))
+            != pair
+            or marker.get("global_batch_policy_sha256") != policy_sha
+        ):
+            raise ValueError(f"pre-TimesNet训练marker身份/策略漂移: {pair}")
+        code_hashes_by_model[pair[0]].add(
+            str(marker.get("training_code_sha256", ""))
+        )
+        frozen_records.append(
+            {
+                "model_id": pair[0],
+                "farm_id": pair[1],
+                "path": str(path.resolve()),
+                "sha256": record["sha256"],
+            }
+        )
+    inconsistent = {
+        model_id: sorted(values)
+        for model_id, values in code_hashes_by_model.items()
+        if len(values) != 1 or "" in values
+    }
+    if inconsistent:
+        raise ValueError(
+            f"pre-TimesNet模型跨场站训练代码SHA不一致: {inconsistent}"
+        )
+    for model_id in LEGACY_MODEL_IDS:
+        if code_hashes_by_model[model_id] != {
+            BASE10_TRAINING_CODE_SHA256
+        }:
+            raise ValueError(f"{model_id}不再绑定原base10训练代码SHA")
+
+    for key, record in payload.get("summary_outputs", {}).items():
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(record["size_bytes"])
+            or sha256_file(path) != record["sha256"]
+        ):
+            raise ValueError(f"pre-TimesNet训练summary漂移: {key}")
+
+    staging_parent = RESULT_ROOT / "partial_runs" / "archive_staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_timesnet_training_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_record(record: dict[str, Any]) -> dict[str, Any]:
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {
+            **record,
+            "path": str((archive_root / relative).resolve()),
+        }
+
+    try:
+        archived_records = {
+            "training_complete": final_record(
+                copy_exact_file(
+                    source,
+                    staging_root
+                    / "pre_timesnet_11_training_bundle_complete.json",
+                )
+            )
+        }
+        for key, record in payload.get("summary_outputs", {}).items():
+            source_path = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_record(
+                copy_exact_file(
+                    source_path,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source_path.suffix}",
+                )
+            )
+        for key in (
+            "resource_plan_initial",
+            "resource_plan_calibrated",
+            "runtime_progress",
+        ):
+            source_path = payload.get(f"{key}_path")
+            expected_sha = payload.get(f"{key}_sha256")
+            if source_path and expected_sha:
+                source_path = Path(source_path)
+                if sha256_file(source_path) != expected_sha:
+                    raise ValueError(f"pre-TimesNet {key}源SHA漂移")
+                archived_records[key] = final_record(
+                    copy_exact_file(
+                        source_path,
+                        staging_root / "resource_state" / source_path.name,
+                    )
+                )
+        manifest = {
+            "status": "complete",
+            "created_at": utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision": MODEL_MATRIX_REVISION,
+            "expected_models": list(PRE_TIMESNET_MODEL_IDS),
+            "expected_farms": list(EXPECTED_FARMS),
+            "expected_task_count": len(expected_pairs),
+            "pre_timesnet_training_complete_source_sha256": sha256_file(
+                source
+            ),
+            "global_batch_policy_sha256": policy_sha,
+            "frozen_training_code_sha256_by_model": {
+                model_id: next(iter(values))
+                for model_id, values in code_hashes_by_model.items()
+            },
+            "frozen_task_marker_records": frozen_records,
+            "archived_records": archived_records,
+            "pre_timesnet_model_artifacts_modified": False,
+        }
+        atomic_json(staging_root / "archive_manifest.json", manifest)
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+
+
+def archive_pre_timemixer_training_complete() -> dict[str, Any]:
+    """Atomically freeze the completed 12×14 matrix before TimeMixer."""
+    source = RESULT_ROOT / "round3_training_bundle_complete.json"
+    archive_root = PRE_TIMEMIXER_TRAINING_ARCHIVE_ROOT
+    manifest_path = PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_TIMEMIXER_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+
+    if manifest_path.is_file():
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if (
+            manifest.get("status") != "complete"
+            or tuple(manifest.get("expected_models", ()))
+            != PRE_TIMEMIXER_MODEL_IDS
+            or int(manifest.get("expected_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(f"pre-TimeMixer训练归档身份漂移: {manifest_path}")
+        frozen_records = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get("frozen_task_marker_records", ())
+        }
+        if set(frozen_records) != expected_pairs:
+            raise ValueError("pre-TimeMixer归档缺少168个训练marker记录")
+        for record in manifest.get("archived_records", {}).values():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(record["size_bytes"])
+                or sha256_file(path) != record["sha256"]
+            ):
+                raise ValueError(f"pre-TimeMixer训练归档文件漂移: {path}")
+        for pair, record in frozen_records.items():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or sha256_file(path) != record["sha256"]
+                or not completed_marker_valid(path)
+            ):
+                raise ValueError(f"pre-TimeMixer冻结训练marker漂移: {pair}")
+        frozen_hashes = manifest.get(
+            "frozen_training_code_sha256_by_model", {}
+        )
+        if set(frozen_hashes) != set(PRE_TIMEMIXER_MODEL_IDS):
+            raise ValueError("pre-TimeMixer归档缺少12模型训练代码SHA")
+        return {
+            "path": str(manifest_path.resolve()),
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        }
+
+    if archive_root.exists():
+        raise ValueError(f"pre-TimeMixer训练归档目录不完整: {archive_root}")
+    if not source.is_file():
+        raise FileNotFoundError(
+            "缺少TimesNet扩展后的12模型training complete marker"
+        )
+    if not PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.is_file():
+        raise FileNotFoundError(
+            "缺少pre-TimesNet训练归档，无法建立连续代际证据链"
+        )
+    # 复核上一代归档及其154个live marker均未漂移。
+    archive_pre_timesnet_training_complete()
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    declared_pairs = {
+        (str(item.get("model_id")), str(item.get("farm_id")))
+        for item in payload.get("completed_tasks", ())
+    }
+    if (
+        payload.get("status") != "complete"
+        or payload.get("protocol_version") != PROTOCOL_VERSION
+        or tuple(payload.get("expected_models", ()))
+        != PRE_TIMEMIXER_MODEL_IDS
+        or int(payload.get("expected_task_count", -1))
+        != len(expected_pairs)
+        or int(payload.get("completed_task_count", -1))
+        != len(expected_pairs)
+        or declared_pairs != expected_pairs
+    ):
+        raise ValueError(
+            "TimeMixer追加要求先完成12模型×14站矩阵；"
+            "当前training complete不是168任务冻结态"
+        )
+    previous_archive = payload.get(
+        "pre_timesnet_training_complete_archive"
+    )
+    if (
+        not isinstance(previous_archive, dict)
+        or Path(previous_archive.get("path", "")).resolve()
+        != PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
+        or previous_archive.get("sha256")
+        != sha256_file(PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH)
+        or int(previous_archive.get("size_bytes", -1))
+        != PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size
+    ):
+        raise ValueError("12模型complete未正确绑定pre-TimesNet训练归档")
+    policy_sha = str(payload.get("global_batch_policy_sha256", ""))
+    if (
+        not BATCH_POLICY_PATH.is_file()
+        or sha256_file(BATCH_POLICY_PATH) != policy_sha
+    ):
+        raise ValueError("pre-TimeMixer训练complete绑定的batch policy已漂移")
+
+    task_records = {
+        (str(item.get("model_id")), str(item.get("farm_id"))): item
+        for item in payload.get("task_marker_records", ())
+    }
+    if set(task_records) != expected_pairs:
+        raise ValueError("pre-TimeMixer训练complete缺少168个task marker哈希")
+    frozen_records: list[dict[str, Any]] = []
+    code_hashes_by_model: dict[str, set[str]] = {
+        model_id: set() for model_id in PRE_TIMEMIXER_MODEL_IDS
+    }
+    for pair in sorted(expected_pairs):
+        record = task_records[pair]
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or sha256_file(path) != record.get("sha256")
+            or not completed_marker_valid(path)
+        ):
+            raise ValueError(f"pre-TimeMixer训练marker无效: {pair}")
+        with open(path, "r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+        if (
+            (str(marker.get("model_id")), str(marker.get("farm_id")))
+            != pair
+            or marker.get("global_batch_policy_sha256") != policy_sha
+        ):
+            raise ValueError(f"pre-TimeMixer训练marker身份/策略漂移: {pair}")
+        code_hashes_by_model[pair[0]].add(
+            str(marker.get("training_code_sha256", ""))
+        )
+        frozen_records.append(
+            {
+                "model_id": pair[0],
+                "farm_id": pair[1],
+                "path": str(path.resolve()),
+                "sha256": record["sha256"],
+            }
+        )
+    inconsistent = {
+        model_id: sorted(values)
+        for model_id, values in code_hashes_by_model.items()
+        if len(values) != 1 or "" in values
+    }
+    if inconsistent:
+        raise ValueError(
+            f"pre-TimeMixer模型跨场站训练代码SHA不一致: {inconsistent}"
+        )
+    for model_id in LEGACY_MODEL_IDS:
+        if code_hashes_by_model[model_id] != {
+            BASE10_TRAINING_CODE_SHA256
+        }:
+            raise ValueError(f"{model_id}不再绑定原base10训练代码SHA")
+
+    for key, record in payload.get("summary_outputs", {}).items():
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(record["size_bytes"])
+            or sha256_file(path) != record["sha256"]
+        ):
+            raise ValueError(f"pre-TimeMixer训练summary漂移: {key}")
+
+    staging_parent = RESULT_ROOT / "partial_runs" / "archive_staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_timemixer_training_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_record(record: dict[str, Any]) -> dict[str, Any]:
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {**record, "path": str((archive_root / relative).resolve())}
+
+    try:
+        archived_records = {
+            "training_complete": final_record(
+                copy_exact_file(
+                    source,
+                    staging_root
+                    / "pre_timemixer_12_training_bundle_complete.json",
+                )
+            ),
+            "pre_timesnet_archive_manifest": final_record(
+                copy_exact_file(
+                    PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH,
+                    staging_root
+                    / "prior_generation"
+                    / "pre_timesnet_archive_manifest.json",
+                )
+            ),
+        }
+        for key, record in payload.get("summary_outputs", {}).items():
+            source_path = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_record(
+                copy_exact_file(
+                    source_path,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source_path.suffix}",
+                )
+            )
+        for key in (
+            "resource_plan_initial",
+            "resource_plan_calibrated",
+            "runtime_progress",
+        ):
+            source_path = payload.get(f"{key}_path")
+            expected_sha = payload.get(f"{key}_sha256")
+            if source_path and expected_sha:
+                source_path = Path(source_path)
+                if sha256_file(source_path) != expected_sha:
+                    raise ValueError(f"pre-TimeMixer {key}源SHA漂移")
+                archived_records[key] = final_record(
+                    copy_exact_file(
+                        source_path,
+                        staging_root / "resource_state" / source_path.name,
+                    )
+                )
+        manifest = {
+            "status": "complete",
+            "created_at": utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision_at_archive": payload.get(
+                "model_matrix_revision"
+            ),
+            "expected_models": list(PRE_TIMEMIXER_MODEL_IDS),
+            "expected_farms": list(EXPECTED_FARMS),
+            "expected_task_count": len(expected_pairs),
+            "pre_timemixer_training_complete_source_sha256": sha256_file(
+                source
+            ),
+            "global_batch_policy_sha256": policy_sha,
+            "frozen_training_code_sha256_by_model": {
+                model_id: next(iter(values))
+                for model_id, values in code_hashes_by_model.items()
+            },
+            "frozen_task_marker_records": frozen_records,
+            "archived_records": archived_records,
+            "pre_timemixer_model_artifacts_modified": False,
+        }
+        atomic_json(staging_root / "archive_manifest.json", manifest)
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+
+
+def archive_pre_dlinear_training_complete() -> dict[str, Any]:
+    """Atomically freeze the completed 13×14 matrix before DLinear."""
+    source = RESULT_ROOT / "round3_training_bundle_complete.json"
+    archive_root = PRE_DLINEAR_TRAINING_ARCHIVE_ROOT
+    manifest_path = PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH
+    expected_pairs = {
+        (model_id, farm_id)
+        for model_id in PRE_DLINEAR_MODEL_IDS
+        for farm_id in EXPECTED_FARMS
+    }
+
+    if manifest_path.is_file():
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("protocol_version") != PROTOCOL_VERSION
+            or manifest.get("model_matrix_revision_at_archive")
+            != PRE_DLINEAR_MODEL_MATRIX_REVISION
+            or tuple(manifest.get("expected_models", ()))
+            != PRE_DLINEAR_MODEL_IDS
+            or int(manifest.get("expected_task_count", -1))
+            != len(expected_pairs)
+        ):
+            raise ValueError(f"pre-DLinear训练归档身份漂移: {manifest_path}")
+        frozen_records = {
+            (str(item["model_id"]), str(item["farm_id"])): item
+            for item in manifest.get("frozen_task_marker_records", ())
+        }
+        if set(frozen_records) != expected_pairs:
+            raise ValueError("pre-DLinear归档缺少182个训练marker记录")
+        for record in manifest.get("archived_records", {}).values():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(record["size_bytes"])
+                or sha256_file(path) != record["sha256"]
+            ):
+                raise ValueError(f"pre-DLinear训练归档文件漂移: {path}")
+        for pair, record in frozen_records.items():
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or sha256_file(path) != record["sha256"]
+                or not completed_marker_valid(path)
+            ):
+                raise ValueError(f"pre-DLinear冻结训练marker漂移: {pair}")
+        frozen_hashes = {
+            str(model_id): str(code_sha)
+            for model_id, code_sha in manifest.get(
+                "frozen_training_code_sha256_by_model", {}
+            ).items()
+        }
+        if set(frozen_hashes) != set(PRE_DLINEAR_MODEL_IDS):
+            raise ValueError("pre-DLinear归档缺少13模型训练代码SHA")
+        if (
+            frozen_hashes.get("timemixer")
+            != TIMEMIXER_EXTENSION_TRAINING_CODE_SHA256
+        ):
+            raise ValueError("pre-DLinear归档中的TimeMixer训练代码SHA漂移")
+        return {
+            "path": str(manifest_path.resolve()),
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        }
+
+    if archive_root.exists():
+        raise ValueError(f"pre-DLinear训练归档目录不完整: {archive_root}")
+    if not source.is_file():
+        raise FileNotFoundError(
+            "缺少TimeMixer扩展后的13模型training complete marker"
+        )
+    if not PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.is_file():
+        raise FileNotFoundError(
+            "缺少pre-TimeMixer训练归档，不能从当前182项live bundle"
+            "反推上一代状态，无法建立连续代际证据链"
+        )
+    # 只能复核既存上一代归档；不能用13模型live complete重建12模型归档。
+    archive_pre_timemixer_training_complete()
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    declared_pairs = {
+        (str(item.get("model_id")), str(item.get("farm_id")))
+        for item in payload.get("completed_tasks", ())
+    }
+    if (
+        payload.get("status") != "complete"
+        or payload.get("protocol_version") != PROTOCOL_VERSION
+        or payload.get("model_matrix_revision")
+        != PRE_DLINEAR_MODEL_MATRIX_REVISION
+        or tuple(payload.get("expected_models", ()))
+        != PRE_DLINEAR_MODEL_IDS
+        or int(payload.get("expected_task_count", -1))
+        != len(expected_pairs)
+        or int(payload.get("completed_task_count", -1))
+        != len(expected_pairs)
+        or declared_pairs != expected_pairs
+    ):
+        raise ValueError(
+            "DLinear追加要求先完成13模型×14站矩阵；"
+            "当前training complete不是182任务冻结态"
+        )
+    previous_archive = payload.get(
+        "pre_timemixer_training_complete_archive"
+    )
+    if (
+        not isinstance(previous_archive, dict)
+        or Path(previous_archive.get("path", "")).resolve()
+        != PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
+        or previous_archive.get("sha256")
+        != sha256_file(PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH)
+        or int(previous_archive.get("size_bytes", -1))
+        != PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size
+    ):
+        raise ValueError("13模型complete未正确绑定pre-TimeMixer训练归档")
+    if (
+        payload.get("timemixer_extension_training_code_sha256")
+        != TIMEMIXER_EXTENSION_TRAINING_CODE_SHA256
+    ):
+        raise ValueError("13模型complete记录的TimeMixer训练代码SHA漂移")
+    policy_sha = str(payload.get("global_batch_policy_sha256", ""))
+    if (
+        not BATCH_POLICY_PATH.is_file()
+        or sha256_file(BATCH_POLICY_PATH) != policy_sha
+    ):
+        raise ValueError("pre-DLinear训练complete绑定的batch policy已漂移")
+
+    task_records = {
+        (str(item.get("model_id")), str(item.get("farm_id"))): item
+        for item in payload.get("task_marker_records", ())
+    }
+    if set(task_records) != expected_pairs:
+        raise ValueError("pre-DLinear训练complete缺少182个task marker哈希")
+    with open(
+        PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH,
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        prior_archive = json.load(handle)
+    prior_hashes = {
+        str(model_id): str(code_sha)
+        for model_id, code_sha in prior_archive.get(
+            "frozen_training_code_sha256_by_model", {}
+        ).items()
+    }
+    if set(prior_hashes) != set(PRE_TIMEMIXER_MODEL_IDS):
+        raise ValueError("pre-TimeMixer训练归档缺少12模型代码SHA")
+
+    frozen_records: list[dict[str, Any]] = []
+    code_hashes_by_model: dict[str, set[str]] = {
+        model_id: set() for model_id in PRE_DLINEAR_MODEL_IDS
+    }
+    for pair in sorted(expected_pairs):
+        record = task_records[pair]
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or sha256_file(path) != record.get("sha256")
+            or not completed_marker_valid(path)
+        ):
+            raise ValueError(f"pre-DLinear训练marker无效: {pair}")
+        with open(path, "r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+        if (
+            (str(marker.get("model_id")), str(marker.get("farm_id")))
+            != pair
+            or marker.get("global_batch_policy_sha256") != policy_sha
+        ):
+            raise ValueError(f"pre-DLinear训练marker身份/策略漂移: {pair}")
+        code_hashes_by_model[pair[0]].add(
+            str(marker.get("training_code_sha256", ""))
+        )
+        frozen_records.append(
+            {
+                "model_id": pair[0],
+                "farm_id": pair[1],
+                "path": str(path.resolve()),
+                "sha256": record["sha256"],
+            }
+        )
+    inconsistent = {
+        model_id: sorted(values)
+        for model_id, values in code_hashes_by_model.items()
+        if len(values) != 1 or "" in values
+    }
+    if inconsistent:
+        raise ValueError(
+            f"pre-DLinear模型跨场站训练代码SHA不一致: {inconsistent}"
+        )
+    for model_id in PRE_TIMEMIXER_MODEL_IDS:
+        if code_hashes_by_model[model_id] != {
+            prior_hashes[model_id]
+        }:
+            raise ValueError(f"{model_id}不再绑定pre-TimeMixer归档训练SHA")
+    if code_hashes_by_model["timemixer"] != {
+        TIMEMIXER_EXTENSION_TRAINING_CODE_SHA256
+    }:
+        raise ValueError("TimeMixer不再绑定其冻结训练代码SHA")
+
+    for key, record in payload.get("summary_outputs", {}).items():
+        path = Path(record["path"])
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(record["size_bytes"])
+            or sha256_file(path) != record["sha256"]
+        ):
+            raise ValueError(f"pre-DLinear训练summary漂移: {key}")
+
+    staging_parent = RESULT_ROOT / "partial_runs" / "archive_staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix="pre_dlinear_training_state_",
+            dir=staging_parent,
+        )
+    ).resolve()
+
+    def final_record(record: dict[str, Any]) -> dict[str, Any]:
+        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        return {**record, "path": str((archive_root / relative).resolve())}
+
+    try:
+        archived_records = {
+            "training_complete": final_record(
+                copy_exact_file(
+                    source,
+                    staging_root
+                    / "pre_dlinear_13_training_bundle_complete.json",
+                )
+            ),
+            "pre_timemixer_archive_manifest": final_record(
+                copy_exact_file(
+                    PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH,
+                    staging_root
+                    / "prior_generation"
+                    / "pre_timemixer_archive_manifest.json",
+                )
+            ),
+        }
+        for key, record in payload.get("summary_outputs", {}).items():
+            source_path = Path(record["path"])
+            archived_records[f"summary_{key}"] = final_record(
+                copy_exact_file(
+                    source_path,
+                    staging_root
+                    / "summary_files"
+                    / f"{key}{source_path.suffix}",
+                )
+            )
+        for key in (
+            "resource_plan_initial",
+            "resource_plan_calibrated",
+            "runtime_progress",
+        ):
+            source_path = payload.get(f"{key}_path")
+            expected_sha = payload.get(f"{key}_sha256")
+            if source_path and expected_sha:
+                source_path = Path(source_path)
+                if sha256_file(source_path) != expected_sha:
+                    raise ValueError(f"pre-DLinear {key}源SHA漂移")
+                archived_records[key] = final_record(
+                    copy_exact_file(
+                        source_path,
+                        staging_root / "resource_state" / source_path.name,
+                    )
+                )
+        manifest = {
+            "status": "complete",
+            "created_at": utc_now(),
+            "protocol_version": PROTOCOL_VERSION,
+            "model_matrix_revision_at_archive": payload.get(
+                "model_matrix_revision"
+            ),
+            "expected_models": list(PRE_DLINEAR_MODEL_IDS),
+            "expected_farms": list(EXPECTED_FARMS),
+            "expected_task_count": len(expected_pairs),
+            "pre_dlinear_training_complete_source_sha256": sha256_file(source),
+            "global_batch_policy_sha256": policy_sha,
+            "frozen_training_code_sha256_by_model": {
+                model_id: next(iter(values))
+                for model_id, values in code_hashes_by_model.items()
+            },
+            "frozen_task_marker_records": frozen_records,
+            "archived_records": archived_records,
+            "pre_dlinear_model_artifacts_modified": False,
+        }
+        atomic_json(staging_root / "archive_manifest.json", manifest)
+        archive_root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_root, archive_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+
+
+def infer_extension_lineage() -> str:
+    """Infer staged versus unified lineage without rewriting any evidence."""
+    staged_archives = (
+        PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH,
+        PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH,
+        PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH,
+    )
+    if any(path.is_file() for path in staged_archives):
+        return STAGED_EXTENSION_LINEAGE
+
+    complete_path = RESULT_ROOT / "round3_training_bundle_complete.json"
+    if complete_path.is_file():
+        try:
+            with open(complete_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            declared_lineage = payload.get("extension_lineage")
+            if declared_lineage in {
+                STAGED_EXTENSION_LINEAGE,
+                UNIFIED_MODERN_EXTENSION_LINEAGE,
+            }:
+                return str(declared_lineage)
+            expected_models = tuple(payload.get("expected_models", ()))
+            if expected_models in {
+                PRE_TIMESNET_MODEL_IDS,
+                PRE_TIMEMIXER_MODEL_IDS,
+                PRE_DLINEAR_MODEL_IDS,
+            }:
+                return STAGED_EXTENSION_LINEAGE
+        except Exception:
+            pass
+
+    current_code_sha = sha256_file(__file__)
+    observed_hashes = set()
+    for model_id in MODERN_TRAINABLE_MODEL_IDS:
+        for farm_id in EXPECTED_FARMS:
+            marker_path = artifact_paths(model_id, farm_id)["marker"]
+            if not marker_path.is_file():
+                continue
+            try:
+                with open(marker_path, "r", encoding="utf-8") as handle:
+                    marker = json.load(handle)
+            except Exception:
+                continue
+            if (
+                marker.get("status") == "complete"
+                and marker.get("model_id") == model_id
+                and marker.get("farm_id") == farm_id
+            ):
+                declared_lineage = marker.get("extension_lineage")
+                if declared_lineage == STAGED_EXTENSION_LINEAGE:
+                    return STAGED_EXTENSION_LINEAGE
+                if marker.get("training_code_sha256"):
+                    observed_hashes.add(str(marker["training_code_sha256"]))
+    if observed_hashes and observed_hashes != {current_code_sha}:
+        return STAGED_EXTENSION_LINEAGE
+    return UNIFIED_MODERN_EXTENSION_LINEAGE
+
+
+def _archive_pointer_valid(
+    record: Any,
+    manifest_path: Path,
+) -> bool:
+    return bool(
+        isinstance(record, dict)
+        and manifest_path.is_file()
+        and Path(record.get("path", "")).resolve() == manifest_path.resolve()
+        and record.get("sha256") == sha256_file(manifest_path)
+        and int(record.get("size_bytes", -1)) == manifest_path.stat().st_size
+    )
+
+
+def extended_training_bundle_valid() -> bool:
+    """Return True for either immutable staged or unified 14×14 lineage."""
+    path = RESULT_ROOT / "round3_training_bundle_complete.json"
+    if not path.is_file():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        expected = {
+            (model_id, farm_id)
+            for model_id in MODEL_IDS
+            for farm_id in EXPECTED_FARMS
+        }
+        declared = {
+            (str(item.get("model_id")), str(item.get("farm_id")))
+            for item in payload.get("completed_tasks", ())
+        }
+        if (
+            payload.get("status") != "complete"
+            or payload.get("protocol_version") != PROTOCOL_VERSION
+            or payload.get("model_matrix_revision")
+            != MODEL_MATRIX_REVISION
+            or tuple(payload.get("expected_models", ())) != MODEL_IDS
+            or int(payload.get("expected_task_count", -1)) != len(expected)
+            or int(payload.get("completed_task_count", -1)) != len(expected)
+            or declared != expected
+        ):
+            return False
+        lineage = payload.get("extension_lineage")
+        if lineage not in {
+            STAGED_EXTENSION_LINEAGE,
+            UNIFIED_MODERN_EXTENSION_LINEAGE,
+        }:
+            # Compatibility for a historical staged complete written before
+            # the explicit lineage field was introduced.
+            if payload.get("pre_dlinear_training_complete_archive"):
+                lineage = STAGED_EXTENSION_LINEAGE
+            else:
+                return False
+        records = {
+            (str(item.get("model_id")), str(item.get("farm_id"))): item
+            for item in payload.get("task_marker_records", ())
+        }
+        if set(records) != expected:
+            return False
+        frozen_code_hashes: dict[str, str]
+        modern_code_sha: str | None = None
+        if lineage == STAGED_EXTENSION_LINEAGE:
+            if not _archive_pointer_valid(
+                payload.get("pre_dlinear_training_complete_archive"),
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH,
+            ):
+                return False
+            with open(
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                archive = json.load(handle)
+            frozen_code_hashes = {
+                str(model_id): str(code_sha)
+                for model_id, code_sha in archive.get(
+                    "frozen_training_code_sha256_by_model", {}
+                ).items()
+            }
+            if (
+                archive.get("status") != "complete"
+                or archive.get("model_matrix_revision_at_archive")
+                != PRE_DLINEAR_MODEL_MATRIX_REVISION
+                or tuple(archive.get("expected_models", ()))
+                != PRE_DLINEAR_MODEL_IDS
+                or set(frozen_code_hashes) != set(PRE_DLINEAR_MODEL_IDS)
+            ):
+                return False
+            dlinear_code_sha = str(
+                payload.get("dlinear_extension_training_code_sha256", "")
+            )
+            if not dlinear_code_sha:
+                return False
+        else:
+            if not _archive_pointer_valid(
+                payload.get("base10_training_complete_archive"),
+                BASE10_TRAINING_ARCHIVE_MANIFEST_PATH,
+            ):
+                return False
+            with open(
+                BASE10_TRAINING_ARCHIVE_MANIFEST_PATH,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                archive = json.load(handle)
+            if (
+                archive.get("status") != "complete"
+                or tuple(archive.get("expected_models", ()))
+                != LEGACY_MODEL_IDS
+                or int(archive.get("expected_task_count", -1))
+                != len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
+            ):
+                return False
+            frozen_code_hashes = {
+                model_id: BASE10_TRAINING_CODE_SHA256
+                for model_id in LEGACY_MODEL_IDS
+            }
+            modern_code_sha = str(
+                payload.get("modern_extension_training_code_sha256", "")
+            )
+            if not modern_code_sha:
+                return False
+
+        for pair, record in records.items():
+            record_path = Path(record["path"])
+            if (
+                not record_path.is_file()
+                or sha256_file(record_path) != record.get("sha256")
+                or not completed_marker_valid(record_path)
+            ):
+                return False
+            with open(record_path, "r", encoding="utf-8") as handle:
+                marker = json.load(handle)
+            if (
+                str(marker.get("model_id")),
+                str(marker.get("farm_id")),
+            ) != pair:
+                return False
+            if lineage == UNIFIED_MODERN_EXTENSION_LINEAGE:
+                expected_code_sha = (
+                    modern_code_sha
+                    if pair[0] in MODERN_TRAINABLE_MODEL_IDS
+                    else frozen_code_hashes.get(pair[0])
+                )
+                if (
+                    pair[0] in MODERN_TRAINABLE_MODEL_IDS
+                    and marker.get("extension_lineage")
+                    != UNIFIED_MODERN_EXTENSION_LINEAGE
+                ):
+                    return False
+            else:
+                expected_code_sha = (
+                    dlinear_code_sha
+                    if pair[0] in DLINEAR_BASELINE_IDS
+                    else frozen_code_hashes.get(pair[0])
+                )
+                if (
+                    pair[0] in DLINEAR_BASELINE_IDS
+                    and marker.get("extension_lineage")
+                    not in (None, STAGED_EXTENSION_LINEAGE)
+                ):
+                    return False
+            if marker.get("training_code_sha256") != expected_code_sha:
+                return False
+        for record in payload.get("summary_outputs", {}).values():
+            record_path = Path(record["path"])
+            if (
+                not record_path.is_file()
+                or sha256_file(record_path) != record.get("sha256")
+            ):
+                return False
+        policy_path = Path(payload["global_batch_policy_path"])
+        if (
+            not policy_path.is_file()
+            or sha256_file(policy_path)
+            != payload.get("global_batch_policy_sha256")
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def load_batch_policy(require_valid_sources: bool = True) -> dict[str, Any]:
     if not BATCH_POLICY_PATH.is_file():
         raise FileNotFoundError(f"缺少全局batch策略: {BATCH_POLICY_PATH}")
@@ -287,14 +1656,29 @@ def load_batch_policy(require_valid_sources: bool = True) -> dict[str, Any]:
         if farm_id != largest_training_farm():
             raise ValueError("全局batch策略的最大训练场站已漂移")
         paths = artifact_paths("patchtst", farm_id)
-        current = {
+        current_sources = {
             "array_sha256": sha256_file(paths["array"]),
             "preprocess_bundle_sha256": sha256_file(paths["bundle"]),
-            "training_code_sha256": sha256_file(__file__),
         }
-        for key, value in current.items():
+        for key, value in current_sources.items():
             if policy.get(key) != value:
                 raise ValueError(f"全局batch策略源身份漂移: {key}")
+        current_code_sha = sha256_file(__file__)
+        if policy.get("training_code_sha256") != current_code_sha:
+            # Modern baselines are appended by generation.  Rebuilding the
+            # original policy would change its SHA and invalidate the frozen
+            # base markers, so compatibility is accepted only while every
+            # base marker still binds the archived code SHA and policy SHA.
+            if (
+                policy.get("training_code_sha256")
+                != BASE10_TRAINING_CODE_SHA256
+                or not legacy_base10_markers_valid_for_extension(
+                    sha256_file(BATCH_POLICY_PATH)
+                )
+            ):
+                raise ValueError(
+                    "全局batch策略training code身份漂移，且不满足base10追加兼容"
+                )
     return policy
 
 
@@ -441,6 +1825,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--farm", choices=EXPECTED_FARMS, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--attempt-dir", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--extension-lineage",
+        choices=(
+            STAGED_EXTENSION_LINEAGE,
+            UNIFIED_MODERN_EXTENSION_LINEAGE,
+            "smoke",
+        ),
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -736,6 +2129,1440 @@ def get_round3_custom_objects() -> dict[str, Any]:
     }
 
 
+def get_itransformer_layer_classes() -> dict[str, Any]:
+    """Create serializable Keras layers without importing TensorFlow in parent."""
+    global _ITRANSFORMER_LAYER_CLASSES
+    if _ITRANSFORMER_LAYER_CLASSES is not None:
+        return _ITRANSFORMER_LAYER_CLASSES
+
+    import tensorflow as tf
+    from tensorflow import keras
+
+    @keras.utils.register_keras_serializable(package="Round3ITransformer")
+    class ITransformerInstanceNormalization(keras.layers.Layer):
+        """Official per-window/per-variate normalization and retained statistics."""
+
+        def __init__(self, epsilon: float = 1e-5, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.epsilon = float(epsilon)
+
+        def call(self, inputs: Any) -> tuple[Any, Any, Any]:
+            # Official implementation detaches only the window mean. Population
+            # variance (unbiased=False) is equivalent to tf.math.reduce_variance.
+            mean = tf.stop_gradient(
+                tf.reduce_mean(inputs, axis=1, keepdims=True)
+            )
+            centered = inputs - mean
+            stdev = tf.sqrt(
+                tf.math.reduce_variance(
+                    centered, axis=1, keepdims=True
+                )
+                + tf.cast(self.epsilon, inputs.dtype)
+            )
+            normalized = centered / stdev
+            return normalized, mean, stdev
+
+        def get_config(self) -> dict[str, Any]:
+            return {**super().get_config(), "epsilon": self.epsilon}
+
+    @keras.utils.register_keras_serializable(package="Round3ITransformer")
+    class ITransformerEncoderBlock(keras.layers.Layer):
+        """Post-norm full-attention encoder operating on variate tokens."""
+
+        def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            dropout: float = 0.1,
+            activation: str = "gelu",
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            if int(d_model) % int(num_heads):
+                raise ValueError("iTransformer d_model必须能被num_heads整除")
+            self.d_model = int(d_model)
+            self.num_heads = int(num_heads)
+            self.d_ff = int(d_ff)
+            self.dropout_rate = float(dropout)
+            self.activation_name = str(activation)
+            self.attention = keras.layers.MultiHeadAttention(
+                num_heads=self.num_heads,
+                key_dim=self.d_model // self.num_heads,
+                value_dim=self.d_model // self.num_heads,
+                dropout=self.dropout_rate,
+                use_bias=True,
+                output_shape=self.d_model,
+                name="full_variate_attention",
+            )
+            self.attention_dropout = keras.layers.Dropout(
+                self.dropout_rate, name="attention_residual_dropout"
+            )
+            self.attention_norm = keras.layers.LayerNormalization(
+                epsilon=1e-5, name="attention_post_norm"
+            )
+            self.ffn_dense_1 = keras.layers.Dense(
+                self.d_ff,
+                activation=keras.activations.get(self.activation_name),
+                name="ffn_expand",
+            )
+            self.ffn_dropout_1 = keras.layers.Dropout(
+                self.dropout_rate, name="ffn_activation_dropout"
+            )
+            self.ffn_dense_2 = keras.layers.Dense(
+                self.d_model, name="ffn_project"
+            )
+            self.ffn_dropout_2 = keras.layers.Dropout(
+                self.dropout_rate, name="ffn_residual_dropout"
+            )
+            self.ffn_norm = keras.layers.LayerNormalization(
+                epsilon=1e-5, name="ffn_post_norm"
+            )
+
+        def call(self, inputs: Any, training: bool | None = None) -> Any:
+            attended = self.attention(
+                query=inputs,
+                value=inputs,
+                key=inputs,
+                use_causal_mask=False,
+                training=training,
+            )
+            attended = self.attention_dropout(
+                attended, training=training
+            )
+            attention_output = self.attention_norm(inputs + attended)
+            ffn = self.ffn_dense_1(attention_output)
+            ffn = self.ffn_dropout_1(ffn, training=training)
+            ffn = self.ffn_dense_2(ffn)
+            ffn = self.ffn_dropout_2(ffn, training=training)
+            return self.ffn_norm(attention_output + ffn)
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "d_model": self.d_model,
+                "num_heads": self.num_heads,
+                "d_ff": self.d_ff,
+                "dropout": self.dropout_rate,
+                "activation": self.activation_name,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3ITransformer")
+    class ITransformerTargetHead(keras.layers.Layer):
+        """De-normalize all tokens, then emit target power in y-scaler units."""
+
+        def __init__(
+            self,
+            target_index: int,
+            power_scale_ratio: float,
+            power_scale_offset: float,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.target_index = int(target_index)
+            self.power_scale_ratio = float(power_scale_ratio)
+            self.power_scale_offset = float(power_scale_offset)
+
+        def call(self, inputs: list[Any] | tuple[Any, ...]) -> Any:
+            forecasts, mean, stdev = inputs
+            denormalized = forecasts * stdev + mean
+            target_x_scaled = denormalized[:, :, self.target_index]
+            return (
+                target_x_scaled
+                * tf.cast(self.power_scale_ratio, target_x_scaled.dtype)
+                + tf.cast(self.power_scale_offset, target_x_scaled.dtype)
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "target_index": self.target_index,
+                "power_scale_ratio": self.power_scale_ratio,
+                "power_scale_offset": self.power_scale_offset,
+            }
+
+    _ITRANSFORMER_LAYER_CLASSES = {
+        "ITransformerInstanceNormalization": ITransformerInstanceNormalization,
+        "ITransformerEncoderBlock": ITransformerEncoderBlock,
+        "ITransformerTargetHead": ITransformerTargetHead,
+    }
+    return _ITRANSFORMER_LAYER_CLASSES
+
+
+def get_itransformer_custom_objects() -> dict[str, Any]:
+    """Custom-object map required to reload Round-3 iTransformer models."""
+    classes = get_itransformer_layer_classes()
+    result: dict[str, Any] = {}
+    for name, layer_class in classes.items():
+        result[name] = layer_class
+        result[f"Round3ITransformer>{name}"] = layer_class
+    return result
+
+
+def build_itransformer_model(
+    prepared: dict[str, Any],
+    keras: Any,
+) -> Any:
+    """Faithful Keras iTransformer adapted from 96 steps to a 16-step target."""
+    d_model = ITRANSFORMER_D_MODEL
+    num_heads = ITRANSFORMER_NUM_HEADS
+    encoder_layers = ITRANSFORMER_ENCODER_LAYERS
+    d_ff = ITRANSFORMER_D_FF
+    dropout = ITRANSFORMER_DROPOUT
+    classes = get_itransformer_layer_classes()
+
+    inputs = keras.layers.Input(
+        shape=(HISTORY_LEN, INPUT_DIM), name="history_features"
+    )
+    normalized, window_mean, window_stdev = classes[
+        "ITransformerInstanceNormalization"
+    ](
+        epsilon=ITRANSFORMER_NORM_EPSILON,
+        name="instance_normalization",
+    )(inputs)
+    # Official DataEmbedding_inverted: B×L×N -> B×N×L, followed by one
+    # shared Linear(L, d_model).  No positional embedding is used.
+    tokens = keras.layers.Permute(
+        (2, 1), name="invert_time_and_variate_axes"
+    )(normalized)
+    tokens = keras.layers.Dense(
+        d_model, name="inverted_value_embedding"
+    )(tokens)
+    tokens = keras.layers.Dropout(
+        dropout, name="embedding_dropout"
+    )(tokens)
+    for index in range(encoder_layers):
+        tokens = classes["ITransformerEncoderBlock"](
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            name=f"inverted_encoder_{index + 1}",
+        )(tokens)
+    tokens = keras.layers.LayerNormalization(
+        epsilon=ITRANSFORMER_NORM_EPSILON,
+        name="encoder_final_norm",
+    )(tokens)
+    all_variate_forecasts = keras.layers.Dense(
+        FORECAST_LEN, name="shared_forecast_projector"
+    )(tokens)
+    all_variate_forecasts = keras.layers.Permute(
+        (2, 1), name="restore_forecast_and_variate_axes"
+    )(all_variate_forecasts)
+    forecast_power = classes["ITransformerTargetHead"](
+        target_index=TARGET_INDEX,
+        power_scale_ratio=prepared["power_scale_ratio"],
+        power_scale_offset=prepared["power_scale_offset"],
+        name="forecast_power",
+    )([all_variate_forecasts, window_mean, window_stdev])
+    return keras.Model(
+        inputs=inputs,
+        outputs=forecast_power,
+        name="Round3_iTransformer_96to16",
+    )
+
+
+def get_timesnet_layer_classes() -> dict[str, Any]:
+    """Create serializable Keras TimesNet layers without parent-side TF import."""
+    global _TIMESNET_LAYER_CLASSES
+    if _TIMESNET_LAYER_CLASSES is not None:
+        return _TIMESNET_LAYER_CLASSES
+
+    import tensorflow as tf
+    from tensorflow import keras
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetInstanceNormalization(keras.layers.Layer):
+        """Official forecast normalization: detached mean, live population std."""
+
+        def __init__(self, epsilon: float = 1e-5, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.epsilon = float(epsilon)
+
+        def call(self, inputs: Any) -> tuple[Any, Any, Any]:
+            mean = tf.stop_gradient(
+                tf.reduce_mean(inputs, axis=1, keepdims=True)
+            )
+            centered = inputs - mean
+            stdev = tf.sqrt(
+                tf.math.reduce_variance(
+                    centered, axis=1, keepdims=True
+                )
+                + tf.cast(self.epsilon, inputs.dtype)
+            )
+            return centered / stdev, mean, stdev
+
+        def get_config(self) -> dict[str, Any]:
+            return {**super().get_config(), "epsilon": self.epsilon}
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetCircularConv1D(keras.layers.Layer):
+        """Keras equivalent of the official circular Conv1d token embedding."""
+
+        def __init__(
+            self,
+            filters: int,
+            kernel_size: int = 3,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            if int(kernel_size) % 2 != 1:
+                raise ValueError("TimesNet circular kernel_size必须为奇数")
+            self.filters = int(filters)
+            self.kernel_size = int(kernel_size)
+            self.conv = keras.layers.Conv1D(
+                filters=self.filters,
+                kernel_size=self.kernel_size,
+                padding="valid",
+                use_bias=False,
+                kernel_initializer=keras.initializers.VarianceScaling(
+                    scale=2.0,
+                    mode="fan_in",
+                    distribution="untruncated_normal",
+                ),
+                name="token_conv",
+            )
+
+        def call(self, inputs: Any) -> Any:
+            radius = self.kernel_size // 2
+            if radius == 0:
+                padded = inputs
+            else:
+                padded = tf.concat(
+                    [inputs[:, -radius:, :], inputs, inputs[:, :radius, :]],
+                    axis=1,
+                )
+            return self.conv(padded)
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "filters": self.filters,
+                "kernel_size": self.kernel_size,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetDataEmbedding(keras.layers.Layer):
+        """Token convolution plus fixed sinusoidal position encoding."""
+
+        def __init__(
+            self,
+            d_model: int,
+            dropout: float = 0.1,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.d_model = int(d_model)
+            self.dropout_rate = float(dropout)
+            self.value_embedding = TimesNetCircularConv1D(
+                filters=self.d_model,
+                kernel_size=3,
+                name="circular_value_embedding",
+            )
+            self.dropout = keras.layers.Dropout(
+                self.dropout_rate, name="embedding_dropout"
+            )
+
+        def call(
+            self,
+            inputs: Any,
+            training: bool | None = None,
+        ) -> Any:
+            values = self.value_embedding(inputs)
+            dtype = values.dtype
+            positions = tf.cast(
+                tf.range(tf.shape(values)[1])[:, None], dtype
+            )
+            dimensions = tf.range(self.d_model)[None, :]
+            paired_dimensions = 2 * tf.math.floordiv(dimensions, 2)
+            rates = tf.pow(
+                tf.cast(10_000.0, dtype),
+                -tf.cast(paired_dimensions, dtype)
+                / tf.cast(self.d_model, dtype),
+            )
+            angles = positions * rates
+            encoding = tf.where(
+                tf.equal(tf.math.floormod(dimensions, 2), 0),
+                tf.sin(angles),
+                tf.cos(angles),
+            )
+            return self.dropout(
+                values + encoding[None, :, :],
+                training=training,
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "d_model": self.d_model,
+                "dropout": self.dropout_rate,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetInceptionBlockV1(keras.layers.Layer):
+        """Six averaged square-kernel Conv2D branches from official TimesNet."""
+
+        def __init__(
+            self,
+            out_channels: int,
+            num_kernels: int = 6,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.out_channels = int(out_channels)
+            self.num_kernels = int(num_kernels)
+            self.kernels = [
+                keras.layers.Conv2D(
+                    filters=self.out_channels,
+                    kernel_size=2 * index + 1,
+                    padding="same",
+                    use_bias=True,
+                    kernel_initializer=keras.initializers.VarianceScaling(
+                        scale=2.0,
+                        mode="fan_out",
+                        distribution="untruncated_normal",
+                    ),
+                    bias_initializer="zeros",
+                    name=f"kernel_{2 * index + 1}x{2 * index + 1}",
+                )
+                for index in range(self.num_kernels)
+            ]
+
+        def call(self, inputs: Any) -> Any:
+            branches = [kernel(inputs) for kernel in self.kernels]
+            return tf.add_n(branches) / tf.cast(
+                self.num_kernels, inputs.dtype
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "out_channels": self.out_channels,
+                "num_kernels": self.num_kernels,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetBlock(keras.layers.Layer):
+        """FFT-discovered temporal 2D variation block with adaptive fusion."""
+
+        def __init__(
+            self,
+            d_model: int,
+            d_ff: int,
+            top_k: int = 5,
+            num_kernels: int = 6,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.d_model = int(d_model)
+            self.d_ff = int(d_ff)
+            self.top_k = int(top_k)
+            self.num_kernels = int(num_kernels)
+            self.expand = TimesNetInceptionBlockV1(
+                out_channels=self.d_ff,
+                num_kernels=self.num_kernels,
+                name="inception_expand",
+            )
+            self.activation = keras.layers.Activation(
+                keras.activations.gelu, name="gelu"
+            )
+            self.project = TimesNetInceptionBlockV1(
+                out_channels=self.d_model,
+                num_kernels=self.num_kernels,
+                name="inception_project",
+            )
+
+        def call(self, inputs: Any) -> Any:
+            # tf.signal.rfft works on the last axis, so [B,T,C] -> [B,C,F].
+            spectrum = tf.signal.rfft(tf.transpose(inputs, [0, 2, 1]))
+            amplitude = tf.abs(spectrum)
+            global_amplitude = tf.reduce_mean(amplitude, axis=[0, 1])
+            # Official code sets DC to zero.  -inf preserves the intent while
+            # preventing an all-flat batch from selecting index 0 and dividing
+            # by zero when converting frequency into period.
+            global_amplitude = tf.concat(
+                [
+                    tf.fill(
+                        [1],
+                        tf.cast(-float("inf"), global_amplitude.dtype),
+                    ),
+                    global_amplitude[1:],
+                ],
+                axis=0,
+            )
+            _, frequency_indices = tf.math.top_k(
+                global_amplitude, k=self.top_k, sorted=True
+            )
+            frequency_indices = tf.stop_gradient(frequency_indices)
+            total_length = tf.shape(inputs)[1]
+            periods = tf.math.floordiv(total_length, frequency_indices)
+            batch = tf.shape(inputs)[0]
+            channels = tf.shape(inputs)[2]
+            periodic_outputs = []
+            for index in range(self.top_k):
+                period = periods[index]
+                padded_length = (
+                    tf.math.floordiv(total_length + period - 1, period)
+                    * period
+                )
+                padding_length = padded_length - total_length
+                padded = tf.pad(
+                    inputs,
+                    tf.stack(
+                        [
+                            tf.constant([0, 0], dtype=tf.int32),
+                            tf.stack(
+                                [
+                                    tf.constant(0, dtype=tf.int32),
+                                    padding_length,
+                                ]
+                            ),
+                            tf.constant([0, 0], dtype=tf.int32),
+                        ]
+                    ),
+                )
+                two_dimensional = tf.reshape(
+                    padded,
+                    tf.stack(
+                        [
+                            batch,
+                            tf.math.floordiv(padded_length, period),
+                            period,
+                            channels,
+                        ]
+                    ),
+                )
+                two_dimensional.set_shape(
+                    (None, None, None, self.d_model)
+                )
+                convolved = self.project(
+                    self.activation(self.expand(two_dimensional))
+                )
+                restored = tf.reshape(
+                    convolved,
+                    tf.stack([batch, padded_length, channels]),
+                )
+                restored.set_shape((None, None, self.d_model))
+                periodic_outputs.append(restored[:, :total_length, :])
+            stacked = tf.stack(periodic_outputs, axis=-1)
+            sample_amplitude = tf.reduce_mean(amplitude, axis=1)
+            period_weights = tf.nn.softmax(
+                tf.gather(
+                    sample_amplitude,
+                    frequency_indices,
+                    axis=1,
+                ),
+                axis=1,
+            )
+            period_weights = period_weights[:, None, None, :]
+            return (
+                tf.reduce_sum(stacked * period_weights, axis=-1)
+                + inputs
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "d_model": self.d_model,
+                "d_ff": self.d_ff,
+                "top_k": self.top_k,
+                "num_kernels": self.num_kernels,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimesNet")
+    class TimesNetTargetHead(keras.layers.Layer):
+        """Return the last 16 target steps after official de-normalization."""
+
+        def __init__(
+            self,
+            forecast_len: int,
+            target_index: int,
+            power_scale_ratio: float,
+            power_scale_offset: float,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.forecast_len = int(forecast_len)
+            self.target_index = int(target_index)
+            self.power_scale_ratio = float(power_scale_ratio)
+            self.power_scale_offset = float(power_scale_offset)
+
+        def call(self, inputs: list[Any] | tuple[Any, ...]) -> Any:
+            forecasts, mean, stdev = inputs
+            target_normalized = forecasts[
+                :, -self.forecast_len :, self.target_index
+            ]
+            target_x_scaled = (
+                target_normalized * stdev[:, :, self.target_index]
+                + mean[:, :, self.target_index]
+            )
+            return (
+                target_x_scaled
+                * tf.cast(self.power_scale_ratio, target_x_scaled.dtype)
+                + tf.cast(self.power_scale_offset, target_x_scaled.dtype)
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "forecast_len": self.forecast_len,
+                "target_index": self.target_index,
+                "power_scale_ratio": self.power_scale_ratio,
+                "power_scale_offset": self.power_scale_offset,
+            }
+
+    _TIMESNET_LAYER_CLASSES = {
+        "TimesNetInstanceNormalization": TimesNetInstanceNormalization,
+        "TimesNetCircularConv1D": TimesNetCircularConv1D,
+        "TimesNetDataEmbedding": TimesNetDataEmbedding,
+        "TimesNetInceptionBlockV1": TimesNetInceptionBlockV1,
+        "TimesNetBlock": TimesNetBlock,
+        "TimesNetTargetHead": TimesNetTargetHead,
+    }
+    return _TIMESNET_LAYER_CLASSES
+
+
+def get_timesnet_custom_objects() -> dict[str, Any]:
+    """Custom-object map required to reload Round-3 TimesNet models."""
+    classes = get_timesnet_layer_classes()
+    result: dict[str, Any] = {}
+    for name, layer_class in classes.items():
+        result[name] = layer_class
+        result[f"Round3TimesNet>{name}"] = layer_class
+    return result
+
+
+def build_timesnet_model(
+    prepared: dict[str, Any],
+    keras: Any,
+) -> Any:
+    """Official TimesNet forecasting flow adapted to 96→16 wind power."""
+    classes = get_timesnet_layer_classes()
+    inputs = keras.layers.Input(
+        shape=(HISTORY_LEN, INPUT_DIM), name="history_features"
+    )
+    normalized, window_mean, window_stdev = classes[
+        "TimesNetInstanceNormalization"
+    ](
+        epsilon=TIMESNET_NORM_EPSILON,
+        name="instance_normalization",
+    )(inputs)
+    embedded = classes["TimesNetDataEmbedding"](
+        d_model=TIMESNET_D_MODEL,
+        dropout=TIMESNET_DROPOUT,
+        name="data_embedding",
+    )(normalized)
+    # Official forecast head first expands the latent temporal dimension from
+    # seq_len to seq_len+pred_len; TimesBlocks therefore process 112 positions.
+    aligned = keras.layers.Permute(
+        (2, 1), name="latent_time_to_last_axis"
+    )(embedded)
+    aligned = keras.layers.Dense(
+        HISTORY_LEN + FORECAST_LEN,
+        name="temporal_alignment",
+    )(aligned)
+    encoded = keras.layers.Permute(
+        (2, 1), name="restore_latent_time_axis"
+    )(aligned)
+    shared_norm = keras.layers.LayerNormalization(
+        epsilon=TIMESNET_NORM_EPSILON,
+        name="shared_timesblock_norm",
+    )
+    for index in range(TIMESNET_ENCODER_LAYERS):
+        encoded = classes["TimesNetBlock"](
+            d_model=TIMESNET_D_MODEL,
+            d_ff=TIMESNET_D_FF,
+            top_k=TIMESNET_TOP_K,
+            num_kernels=TIMESNET_NUM_KERNELS,
+            name=f"times_block_{index + 1}",
+        )(encoded)
+        encoded = shared_norm(encoded)
+    all_variate_forecasts = keras.layers.Dense(
+        INPUT_DIM, name="all_variate_projection"
+    )(encoded)
+    forecast_power = classes["TimesNetTargetHead"](
+        forecast_len=FORECAST_LEN,
+        target_index=TARGET_INDEX,
+        power_scale_ratio=prepared["power_scale_ratio"],
+        power_scale_offset=prepared["power_scale_offset"],
+        name="forecast_power",
+    )([all_variate_forecasts, window_mean, window_stdev])
+    return keras.Model(
+        inputs=inputs,
+        outputs=forecast_power,
+        name="Round3_TimesNet_96to16",
+    )
+
+
+def get_timemixer_layer_classes() -> dict[str, Any]:
+    """Create serializable Keras TimeMixer layers without parent-side TF import."""
+    global _TIMEMIXER_LAYER_CLASSES
+    if _TIMEMIXER_LAYER_CLASSES is not None:
+        return _TIMEMIXER_LAYER_CLASSES
+
+    import tensorflow as tf
+    from tensorflow import keras
+
+    @keras.utils.register_keras_serializable(package="Round3TimeMixer")
+    class TimeMixerReversibleNormalization(keras.layers.Layer):
+        """Official per-scale Normalize/RevIN with detached statistics."""
+
+        def __init__(
+            self,
+            num_features: int,
+            epsilon: float = 1e-5,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.num_features = int(num_features)
+            self.epsilon = float(epsilon)
+
+        def build(self, input_shape: Any) -> None:
+            if int(input_shape[-1]) != self.num_features:
+                raise ValueError(
+                    "TimeMixer Normalize输入变量数漂移: "
+                    f"{input_shape[-1]} != {self.num_features}"
+                )
+            self.affine_weight = self.add_weight(
+                name="affine_weight",
+                shape=(self.num_features,),
+                initializer="ones",
+                trainable=True,
+            )
+            self.affine_bias = self.add_weight(
+                name="affine_bias",
+                shape=(self.num_features,),
+                initializer="zeros",
+                trainable=True,
+            )
+            super().build(input_shape)
+
+        def call(self, inputs: Any) -> tuple[Any, Any, Any]:
+            mean = tf.stop_gradient(
+                tf.reduce_mean(inputs, axis=1, keepdims=True)
+            )
+            centered = inputs - mean
+            stdev = tf.stop_gradient(
+                tf.sqrt(
+                    tf.math.reduce_variance(
+                        centered, axis=1, keepdims=True
+                    )
+                    + tf.cast(self.epsilon, inputs.dtype)
+                )
+            )
+            normalized = centered / stdev
+            normalized = (
+                normalized
+                * tf.cast(self.affine_weight, normalized.dtype)
+                + tf.cast(self.affine_bias, normalized.dtype)
+            )
+            return normalized, mean, stdev
+
+        def denormalize(self, inputs: Any, mean: Any, stdev: Any) -> Any:
+            restored = inputs - tf.cast(self.affine_bias, inputs.dtype)
+            restored = restored / (
+                tf.cast(self.affine_weight, inputs.dtype)
+                + tf.cast(self.epsilon * self.epsilon, inputs.dtype)
+            )
+            return restored * stdev + mean
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "num_features": self.num_features,
+                "epsilon": self.epsilon,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimeMixer")
+    class TimeMixerCircularConv1D(keras.layers.Layer):
+        """Keras equivalent of TimeMixer's circular Conv1d token embedding."""
+
+        def __init__(
+            self,
+            filters: int,
+            kernel_size: int = 3,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            if int(kernel_size) % 2 != 1:
+                raise ValueError("TimeMixer circular kernel_size必须为奇数")
+            self.filters = int(filters)
+            self.kernel_size = int(kernel_size)
+            self.conv = keras.layers.Conv1D(
+                filters=self.filters,
+                kernel_size=self.kernel_size,
+                padding="valid",
+                use_bias=False,
+                kernel_initializer=keras.initializers.VarianceScaling(
+                    scale=2.0,
+                    mode="fan_in",
+                    distribution="untruncated_normal",
+                ),
+                name="token_conv",
+            )
+
+        def call(self, inputs: Any) -> Any:
+            radius = self.kernel_size // 2
+            if radius == 0:
+                padded = inputs
+            else:
+                padded = tf.concat(
+                    [inputs[:, -radius:, :], inputs, inputs[:, :radius, :]],
+                    axis=1,
+                )
+            return self.conv(padded)
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "filters": self.filters,
+                "kernel_size": self.kernel_size,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimeMixer")
+    class TimeMixerDataEmbeddingWithoutPosition(keras.layers.Layer):
+        """Shared value embedding used by official DataEmbedding_wo_pos."""
+
+        def __init__(
+            self,
+            d_model: int,
+            dropout: float,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.d_model = int(d_model)
+            self.dropout_rate = float(dropout)
+            self.value_embedding = TimeMixerCircularConv1D(
+                filters=self.d_model,
+                kernel_size=3,
+                name="circular_value_embedding",
+            )
+            self.dropout = keras.layers.Dropout(
+                self.dropout_rate, name="embedding_dropout"
+            )
+
+        def call(
+            self,
+            inputs: Any,
+            training: bool | None = None,
+        ) -> Any:
+            return self.dropout(
+                self.value_embedding(inputs), training=training
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "d_model": self.d_model,
+                "dropout": self.dropout_rate,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimeMixer")
+    class TimeMixerPastDecomposableMixing(keras.layers.Layer):
+        """PDM: seasonal bottom-up and trend top-down multiscale mixing."""
+
+        def __init__(
+            self,
+            scale_lengths: tuple[int, ...] | list[int],
+            d_model: int,
+            d_ff: int,
+            moving_average: int,
+            dropout: float,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.scale_lengths = tuple(int(value) for value in scale_lengths)
+            self.d_model = int(d_model)
+            self.d_ff = int(d_ff)
+            self.moving_average = int(moving_average)
+            self.dropout_rate = float(dropout)
+            if self.moving_average % 2 != 1:
+                raise ValueError("TimeMixer moving_average必须为奇数")
+            if len(self.scale_lengths) < 2:
+                raise ValueError("TimeMixer至少需要两个时间尺度")
+            self.season_down_sampling_layers = []
+            for index in range(len(self.scale_lengths) - 1):
+                next_length = self.scale_lengths[index + 1]
+                self.season_down_sampling_layers.append(
+                    keras.Sequential(
+                        [
+                            keras.layers.Dense(next_length),
+                            keras.layers.Activation(
+                                keras.activations.gelu
+                            ),
+                            keras.layers.Dense(next_length),
+                        ],
+                        name=f"season_fine_to_coarse_{index + 1}",
+                    )
+                )
+            self.trend_up_sampling_layers = []
+            for index in reversed(range(len(self.scale_lengths) - 1)):
+                fine_length = self.scale_lengths[index]
+                self.trend_up_sampling_layers.append(
+                    keras.Sequential(
+                        [
+                            keras.layers.Dense(fine_length),
+                            keras.layers.Activation(
+                                keras.activations.gelu
+                            ),
+                            keras.layers.Dense(fine_length),
+                        ],
+                        name=(
+                            "trend_coarse_to_fine_"
+                            f"{len(self.scale_lengths) - index - 1}"
+                        ),
+                    )
+                )
+            self.out_cross_layer = keras.Sequential(
+                [
+                    keras.layers.Dense(self.d_ff),
+                    keras.layers.Activation(keras.activations.gelu),
+                    keras.layers.Dense(self.d_model),
+                ],
+                name="channel_independent_out_cross",
+            )
+            # These modules are registered in the official PDM class although
+            # its forward() does not invoke them.  Building the LayerNorm keeps
+            # the upstream module/state structure and parameter accounting.
+            self.official_registered_layer_norm = (
+                keras.layers.LayerNormalization(
+                    epsilon=1e-5,
+                    name="official_registered_layer_norm",
+                )
+            )
+            self.official_registered_dropout = keras.layers.Dropout(
+                self.dropout_rate,
+                name="official_registered_dropout",
+            )
+
+        def build(self, input_shape: Any) -> None:
+            self.official_registered_layer_norm.build(
+                (None, None, self.d_model)
+            )
+            super().build(input_shape)
+
+        def _decompose(self, inputs: Any) -> tuple[Any, Any]:
+            radius = (self.moving_average - 1) // 2
+            padded = tf.concat(
+                [
+                    tf.repeat(inputs[:, :1, :], radius, axis=1),
+                    inputs,
+                    tf.repeat(inputs[:, -1:, :], radius, axis=1),
+                ],
+                axis=1,
+            )
+            trend = tf.nn.avg_pool1d(
+                padded,
+                ksize=self.moving_average,
+                strides=1,
+                padding="VALID",
+            )
+            return inputs - trend, trend
+
+        def call(
+            self,
+            inputs: list[Any] | tuple[Any, ...],
+            training: bool | None = None,
+        ) -> list[Any]:
+            if len(inputs) != len(self.scale_lengths):
+                raise ValueError("TimeMixer PDM输入尺度数漂移")
+            season_list = []
+            trend_list = []
+            for scale in inputs:
+                season, trend = self._decompose(scale)
+                season_list.append(tf.transpose(season, [0, 2, 1]))
+                trend_list.append(tf.transpose(trend, [0, 2, 1]))
+
+            out_high = season_list[0]
+            out_low = season_list[1]
+            mixed_seasons = [tf.transpose(out_high, [0, 2, 1])]
+            for index, down_layer in enumerate(
+                self.season_down_sampling_layers
+            ):
+                out_low = out_low + down_layer(
+                    out_high, training=training
+                )
+                out_high = out_low
+                if index + 2 <= len(season_list) - 1:
+                    out_low = season_list[index + 2]
+                mixed_seasons.append(tf.transpose(out_high, [0, 2, 1]))
+
+            reversed_trends = list(reversed(trend_list))
+            out_low = reversed_trends[0]
+            out_high = reversed_trends[1]
+            mixed_trends_reversed = [tf.transpose(out_low, [0, 2, 1])]
+            for index, up_layer in enumerate(
+                self.trend_up_sampling_layers
+            ):
+                out_high = out_high + up_layer(
+                    out_low, training=training
+                )
+                out_low = out_high
+                if index + 2 <= len(reversed_trends) - 1:
+                    out_high = reversed_trends[index + 2]
+                mixed_trends_reversed.append(
+                    tf.transpose(out_low, [0, 2, 1])
+                )
+            mixed_trends = list(reversed(mixed_trends_reversed))
+
+            outputs = []
+            for original, season, trend, length in zip(
+                inputs,
+                mixed_seasons,
+                mixed_trends,
+                self.scale_lengths,
+            ):
+                mixed = season + trend
+                # channel_independence=1 branch in the official PDM.
+                mixed = original + self.out_cross_layer(
+                    mixed, training=training
+                )
+                outputs.append(mixed[:, :length, :])
+            return outputs
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "scale_lengths": list(self.scale_lengths),
+                "d_model": self.d_model,
+                "d_ff": self.d_ff,
+                "moving_average": self.moving_average,
+                "dropout": self.dropout_rate,
+            }
+
+    @keras.utils.register_keras_serializable(package="Round3TimeMixer")
+    class TimeMixerForecastCore(keras.layers.Layer):
+        """Original TimeMixer PDM+FMM flow adapted to the fixed wind schema."""
+
+        def __init__(
+            self,
+            history_len: int,
+            forecast_len: int,
+            num_features: int,
+            target_index: int,
+            d_model: int,
+            d_ff: int,
+            pdm_layers: int,
+            downsampling_layers: int,
+            downsampling_window: int,
+            moving_average: int,
+            dropout: float,
+            norm_epsilon: float,
+            power_scale_ratio: float,
+            power_scale_offset: float,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.history_len = int(history_len)
+            self.forecast_len = int(forecast_len)
+            self.num_features = int(num_features)
+            self.target_index = int(target_index)
+            self.d_model = int(d_model)
+            self.d_ff = int(d_ff)
+            self.pdm_layers = int(pdm_layers)
+            self.downsampling_layers = int(downsampling_layers)
+            self.downsampling_window = int(downsampling_window)
+            self.moving_average = int(moving_average)
+            self.dropout_rate = float(dropout)
+            self.norm_epsilon = float(norm_epsilon)
+            self.power_scale_ratio = float(power_scale_ratio)
+            self.power_scale_offset = float(power_scale_offset)
+            self.scale_lengths = tuple(
+                self.history_len // (self.downsampling_window**level)
+                for level in range(self.downsampling_layers + 1)
+            )
+            if self.scale_lengths != TIMEMIXER_SCALE_LENGTHS:
+                raise ValueError(
+                    f"TimeMixer时间尺度漂移: {self.scale_lengths}"
+                )
+            self.normalize_layers = [
+                TimeMixerReversibleNormalization(
+                    num_features=self.num_features,
+                    epsilon=self.norm_epsilon,
+                    name=f"scale_{index}_normalization",
+                )
+                for index in range(self.downsampling_layers + 1)
+            ]
+            self.embedding = TimeMixerDataEmbeddingWithoutPosition(
+                d_model=self.d_model,
+                dropout=self.dropout_rate,
+                name="shared_data_embedding_without_position",
+            )
+            self.pdm_blocks = [
+                TimeMixerPastDecomposableMixing(
+                    scale_lengths=self.scale_lengths,
+                    d_model=self.d_model,
+                    d_ff=self.d_ff,
+                    moving_average=self.moving_average,
+                    dropout=self.dropout_rate,
+                    name=f"past_decomposable_mixing_{index + 1}",
+                )
+                for index in range(self.pdm_layers)
+            ]
+            self.predict_layers = [
+                keras.layers.Dense(
+                    self.forecast_len,
+                    name=f"scale_{index}_future_predictor",
+                )
+                for index in range(self.downsampling_layers + 1)
+            ]
+            self.projection_layer = keras.layers.Dense(
+                1, name="shared_channel_independent_projection"
+            )
+
+        def call(
+            self,
+            inputs: Any,
+            training: bool | None = None,
+        ) -> Any:
+            batch = tf.shape(inputs)[0]
+            raw_scales = [inputs]
+            current = inputs
+            for _ in range(self.downsampling_layers):
+                current = tf.nn.avg_pool1d(
+                    current,
+                    ksize=self.downsampling_window,
+                    strides=self.downsampling_window,
+                    padding="VALID",
+                )
+                raw_scales.append(current)
+
+            embedded_scales = []
+            scale_zero_mean = scale_zero_stdev = None
+            for index, (raw_scale, normalizer, length) in enumerate(
+                zip(
+                    raw_scales,
+                    self.normalize_layers,
+                    self.scale_lengths,
+                )
+            ):
+                normalized, mean, stdev = normalizer(raw_scale)
+                if index == 0:
+                    scale_zero_mean, scale_zero_stdev = mean, stdev
+                channel_independent = tf.reshape(
+                    tf.transpose(normalized, [0, 2, 1]),
+                    [-1, length, 1],
+                )
+                channel_independent.set_shape((None, length, 1))
+                embedded_scales.append(
+                    self.embedding(
+                        channel_independent, training=training
+                    )
+                )
+
+            encoded_scales = embedded_scales
+            for pdm_block in self.pdm_blocks:
+                encoded_scales = pdm_block(
+                    encoded_scales, training=training
+                )
+
+            scale_predictions = []
+            for encoded, predictor in zip(
+                encoded_scales, self.predict_layers
+            ):
+                aligned = predictor(
+                    tf.transpose(encoded, [0, 2, 1])
+                )
+                aligned = tf.transpose(aligned, [0, 2, 1])
+                projected = self.projection_layer(aligned)
+                projected = tf.reshape(
+                    projected,
+                    [
+                        batch,
+                        self.num_features,
+                        self.forecast_len,
+                    ],
+                )
+                scale_predictions.append(
+                    tf.transpose(projected, [0, 2, 1])
+                )
+            all_variate_forecasts = tf.add_n(scale_predictions)
+            restored = self.normalize_layers[0].denormalize(
+                all_variate_forecasts,
+                scale_zero_mean,
+                scale_zero_stdev,
+            )
+            target_x_scaled = restored[:, :, self.target_index]
+            forecast_power = (
+                target_x_scaled
+                * tf.cast(self.power_scale_ratio, target_x_scaled.dtype)
+                + tf.cast(self.power_scale_offset, target_x_scaled.dtype)
+            )
+            forecast_power.set_shape((None, self.forecast_len))
+            return forecast_power
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "history_len": self.history_len,
+                "forecast_len": self.forecast_len,
+                "num_features": self.num_features,
+                "target_index": self.target_index,
+                "d_model": self.d_model,
+                "d_ff": self.d_ff,
+                "pdm_layers": self.pdm_layers,
+                "downsampling_layers": self.downsampling_layers,
+                "downsampling_window": self.downsampling_window,
+                "moving_average": self.moving_average,
+                "dropout": self.dropout_rate,
+                "norm_epsilon": self.norm_epsilon,
+                "power_scale_ratio": self.power_scale_ratio,
+                "power_scale_offset": self.power_scale_offset,
+            }
+
+    _TIMEMIXER_LAYER_CLASSES = {
+        "TimeMixerReversibleNormalization": (
+            TimeMixerReversibleNormalization
+        ),
+        "TimeMixerCircularConv1D": TimeMixerCircularConv1D,
+        "TimeMixerDataEmbeddingWithoutPosition": (
+            TimeMixerDataEmbeddingWithoutPosition
+        ),
+        "TimeMixerPastDecomposableMixing": (
+            TimeMixerPastDecomposableMixing
+        ),
+        "TimeMixerForecastCore": TimeMixerForecastCore,
+    }
+    return _TIMEMIXER_LAYER_CLASSES
+
+
+def get_timemixer_custom_objects() -> dict[str, Any]:
+    """Custom-object map required to reload Round-3 TimeMixer models."""
+    classes = get_timemixer_layer_classes()
+    result: dict[str, Any] = {}
+    for name, layer_class in classes.items():
+        result[name] = layer_class
+        result[f"Round3TimeMixer>{name}"] = layer_class
+    return result
+
+
+def build_timemixer_model(
+    prepared: dict[str, Any],
+    keras: Any,
+) -> Any:
+    """Original TimeMixer forecasting flow adapted to 96→16 wind power."""
+    classes = get_timemixer_layer_classes()
+    inputs = keras.layers.Input(
+        shape=(HISTORY_LEN, INPUT_DIM), name="history_features"
+    )
+    forecast_power = classes["TimeMixerForecastCore"](
+        history_len=HISTORY_LEN,
+        forecast_len=FORECAST_LEN,
+        num_features=INPUT_DIM,
+        target_index=TARGET_INDEX,
+        d_model=TIMEMIXER_D_MODEL,
+        d_ff=TIMEMIXER_D_FF,
+        pdm_layers=TIMEMIXER_PDM_LAYERS,
+        downsampling_layers=TIMEMIXER_DOWNSAMPLING_LAYERS,
+        downsampling_window=TIMEMIXER_DOWNSAMPLING_WINDOW,
+        moving_average=TIMEMIXER_MOVING_AVERAGE,
+        dropout=TIMEMIXER_DROPOUT,
+        norm_epsilon=TIMEMIXER_NORM_EPSILON,
+        power_scale_ratio=prepared["power_scale_ratio"],
+        power_scale_offset=prepared["power_scale_offset"],
+        name="forecast_power",
+    )(inputs)
+    return keras.Model(
+        inputs=inputs,
+        outputs=forecast_power,
+        name="Round3_TimeMixer_96to16",
+    )
+
+
+def get_dlinear_layer_classes() -> dict[str, Any]:
+    """Build serializable Keras layers faithful to the official DLinear."""
+    global _DLINEAR_LAYER_CLASSES
+    if _DLINEAR_LAYER_CLASSES is not None:
+        return _DLINEAR_LAYER_CLASSES
+
+    import tensorflow as tf
+    from tensorflow import keras
+
+    @keras.utils.register_keras_serializable(package="Round3DLinear")
+    class DLinearSeriesDecomposition(keras.layers.Layer):
+        """Endpoint-replicated moving average plus seasonal remainder."""
+
+        def __init__(self, kernel_size: int = 25, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.kernel_size = int(kernel_size)
+            if self.kernel_size <= 0 or self.kernel_size % 2 != 1:
+                raise ValueError("DLinear moving-average kernel must be positive odd")
+
+        def call(self, inputs: Any) -> tuple[Any, Any]:
+            pad = (self.kernel_size - 1) // 2
+            front = tf.repeat(inputs[:, :1, :], repeats=pad, axis=1)
+            end = tf.repeat(inputs[:, -1:, :], repeats=pad, axis=1)
+            padded = tf.concat([front, inputs, end], axis=1)
+            trend = tf.nn.avg_pool1d(
+                padded,
+                ksize=self.kernel_size,
+                strides=1,
+                padding="VALID",
+                data_format="NWC",
+            )
+            seasonal = inputs - trend
+            return seasonal, trend
+
+        def get_config(self) -> dict[str, Any]:
+            return {**super().get_config(), "kernel_size": self.kernel_size}
+
+    @keras.utils.register_keras_serializable(package="Round3DLinear")
+    class DLinearForecastCore(keras.layers.Layer):
+        """Direct 96→16 seasonal/trend linear forecast on every variate."""
+
+        def __init__(
+            self,
+            history_len: int,
+            forecast_len: int,
+            num_features: int,
+            target_index: int,
+            moving_average: int = 25,
+            individual: bool = False,
+            power_scale_ratio: float = 1.0,
+            power_scale_offset: float = 0.0,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(**kwargs)
+            self.history_len = int(history_len)
+            self.forecast_len = int(forecast_len)
+            self.num_features = int(num_features)
+            self.target_index = int(target_index)
+            self.moving_average = int(moving_average)
+            self.individual = bool(individual)
+            self.power_scale_ratio = float(power_scale_ratio)
+            self.power_scale_offset = float(power_scale_offset)
+            self.decomposition = DLinearSeriesDecomposition(
+                kernel_size=self.moving_average,
+                name="series_decomposition",
+            )
+            # PyTorch nn.Linear defaults to U(-1/sqrt(in), +1/sqrt(in)) for
+            # both kernel and bias.  The official optional 1/L initializer is
+            # commented out, so it must not be activated here.
+            bound = float(1.0 / np.sqrt(self.history_len))
+
+            def make_linear(name: str) -> Any:
+                # Use fresh initializer instances so the two official heads do
+                # not accidentally receive identical Keras draws.
+                return keras.layers.Dense(
+                    self.forecast_len,
+                    kernel_initializer=keras.initializers.RandomUniform(
+                        -bound, bound
+                    ),
+                    bias_initializer=keras.initializers.RandomUniform(
+                        -bound, bound
+                    ),
+                    name=name,
+                )
+
+            if self.individual:
+                self.seasonal_linears = [
+                    make_linear(f"seasonal_linear_{index}")
+                    for index in range(self.num_features)
+                ]
+                self.trend_linears = [
+                    make_linear(f"trend_linear_{index}")
+                    for index in range(self.num_features)
+                ]
+                self.seasonal_linear = None
+                self.trend_linear = None
+            else:
+                self.seasonal_linears = []
+                self.trend_linears = []
+                self.seasonal_linear = make_linear("seasonal_linear")
+                self.trend_linear = make_linear("trend_linear")
+
+        def call(self, inputs: Any) -> Any:
+            seasonal, trend = self.decomposition(inputs)
+            seasonal = tf.transpose(seasonal, [0, 2, 1])
+            trend = tf.transpose(trend, [0, 2, 1])
+            if self.individual:
+                seasonal_forecast = tf.stack(
+                    [
+                        layer(seasonal[:, index, :])
+                        for index, layer in enumerate(self.seasonal_linears)
+                    ],
+                    axis=1,
+                )
+                trend_forecast = tf.stack(
+                    [
+                        layer(trend[:, index, :])
+                        for index, layer in enumerate(self.trend_linears)
+                    ],
+                    axis=1,
+                )
+            else:
+                assert self.seasonal_linear is not None
+                assert self.trend_linear is not None
+                seasonal_forecast = self.seasonal_linear(seasonal)
+                trend_forecast = self.trend_linear(trend)
+            all_variate_forecast = tf.transpose(
+                seasonal_forecast + trend_forecast,
+                [0, 2, 1],
+            )
+            target = all_variate_forecast[:, :, self.target_index]
+            return (
+                target * tf.cast(self.power_scale_ratio, target.dtype)
+                + tf.cast(self.power_scale_offset, target.dtype)
+            )
+
+        def get_config(self) -> dict[str, Any]:
+            return {
+                **super().get_config(),
+                "history_len": self.history_len,
+                "forecast_len": self.forecast_len,
+                "num_features": self.num_features,
+                "target_index": self.target_index,
+                "moving_average": self.moving_average,
+                "individual": self.individual,
+                "power_scale_ratio": self.power_scale_ratio,
+                "power_scale_offset": self.power_scale_offset,
+            }
+
+    _DLINEAR_LAYER_CLASSES = {
+        "DLinearSeriesDecomposition": DLinearSeriesDecomposition,
+        "DLinearForecastCore": DLinearForecastCore,
+    }
+    return _DLINEAR_LAYER_CLASSES
+
+
+def get_dlinear_custom_objects() -> dict[str, Any]:
+    """Custom-object map required to reload Round-3 DLinear models."""
+    classes = get_dlinear_layer_classes()
+    result: dict[str, Any] = {}
+    for name, layer_class in classes.items():
+        result[name] = layer_class
+        result[f"Round3DLinear>{name}"] = layer_class
+    return result
+
+
+def build_dlinear_model(
+    prepared: dict[str, Any],
+    keras: Any,
+) -> Any:
+    """Official shared-head DLinear adapted to a 96→16 wind-power MS task."""
+    classes = get_dlinear_layer_classes()
+    inputs = keras.layers.Input(
+        shape=(HISTORY_LEN, INPUT_DIM), name="history_features"
+    )
+    forecast_power = classes["DLinearForecastCore"](
+        history_len=HISTORY_LEN,
+        forecast_len=FORECAST_LEN,
+        num_features=INPUT_DIM,
+        target_index=TARGET_INDEX,
+        moving_average=DLINEAR_MOVING_AVERAGE,
+        individual=DLINEAR_INDIVIDUAL,
+        power_scale_ratio=prepared["power_scale_ratio"],
+        power_scale_offset=prepared["power_scale_offset"],
+        name="forecast_power",
+    )(inputs)
+    return keras.Model(
+        inputs=inputs,
+        outputs=forecast_power,
+        name="Round3_DLinear_96to16",
+    )
+
+
 def configure_worker_environment() -> tuple[Any, Any]:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
@@ -829,6 +3656,30 @@ def build_model(
             power_scale_ratio=prepared["power_scale_ratio"],
             power_scale_offset=prepared["power_scale_offset"],
         )
+    if model_id == "itransformer":
+        # Keras reimplementation of thuml/iTransformer.  The model remains a
+        # pure encoder-only variate-token baseline; no WindPRISM residual,
+        # Persistence candidate or regime gate is introduced.
+        keras.utils.set_random_seed(RANDOM_SEED)
+        return build_itransformer_model(prepared, keras)
+    if model_id == "timesnet":
+        # Keras reimplementation of thuml/Time-Series-Library TimesNet.  It
+        # retains dynamic FFT period discovery and temporal 2D variation
+        # modeling without adding WindPRISM-specific candidates or routing.
+        keras.utils.set_random_seed(RANDOM_SEED)
+        return build_timesnet_model(prepared, keras)
+    if model_id == "timemixer":
+        # Keras reimplementation of kwuking/TimeMixer.  It retains the
+        # original channel-independent PDM and summed multiscale FMM path,
+        # without adding WindPRISM candidates, residuals or regime routing.
+        keras.utils.set_random_seed(RANDOM_SEED)
+        return build_timemixer_model(prepared, keras)
+    if model_id == "dlinear":
+        # Keras reimplementation of honeywell21/DLinear.  It retains the
+        # official shared seasonal/trend temporal heads and deliberately adds
+        # no cross-variate projection or WindPRISM-specific component.
+        keras.utils.set_random_seed(RANDOM_SEED)
+        return build_dlinear_model(prepared, keras)
     if model_id == "windprism_f7_g0":
         import wind_RegimeEncoder_PatchTST_feature_screen_train as source
         import wind_RegimeEncoder_PatchTST_train as regime_source
@@ -1235,6 +4086,21 @@ def run_worker(args: argparse.Namespace) -> int:
     model_id, farm_id = args.model, args.farm
     batch_size = int(args.batch_size)
     smoke = bool(args.smoke)
+    extension_lineage = str(args.extension_lineage or "")
+    if smoke:
+        extension_lineage = "smoke"
+    elif model_id in MODERN_TRAINABLE_MODEL_IDS:
+        if extension_lineage not in {
+            STAGED_EXTENSION_LINEAGE,
+            UNIFIED_MODERN_EXTENSION_LINEAGE,
+        }:
+            raise ValueError(
+                f"{model_id}正式worker缺少有效extension lineage"
+            )
+    elif extension_lineage:
+        raise ValueError(
+            f"原10模型worker不应声明modern extension lineage: {model_id}"
+        )
     batch_policy = None if smoke else load_batch_policy(require_valid_sources=True)
     if batch_policy is not None:
         expected_batch = formal_batch_size(model_id, batch_policy)
@@ -1298,6 +4164,18 @@ def run_worker(args: argparse.Namespace) -> int:
             )
         if tuple(model.input_shape[1:]) != (HISTORY_LEN, INPUT_DIM):
             raise ValueError(f"模型输入形状漂移: {model.input_shape}")
+        if model_id in {
+            "itransformer",
+            "timesnet",
+            "timemixer",
+            "dlinear",
+        } and tuple(
+            model.output_shape[1:]
+        ) != (FORECAST_LEN,):
+            raise ValueError(
+                f"{model_id}输出必须为(None,{FORECAST_LEN}): "
+                f"{model.output_shape}"
+            )
         parameter_count = int(model.count_params())
         trainable_parameter_count = int(
             sum(int(np.prod(weight.shape)) for weight in model.trainable_weights)
@@ -1402,6 +4280,11 @@ def run_worker(args: argparse.Namespace) -> int:
             "model_id": model_id,
             "model_name": model.name,
             "farm_id": farm_id,
+            "extension_lineage": (
+                extension_lineage
+                if model_id in MODERN_TRAINABLE_MODEL_IDS
+                else None
+            ),
             "random_seed": RANDOM_SEED,
             "training_initialization": "from_scratch_seed_2026",
             "pretrained_weights_loaded": False,
@@ -1518,6 +4401,242 @@ def run_worker(args: argparse.Namespace) -> int:
             "training_code_path": str(Path(__file__).resolve()),
             "training_code_sha256": sha256_file(__file__),
         }
+        if model_id == "itransformer":
+            marker.update(
+                {
+                    "model_matrix_revision": MODEL_MATRIX_REVISION,
+                    "architecture_source": (
+                        "https://github.com/thuml/iTransformer"
+                    ),
+                    "architecture_adaptation": {
+                        "implementation": "Keras",
+                        "task": "4h ultra-short-term wind power forecasting",
+                        "history_steps": HISTORY_LEN,
+                        "forecast_steps": FORECAST_LEN,
+                        "time_frequency_minutes": 15,
+                        "variate_tokens": INPUT_DIM,
+                        "target_variate_index": TARGET_INDEX,
+                        "d_model": ITRANSFORMER_D_MODEL,
+                        "num_heads": ITRANSFORMER_NUM_HEADS,
+                        "encoder_layers": ITRANSFORMER_ENCODER_LAYERS,
+                        "d_ff": ITRANSFORMER_D_FF,
+                        "dropout": ITRANSFORMER_DROPOUT,
+                        "activation": "gelu",
+                        "instance_normalization": True,
+                        "attention_axis": "variates",
+                        "causal_attention_mask": False,
+                        "positional_embedding": False,
+                        "decoder": False,
+                        "round3_common_training_protocol": True,
+                    },
+                }
+            )
+        elif model_id == "timesnet":
+            marker.update(
+                {
+                    "model_matrix_revision": MODEL_MATRIX_REVISION,
+                    "architecture_source": (
+                        "https://github.com/thuml/Time-Series-Library"
+                    ),
+                    "architecture_adaptation": {
+                        "implementation": "Keras",
+                        "upstream_model": "TimesNet",
+                        "task": "4h ultra-short-term wind power forecasting",
+                        "history_steps": HISTORY_LEN,
+                        "forecast_steps": FORECAST_LEN,
+                        "time_frequency_minutes": 15,
+                        "input_variates": INPUT_DIM,
+                        "target_variate_index": TARGET_INDEX,
+                        "d_model": TIMESNET_D_MODEL,
+                        "d_ff": TIMESNET_D_FF,
+                        "encoder_layers": TIMESNET_ENCODER_LAYERS,
+                        "top_k_periods": TIMESNET_TOP_K,
+                        "inception_kernels": [
+                            2 * index + 1
+                            for index in range(TIMESNET_NUM_KERNELS)
+                        ],
+                        "dropout": TIMESNET_DROPOUT,
+                        "activation": "gelu",
+                        "instance_normalization": True,
+                        "circular_token_conv_kernel": 3,
+                        "sinusoidal_position_embedding": True,
+                        "temporal_alignment": (
+                            f"{HISTORY_LEN}->{HISTORY_LEN + FORECAST_LEN}"
+                        ),
+                        "dynamic_batch_fft_period_discovery": True,
+                        "fft_dc_exclusion": "negative_infinity_safe_equivalent",
+                        "period_weighting": "sample_amplitude_softmax",
+                        "two_dimensional_variation_convolution": True,
+                        "all_variate_projection_before_target_selection": True,
+                        "x_mark": None,
+                        "x_mark_reason": (
+                            "the fixed 45-channel schema already contains "
+                            "causal calendar features"
+                        ),
+                        "future_truth_entering_latent_112_positions": False,
+                        "causal_statement": (
+                            "the final 16 latent positions are generated only "
+                            "from the 96-step historical embedding"
+                        ),
+                        "official_architecture_recipe": (
+                            "ETTm1 15-minute seq_len=96 d_model=64 d_ff=64"
+                        ),
+                        "round3_common_training_protocol": True,
+                        "windprism_specific_modules_added": False,
+                    },
+                }
+            )
+        elif model_id == "timemixer":
+            marker.update(
+                {
+                    "model_matrix_revision": MODEL_MATRIX_REVISION,
+                    "architecture_source": (
+                        "https://github.com/kwuking/TimeMixer"
+                    ),
+                    "architecture_paper": (
+                        "https://arxiv.org/abs/2405.14616"
+                    ),
+                    "architecture_adaptation": {
+                        "implementation": "Keras",
+                        "upstream_model": "TimeMixer",
+                        "upstream_variant": "original_TimeMixer_not_TimeMixer++",
+                        "task": "4h ultra-short-term wind power forecasting",
+                        "history_steps": HISTORY_LEN,
+                        "forecast_steps": FORECAST_LEN,
+                        "time_frequency_minutes": 15,
+                        "input_variates": INPUT_DIM,
+                        "target_variate_index": TARGET_INDEX,
+                        "channel_independence": 1,
+                        "d_model": TIMEMIXER_D_MODEL,
+                        "d_ff": TIMEMIXER_D_FF,
+                        "pdm_layers": TIMEMIXER_PDM_LAYERS,
+                        "downsampling_method": "average_pooling",
+                        "downsampling_layers": (
+                            TIMEMIXER_DOWNSAMPLING_LAYERS
+                        ),
+                        "downsampling_window": (
+                            TIMEMIXER_DOWNSAMPLING_WINDOW
+                        ),
+                        "scale_lengths": list(TIMEMIXER_SCALE_LENGTHS),
+                        "decomposition_method": "moving_average",
+                        "moving_average_kernel": (
+                            TIMEMIXER_MOVING_AVERAGE
+                        ),
+                        "seasonal_mixing_direction": (
+                            "bottom_up_fine_to_coarse"
+                        ),
+                        "trend_mixing_direction": (
+                            "top_down_coarse_to_fine"
+                        ),
+                        "past_decomposable_mixing": True,
+                        "future_multipredictor_mixing": (
+                            "independent_temporal_predictor_per_scale_then_sum"
+                        ),
+                        "shared_channel_independent_projection": True,
+                        "per_scale_affine_normalization": True,
+                        "scale_zero_denormalization": True,
+                        "data_embedding": (
+                            "shared_circular_conv_without_position"
+                        ),
+                        "dropout": TIMEMIXER_DROPOUT,
+                        "activation": "gelu",
+                        "x_mark": None,
+                        "future_temporal_features": False,
+                        "x_mark_reason": (
+                            "the fixed 45-channel schema already contains "
+                            "causal calendar features and the unified benchmark "
+                            "does not supply a future-covariate tensor"
+                        ),
+                        "all_variate_forecast_before_target_selection": True,
+                        "future_truth_entering_model": False,
+                        "causal_statement": (
+                            "all four 16-step forecasts are generated only "
+                            "from downsampled views of the 96-step history"
+                        ),
+                        "official_registered_unused_pdm_layernorm_retained": (
+                            True
+                        ),
+                        "official_architecture_recipe": (
+                            "ETTm1 15-minute seq_len=96 e_layers=2 "
+                            "down_sampling_layers=3 window=2 avg "
+                            "d_model=16 d_ff=32 channel_independence=1"
+                        ),
+                        "round3_common_training_protocol": True,
+                        "windprism_specific_modules_added": False,
+                    },
+                }
+            )
+        elif model_id == "dlinear":
+            marker.update(
+                {
+                    "model_matrix_revision": MODEL_MATRIX_REVISION,
+                    "architecture_source": (
+                        "https://github.com/honeywell21/DLinear"
+                    ),
+                    "architecture_paper": (
+                        "https://arxiv.org/abs/2205.13504"
+                    ),
+                    "architecture_adaptation": {
+                        "implementation": "Keras",
+                        "upstream_model": "DLinear",
+                        "task": "4h ultra-short-term wind power forecasting",
+                        "history_steps": HISTORY_LEN,
+                        "forecast_steps": FORECAST_LEN,
+                        "time_frequency_minutes": 15,
+                        "input_variates": INPUT_DIM,
+                        "target_variate_index": TARGET_INDEX,
+                        "features_mode": (
+                            "official_MS_equivalent_all_variates_forecast_"
+                            "then_target_selection"
+                        ),
+                        "direct_multi_step_forecast": True,
+                        "decomposition": "moving_average_plus_remainder",
+                        "moving_average_kernel": DLINEAR_MOVING_AVERAGE,
+                        "moving_average_stride": 1,
+                        "moving_average_boundary": (
+                            "repeat_first_and_last_12_steps_then_valid_pool"
+                        ),
+                        "individual": DLINEAR_INDIVIDUAL,
+                        "shared_temporal_heads_across_variates": True,
+                        "seasonal_linear_mapping": (
+                            f"{HISTORY_LEN}->{FORECAST_LEN}"
+                        ),
+                        "trend_linear_mapping": (
+                            f"{HISTORY_LEN}->{FORECAST_LEN}"
+                        ),
+                        "branch_fusion": "elementwise_sum",
+                        "activation": None,
+                        "dropout": 0.0,
+                        "normalization": None,
+                        "attention": False,
+                        "embedding": False,
+                        "cross_variate_mixing": False,
+                        "non_target_variates_influence_target": False,
+                        "future_truth_entering_model": False,
+                        "linear_initializer": (
+                            "pytorch_nn_linear_default_equivalent_"
+                            "uniform_plus_minus_1_over_sqrt_96"
+                        ),
+                        "official_commented_mean_initializer_enabled": False,
+                        "x_target_to_y_target_scaler_bridge": (
+                            "deterministic_non_trainable_affine"
+                        ),
+                        "round3_common_training_protocol": True,
+                        "training_protocol_adaptations": {
+                            "seed": RANDOM_SEED,
+                            "batch_size": batch_size,
+                            "optimizer": "Adam",
+                            "learning_rate": LEARNING_RATE,
+                            "loss": "Huber(delta=1.0)",
+                            "maximum_epochs": epochs,
+                            "early_stopping_patience": (
+                                EARLY_STOPPING_PATIENCE
+                            ),
+                        },
+                        "windprism_specific_modules_added": False,
+                    },
+                }
+            )
         atomic_json(paths["marker"], marker)
         atomic_json(
             attempt_marker,
@@ -1569,6 +4688,7 @@ def worker_command(
     batch_size: int,
     attempt_dir: Path,
     smoke: bool,
+    extension_lineage: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1582,6 +4702,8 @@ def worker_command(
         str(batch_size),
         "--attempt-dir",
         str(attempt_dir.resolve()),
+        "--extension-lineage",
+        extension_lineage,
     ]
     if smoke:
         command.append("--smoke")
@@ -1804,6 +4926,7 @@ def launch_worker(
     farm_id: str,
     batch_size: int,
     smoke: bool,
+    extension_lineage: str,
 ) -> tuple[int, Path, str]:
     paths = artifact_paths(model_id, farm_id, smoke=smoke)
     attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
@@ -1822,7 +4945,14 @@ def launch_worker(
             "PYTHONHASHSEED": str(RANDOM_SEED),
         }
     )
-    command = worker_command(model_id, farm_id, batch_size, attempt_dir, smoke)
+    command = worker_command(
+        model_id,
+        farm_id,
+        batch_size,
+        attempt_dir,
+        smoke,
+        extension_lineage,
+    )
     print(
         f"\n[launch] {model_id}/{farm_id}, batch={batch_size}; "
         f"log={log_path}"
@@ -2201,19 +5331,146 @@ def write_summaries(
     return {name: str(path.resolve()) for name, path in outputs.items()}
 
 
-def finalize_bundle() -> dict[str, Any]:
+def finalize_bundle(
+    extension_lineage: str | None = None,
+) -> dict[str, Any]:
     markers = load_all_formal_markers()
     policy = load_batch_policy(require_valid_sources=True)
     policy_sha = sha256_file(BATCH_POLICY_PATH)
+    current_training_code_sha = sha256_file(__file__)
+    extension_lineage = extension_lineage or infer_extension_lineage()
+    if extension_lineage not in {
+        STAGED_EXTENSION_LINEAGE,
+        UNIFIED_MODERN_EXTENSION_LINEAGE,
+    }:
+        raise ValueError(f"未知训练extension lineage: {extension_lineage}")
+
+    frozen_pre_dlinear_code_hashes: dict[str, str] = {}
+    if extension_lineage == STAGED_EXTENSION_LINEAGE:
+        if PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH.is_file():
+            with open(
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                pre_dlinear_archive = json.load(handle)
+            frozen_pre_dlinear_code_hashes = {
+                str(model_id): str(code_sha)
+                for model_id, code_sha in pre_dlinear_archive.get(
+                    "frozen_training_code_sha256_by_model", {}
+                ).items()
+            }
+            if (
+                pre_dlinear_archive.get("status") != "complete"
+                or pre_dlinear_archive.get(
+                    "model_matrix_revision_at_archive"
+                )
+                != PRE_DLINEAR_MODEL_MATRIX_REVISION
+                or tuple(pre_dlinear_archive.get("expected_models", ()))
+                != PRE_DLINEAR_MODEL_IDS
+                or set(frozen_pre_dlinear_code_hashes)
+                != set(PRE_DLINEAR_MODEL_IDS)
+            ):
+                raise ValueError("pre-DLinear训练归档身份或代码SHA集合漂移")
+        else:
+            # Partial diagnostics before staged DLinear starts.
+            frozen_pre_dlinear_code_hashes = {
+                model_id: BASE10_TRAINING_CODE_SHA256
+                for model_id in LEGACY_MODEL_IDS
+            }
+            frozen_pre_dlinear_code_hashes["itransformer"] = (
+                ITRANSFORMER_EXTENSION_TRAINING_CODE_SHA256
+            )
+            if PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.is_file():
+                with open(
+                    PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH,
+                    "r",
+                    encoding="utf-8",
+                ) as handle:
+                    pre_timemixer_archive = json.load(handle)
+                frozen_pre_dlinear_code_hashes.update(
+                    {
+                        str(model_id): str(code_sha)
+                        for model_id, code_sha in pre_timemixer_archive.get(
+                            "frozen_training_code_sha256_by_model", {}
+                        ).items()
+                    }
+                )
+            frozen_pre_dlinear_code_hashes["timemixer"] = (
+                TIMEMIXER_EXTENSION_TRAINING_CODE_SHA256
+            )
+    else:
+        frozen_pre_dlinear_code_hashes = {
+            str(model_id): str(code_sha)
+            for model_id, code_sha in {
+                model_id: BASE10_TRAINING_CODE_SHA256
+                for model_id in LEGACY_MODEL_IDS
+            }.items()
+        }
     batches_by_model: dict[str, set[int]] = {
         model_id: set() for model_id in MODEL_IDS
     }
+    staged_dlinear_code_sha = current_training_code_sha
+    if extension_lineage == STAGED_EXTENSION_LINEAGE:
+        dlinear_markers = [
+            marker for marker in markers if marker["model_id"] == "dlinear"
+        ]
+        observed_dlinear_hashes = {
+            str(marker.get("training_code_sha256", ""))
+            for marker in dlinear_markers
+        }
+        if (
+            len(dlinear_markers) == len(EXPECTED_FARMS)
+            and len(observed_dlinear_hashes) == 1
+            and "" not in observed_dlinear_hashes
+        ):
+            # Preserve a historically completed staged generation even after
+            # later orchestration-only edits changed this source file SHA.
+            staged_dlinear_code_sha = next(iter(observed_dlinear_hashes))
+        elif observed_dlinear_hashes and observed_dlinear_hashes != {
+            current_training_code_sha
+        }:
+            raise ValueError(
+                "staged DLinear仅部分完成且训练代码SHA已变化，禁止混合代际"
+            )
     for marker in markers:
         model_id = str(marker["model_id"])
         batches_by_model[model_id].add(int(marker["effective_batch_size"]))
         if marker.get("global_batch_policy_sha256") != policy_sha:
             raise ValueError(
                 f"{model_id}/{marker['farm_id']}使用的全局batch策略SHA已漂移"
+            )
+        if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE:
+            expected_code_sha = (
+                current_training_code_sha
+                if model_id in MODERN_TRAINABLE_MODEL_IDS
+                else BASE10_TRAINING_CODE_SHA256
+            )
+            if (
+                model_id in MODERN_TRAINABLE_MODEL_IDS
+                and marker.get("extension_lineage")
+                != UNIFIED_MODERN_EXTENSION_LINEAGE
+            ):
+                raise ValueError(
+                    f"{model_id}/{marker['farm_id']}缺少unified lineage身份"
+                )
+        else:
+            expected_code_sha = (
+                staged_dlinear_code_sha
+                if model_id in DLINEAR_BASELINE_IDS
+                else frozen_pre_dlinear_code_hashes.get(model_id)
+            )
+            if (
+                model_id in DLINEAR_BASELINE_IDS
+                and marker.get("extension_lineage")
+                not in (None, STAGED_EXTENSION_LINEAGE)
+            ):
+                raise ValueError(
+                    f"{model_id}/{marker['farm_id']}staged lineage身份漂移"
+                )
+        if marker.get("training_code_sha256") != expected_code_sha:
+            raise ValueError(
+                f"{model_id}/{marker['farm_id']}训练代码SHA不符合追加矩阵身份"
             )
     mixed = {
         model_id: sorted(values)
@@ -2235,17 +5492,82 @@ def finalize_bundle() -> dict[str, Any]:
                 raise ValueError(f"{model_id}正式batch不是统一192")
     identities = {(item["model_id"], item["farm_id"]) for item in markers}
     expected = {(model, farm) for model in MODEL_IDS for farm in EXPECTED_FARMS}
-    complete = identities == expected and len(markers) == len(expected)
+    required_archive_exists = (
+        PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+        if extension_lineage == STAGED_EXTENSION_LINEAGE
+        else BASE10_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+    )
+    complete = (
+        identities == expected
+        and len(markers) == len(expected)
+        and required_archive_exists
+    )
     report_root = (
         RESULT_ROOT
         if complete
         else RESULT_ROOT / "partial_runs" / "training_summary"
     )
     outputs = write_summaries(markers, report_root)
+    base10_archive_record = (
+        {
+            "path": str(BASE10_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()),
+            "sha256": sha256_file(BASE10_TRAINING_ARCHIVE_MANIFEST_PATH),
+            "size_bytes": BASE10_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size,
+        }
+        if BASE10_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+        else None
+    )
+    pre_timesnet_archive_record = (
+        {
+            "path": str(
+                PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
+            ),
+            "sha256": sha256_file(
+                PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH
+            ),
+            "size_bytes": (
+                PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size
+            ),
+        }
+        if PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+        else None
+    )
+    pre_timemixer_archive_record = (
+        {
+            "path": str(
+                PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
+            ),
+            "sha256": sha256_file(
+                PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH
+            ),
+            "size_bytes": (
+                PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size
+            ),
+        }
+        if PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+        else None
+    )
+    pre_dlinear_archive_record = (
+        {
+            "path": str(
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
+            ),
+            "sha256": sha256_file(
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH
+            ),
+            "size_bytes": (
+                PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH.stat().st_size
+            ),
+        }
+        if PRE_DLINEAR_TRAINING_ARCHIVE_MANIFEST_PATH.is_file()
+        else None
+    )
     payload = {
         "status": "complete" if complete else "partial",
         "created_at": utc_now(),
         "protocol_version": PROTOCOL_VERSION,
+        "model_matrix_revision": MODEL_MATRIX_REVISION,
+        "extension_lineage": extension_lineage,
         "expected_models": list(MODEL_IDS),
         "expected_farms": list(EXPECTED_FARMS),
         "expected_task_count": len(expected),
@@ -2335,6 +5657,108 @@ def finalize_bundle() -> dict[str, Any]:
             markers
             and all(int(item.get("effective_batch_size", -1)) == 192 for item in markers)
         ),
+        "additive_baseline_extension": True,
+        "base10_reused_task_count": int(
+            sum(item["model_id"] in LEGACY_MODEL_IDS for item in markers)
+        ),
+        "itransformer_reused_task_count": int(
+            sum(item["model_id"] == "itransformer" for item in markers)
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else 0
+        ),
+        "new_itransformer_task_count": int(
+            sum(item["model_id"] == "itransformer" for item in markers)
+            if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+            else 0
+        ),
+        "pre_timesnet_reused_task_count": int(
+            sum(
+                item["model_id"] in PRE_TIMESNET_MODEL_IDS
+                for item in markers
+            )
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else sum(item["model_id"] in LEGACY_MODEL_IDS for item in markers)
+        ),
+        "new_timesnet_task_count": int(
+            sum(item["model_id"] == "timesnet" for item in markers)
+        ),
+        "pre_timemixer_reused_task_count": int(
+            sum(
+                item["model_id"] in PRE_TIMEMIXER_MODEL_IDS
+                for item in markers
+            )
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else sum(item["model_id"] in LEGACY_MODEL_IDS for item in markers)
+        ),
+        "timesnet_reused_task_count": int(
+            sum(item["model_id"] == "timesnet" for item in markers)
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else 0
+        ),
+        "new_timemixer_task_count": int(
+            sum(item["model_id"] == "timemixer" for item in markers)
+        ),
+        "pre_dlinear_reused_task_count": int(
+            sum(
+                item["model_id"] in PRE_DLINEAR_MODEL_IDS
+                for item in markers
+            )
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else sum(item["model_id"] in LEGACY_MODEL_IDS for item in markers)
+        ),
+        "timemixer_reused_task_count": int(
+            sum(item["model_id"] == "timemixer" for item in markers)
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else 0
+        ),
+        "new_dlinear_task_count": int(
+            sum(item["model_id"] == "dlinear" for item in markers)
+        ),
+        "base10_training_complete_archive": base10_archive_record,
+        "pre_timesnet_training_complete_archive": (
+            pre_timesnet_archive_record
+        ),
+        "pre_timemixer_training_complete_archive": (
+            pre_timemixer_archive_record
+        ),
+        "pre_dlinear_training_complete_archive": (
+            pre_dlinear_archive_record
+        ),
+        "legacy_training_code_sha256": BASE10_TRAINING_CODE_SHA256,
+        "modern_extension_training_code_sha256": (
+            current_training_code_sha
+            if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+            else None
+        ),
+        "frozen_pre_timesnet_training_code_sha256_by_model": (
+            {
+                model_id: frozen_pre_dlinear_code_hashes.get(model_id)
+                for model_id in PRE_TIMESNET_MODEL_IDS
+            }
+        ),
+        "timesnet_extension_training_code_sha256": (
+            frozen_pre_dlinear_code_hashes.get("timesnet")
+        ),
+        "frozen_pre_timemixer_training_code_sha256_by_model": (
+            {
+                model_id: frozen_pre_dlinear_code_hashes.get(model_id)
+                for model_id in PRE_TIMEMIXER_MODEL_IDS
+            }
+        ),
+        "timemixer_extension_training_code_sha256": (
+            frozen_pre_dlinear_code_hashes.get("timemixer")
+        ),
+        "frozen_pre_dlinear_training_code_sha256_by_model": (
+            frozen_pre_dlinear_code_hashes
+        ),
+        "dlinear_extension_training_code_sha256": (
+            staged_dlinear_code_sha
+            if extension_lineage == STAGED_EXTENSION_LINEAGE
+            else current_training_code_sha
+        ),
+        "legacy_model_artifacts_modified_by_extension": False,
+        "pre_timemixer_model_artifacts_modified_by_extension": False,
+        "pre_dlinear_model_artifacts_modified_by_extension": False,
     }
     if complete:
         marker_path = RESULT_ROOT / "round3_training_bundle_complete.json"
@@ -2358,6 +5782,65 @@ def run_parent(args: argparse.Namespace) -> int:
         print(f"[smoke] 未显式指定场站，仅使用{farms[0]}验证全部所选模型")
     if args.force and args.resume:
         raise ValueError("--force与--resume不能同时使用")
+    extension_lineage = (
+        "smoke" if args.smoke else infer_extension_lineage()
+    )
+    selected_modern = set(models).intersection(MODERN_TRAINABLE_MODEL_IDS)
+    if not args.smoke and not selected_modern and not args.preflight_only:
+        raise ValueError(
+            "正式扩展必须至少选择一个现代基线；原10模型已冻结"
+        )
+    if (
+        not args.smoke
+        and extension_lineage == STAGED_EXTENSION_LINEAGE
+        and "dlinear" not in selected_modern
+        and not args.preflight_only
+    ):
+        raise ValueError(
+            "historical staged lineage当前仅允许补齐DLinear；"
+            "此前13模型已按代际冻结"
+        )
+    frozen_model_ids = (
+        PRE_DLINEAR_MODEL_IDS
+        if extension_lineage == STAGED_EXTENSION_LINEAGE
+        else LEGACY_MODEL_IDS
+    )
+    if (
+        not args.smoke
+        and args.force
+        and set(models).intersection(frozen_model_ids)
+    ):
+        raise ValueError(
+            f"{extension_lineage}禁止--force覆盖冻结模型；"
+            "仅显式选择需要重训的新增模型"
+        )
+    if not args.smoke and args.force_preflight:
+        raise ValueError(
+            "现代基线追加必须复用原10模型绑定的全局batch policy；"
+            "禁止--force-preflight重建策略"
+        )
+    if not args.smoke:
+        if extension_lineage == STAGED_EXTENSION_LINEAGE:
+            archive_record = archive_pre_dlinear_training_complete()
+            archive_label = "pre-DLinear 13-model"
+        else:
+            archive_record = archive_base10_training_complete()
+            archive_label = "base10 unified-modern"
+        print(
+            f"[{extension_lineage}] 已冻结训练bundle ({archive_label}): "
+            f"{archive_record['path']}"
+        )
+        selected_complete = all(
+            completed_marker_valid(artifact_paths(model_id, farm_id)["marker"])
+            for model_id in models
+            for farm_id in farms
+        )
+        if args.resume and selected_complete and extended_training_bundle_valid():
+            print(
+                f"[{extension_lineage} resume] 14×14训练bundle及所选任务"
+                "均通过哈希校验，无需重写任何训练产物"
+            )
+            return 0
     policy = None
     largest_farm = largest_training_farm()
     if not args.smoke:
@@ -2370,11 +5853,14 @@ def run_parent(args: argparse.Namespace) -> int:
                 f"HR batch={policy['hr_moe_effective_batch_size']}"
             )
             return 0
-        # 任一正式调度开始即撤销旧全局complete；只有重新核验140项后才发布。
-        (RESULT_ROOT / "round3_training_bundle_complete.json").unlink(
-            missing_ok=True
-        )
+        # 保留原140项或182项complete作为可恢复证据，直到196项全部
+        # 核验完成后才原子覆盖；精确副本已由对应lineage归档。
         if args.force:
+            # 撤销可能存在的196项complete，避免强制重训失败时留下
+            # 伪完成状态；冻结的上一代complete仍保留在归档中。
+            (
+                RESULT_ROOT / "round3_training_bundle_complete.json"
+            ).unlink(missing_ok=True)
             for model_id, farm_id in ordered_formal_tasks(
                 models, farms, largest_farm
             ):
@@ -2392,10 +5878,65 @@ def run_parent(args: argparse.Namespace) -> int:
     tasks = ordered_formal_tasks(models, farms, largest_farm)
     for model_id, farm_id in tasks:
         paths = artifact_paths(model_id, farm_id, smoke=args.smoke)
+        if not args.smoke and model_id in frozen_model_ids:
+            if not completed_marker_valid(paths["marker"]):
+                raise ValueError(
+                    f"冻结的{extension_lineage}任务缺失或漂移，禁止重算: "
+                    f"{model_id}/{farm_id}"
+                )
+            with open(paths["marker"], "r", encoding="utf-8") as handle:
+                frozen_marker = json.load(handle)
+            if (
+                str(frozen_marker.get("model_id")) != model_id
+                or str(frozen_marker.get("farm_id")) != farm_id
+            ):
+                raise ValueError(
+                    f"冻结任务marker身份漂移: {model_id}/{farm_id}"
+                )
+            if (
+                extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+                and frozen_marker.get("training_code_sha256")
+                != BASE10_TRAINING_CODE_SHA256
+            ):
+                raise ValueError(
+                    f"base10冻结任务训练代码SHA漂移: {model_id}/{farm_id}"
+                )
+            if policy is not None:
+                validate_task_policy(paths["marker"], model_id, policy)
+            print(f"[frozen reuse] {model_id}/{farm_id}已完成，跳过")
+            skipped += 1
+            continue
         if completed_marker_valid(paths["marker"]):
             if args.resume:
                 if policy is not None:
                     validate_task_policy(paths["marker"], model_id, policy)
+                with open(paths["marker"], "r", encoding="utf-8") as handle:
+                    completed_marker = json.load(handle)
+                if (
+                    str(completed_marker.get("model_id")) != model_id
+                    or str(completed_marker.get("farm_id")) != farm_id
+                ):
+                    raise ValueError(
+                        f"resume任务marker身份漂移: {model_id}/{farm_id}"
+                    )
+                if model_id in MODERN_TRAINABLE_MODEL_IDS:
+                    if (
+                        completed_marker.get("extension_lineage")
+                        != extension_lineage
+                    ):
+                        raise ValueError(
+                            f"resume任务lineage漂移: {model_id}/{farm_id}"
+                        )
+                    if (
+                        extension_lineage
+                        == UNIFIED_MODERN_EXTENSION_LINEAGE
+                        and completed_marker.get("training_code_sha256")
+                        != sha256_file(__file__)
+                    ):
+                        raise ValueError(
+                            f"unified resume训练代码SHA漂移: "
+                            f"{model_id}/{farm_id}"
+                        )
                 print(f"[resume] {model_id}/{farm_id}已完成，跳过")
                 skipped += 1
                 continue
@@ -2413,6 +5954,7 @@ def run_parent(args: argparse.Namespace) -> int:
             farm_id,
             batch_size,
             smoke=args.smoke,
+            extension_lineage=extension_lineage,
         )
         if code != 0:
             oom = code == OOM_EXIT_CODE
@@ -2451,7 +5993,7 @@ def run_parent(args: argparse.Namespace) -> int:
         return 0
 
     runtime = update_runtime_progress(policy, largest_farm)
-    bundle = finalize_bundle()
+    bundle = finalize_bundle(extension_lineage)
     print(
         f"[training {bundle['status']}] 本轮完成={completed}, 跳过={skipped}, "
         f"全局进度={bundle['completed_task_count']}/{bundle['expected_task_count']}, "
