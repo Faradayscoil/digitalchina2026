@@ -39,10 +39,15 @@ import pandas as pd
 
 PROTOCOL_VERSION = "part3_round3_external14_unified_training_v2"
 PREPROCESS_PROTOCOL_VERSION = "part3_round3_external14_leakage_free_v2"
-RESULT_ROOT = Path(
-    "./wind_results/part3_new_module_supplement/"
+PROJECT_ROOT = Path(__file__).resolve().parent
+RESULT_ROOT = PROJECT_ROOT / (
+    "wind_results/part3_new_module_supplement/"
     "03_external14_leakage_free_strong_baseline_benchmark"
 )
+# SSH服务器已生成的不可变marker/manifest使用此旧项目根目录。续跑时只允许
+# 将它下面的相对路径逐字映射到当前脚本所在项目根目录；其他绝对路径不会被
+# 猜测、搜索或重定向，文件内容SHA/大小等身份校验也不会放宽。
+RELOCATABLE_PROJECT_ROOTS = (Path("/root/digitalchina2026"),)
 EXPECTED_FARMS = tuple(f"JSFD{i:03d}" for i in range(1, 15))
 LEGACY_MODEL_IDS = (
     "patchtst",
@@ -207,6 +212,12 @@ MODEL_MATRIX_REVISION = (
 BASE10_TRAINING_CODE_SHA256 = (
     "d37c17db911dcf95023e9636c2a7881df2d1a2c62202a55a532cae4139bbe530"
 )
+# Commit 464e50f中、加入本地路径重定位前的统一modern训练脚本SHA。
+# 路径重定位不改变模型结构、优化器、数据或训练循环；续跑只额外接受这一
+# 个精确旧SHA与当前脚本SHA，绝不接受任意历史代码。
+PRE_RELOCATION_MODERN_TRAINING_CODE_SHA256 = (
+    "380e5855d71507b5aeb8b844c5ea91902b45246fc3a55f78064e0a6c05e7faff"
+)
 ITRANSFORMER_EXTENSION_TRAINING_CODE_SHA256 = (
     "06072e0334fb9b785ceb5023d6808489505de27c048d67b19c90353442692e90"
 )
@@ -260,11 +271,65 @@ def utc_now() -> str:
 
 
 def sha256_file(path: os.PathLike[str] | str) -> str:
+    path = resolve_recorded_project_path(path)
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def resolve_recorded_project_path(
+    value: os.PathLike[str] | str,
+) -> Path:
+    """Resolve a persisted path with a narrowly scoped project relocation.
+
+    Only ``/root/digitalchina2026/<relative>`` is relocatable. The relative
+    suffix is retained exactly and mapped below ``PROJECT_ROOT``. Callers
+    retain the original SHA/size/identity checks, so only location semantics
+    change; artifact identity does not.
+    """
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        resolved = (PROJECT_ROOT / raw).resolve()
+        try:
+            resolved.relative_to(PROJECT_ROOT)
+        except ValueError as exc:
+            raise ValueError(
+                f"相对记录路径逃逸当前项目根目录: {value}"
+            ) from exc
+        return resolved
+
+    resolved = raw.resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT)
+    except ValueError:
+        pass
+    else:
+        return resolved
+
+    for old_root in RELOCATABLE_PROJECT_ROOTS:
+        try:
+            relative = resolved.relative_to(old_root)
+        except ValueError:
+            continue
+        relocated = (PROJECT_ROOT / relative).resolve()
+        try:
+            relocated.relative_to(PROJECT_ROOT)
+        except ValueError as exc:
+            raise ValueError(
+                f"记录路径迁移逃逸当前项目根目录: {value}"
+            ) from exc
+        return relocated
+    return resolved
+
+
+def compatible_unified_modern_training_code_sha256s() -> set[str]:
+    """Exact code-SHA allowlist for an SSH-to-local unified resume."""
+    return {
+        PRE_RELOCATION_MODERN_TRAINING_CODE_SHA256,
+        sha256_file(__file__),
+    }
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -403,7 +468,7 @@ def legacy_base10_markers_valid_for_extension(policy_sha256: str) -> bool:
 
 def copy_exact_file(source: Path, destination: Path) -> dict[str, Any]:
     """Copy one immutable artifact atomically and verify its content hash."""
-    source = Path(source).resolve()
+    source = resolve_recorded_project_path(source)
     destination = Path(destination).resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
@@ -449,7 +514,7 @@ def archive_base10_training_complete() -> dict[str, Any]:
         ):
             raise ValueError(f"base10训练归档身份漂移: {manifest_path}")
         for record in manifest.get("archived_records", {}).values():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or path.stat().st_size != int(record["size_bytes"])
@@ -487,7 +552,7 @@ def archive_base10_training_complete() -> dict[str, Any]:
             if set(frozen_records) != expected_pairs:
                 raise ValueError("base10训练归档缺少140个冻结marker记录")
             for pair, record in frozen_records.items():
-                path = Path(record["path"])
+                path = resolve_recorded_project_path(record["path"])
                 if (
                     not path.is_file()
                     or sha256_file(path) != record["sha256"]
@@ -533,7 +598,7 @@ def archive_base10_training_complete() -> dict[str, Any]:
         "training_complete": copy_exact_file(source, archive),
     }
     for key, record in payload.get("summary_outputs", {}).items():
-        source_path = Path(record["path"])
+        source_path = resolve_recorded_project_path(record["path"])
         if (
             not source_path.is_file()
             or source_path.stat().st_size != int(record["size_bytes"])
@@ -552,7 +617,7 @@ def archive_base10_training_complete() -> dict[str, Any]:
         source_path = payload.get(f"{key}_path")
         expected_sha = payload.get(f"{key}_sha256")
         if source_path and expected_sha:
-            source_path = Path(source_path)
+            source_path = resolve_recorded_project_path(source_path)
             if sha256_file(source_path) != expected_sha:
                 raise ValueError(f"base10 {key}源SHA漂移")
             archived_records[key] = copy_exact_file(
@@ -609,7 +674,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
         ):
             raise ValueError(f"pre-TimesNet训练归档身份漂移: {manifest_path}")
         for record in manifest.get("archived_records", {}).values():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or path.stat().st_size != int(record["size_bytes"])
@@ -623,7 +688,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
         if set(frozen_records) != expected_pairs:
             raise ValueError("pre-TimesNet归档缺少154个训练marker记录")
         for record in frozen_records.values():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or sha256_file(path) != record["sha256"]
@@ -682,7 +747,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
     }
     for pair in sorted(expected_pairs):
         record = task_records[pair]
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or sha256_file(path) != record.get("sha256")
@@ -724,7 +789,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
             raise ValueError(f"{model_id}不再绑定原base10训练代码SHA")
 
     for key, record in payload.get("summary_outputs", {}).items():
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or path.stat().st_size != int(record["size_bytes"])
@@ -742,7 +807,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
     ).resolve()
 
     def final_record(record: dict[str, Any]) -> dict[str, Any]:
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = resolve_recorded_project_path(record["path"]).resolve().relative_to(staging_root)
         return {
             **record,
             "path": str((archive_root / relative).resolve()),
@@ -759,7 +824,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
             )
         }
         for key, record in payload.get("summary_outputs", {}).items():
-            source_path = Path(record["path"])
+            source_path = resolve_recorded_project_path(record["path"])
             archived_records[f"summary_{key}"] = final_record(
                 copy_exact_file(
                     source_path,
@@ -776,7 +841,7 @@ def archive_pre_timesnet_training_complete() -> dict[str, Any]:
             source_path = payload.get(f"{key}_path")
             expected_sha = payload.get(f"{key}_sha256")
             if source_path and expected_sha:
-                source_path = Path(source_path)
+                source_path = resolve_recorded_project_path(source_path)
                 if sha256_file(source_path) != expected_sha:
                     raise ValueError(f"pre-TimesNet {key}源SHA漂移")
                 archived_records[key] = final_record(
@@ -847,7 +912,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
         if set(frozen_records) != expected_pairs:
             raise ValueError("pre-TimeMixer归档缺少168个训练marker记录")
         for record in manifest.get("archived_records", {}).values():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or path.stat().st_size != int(record["size_bytes"])
@@ -855,7 +920,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
             ):
                 raise ValueError(f"pre-TimeMixer训练归档文件漂移: {path}")
         for pair, record in frozen_records.items():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or sha256_file(path) != record["sha256"]
@@ -911,7 +976,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
     )
     if (
         not isinstance(previous_archive, dict)
-        or Path(previous_archive.get("path", "")).resolve()
+        or resolve_recorded_project_path(previous_archive.get("path", ""))
         != PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
         or previous_archive.get("sha256")
         != sha256_file(PRE_TIMESNET_TRAINING_ARCHIVE_MANIFEST_PATH)
@@ -938,7 +1003,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
     }
     for pair in sorted(expected_pairs):
         record = task_records[pair]
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or sha256_file(path) != record.get("sha256")
@@ -980,7 +1045,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
             raise ValueError(f"{model_id}不再绑定原base10训练代码SHA")
 
     for key, record in payload.get("summary_outputs", {}).items():
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or path.stat().st_size != int(record["size_bytes"])
@@ -998,7 +1063,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
     ).resolve()
 
     def final_record(record: dict[str, Any]) -> dict[str, Any]:
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = resolve_recorded_project_path(record["path"]).resolve().relative_to(staging_root)
         return {**record, "path": str((archive_root / relative).resolve())}
 
     try:
@@ -1020,7 +1085,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
             ),
         }
         for key, record in payload.get("summary_outputs", {}).items():
-            source_path = Path(record["path"])
+            source_path = resolve_recorded_project_path(record["path"])
             archived_records[f"summary_{key}"] = final_record(
                 copy_exact_file(
                     source_path,
@@ -1037,7 +1102,7 @@ def archive_pre_timemixer_training_complete() -> dict[str, Any]:
             source_path = payload.get(f"{key}_path")
             expected_sha = payload.get(f"{key}_sha256")
             if source_path and expected_sha:
-                source_path = Path(source_path)
+                source_path = resolve_recorded_project_path(source_path)
                 if sha256_file(source_path) != expected_sha:
                     raise ValueError(f"pre-TimeMixer {key}源SHA漂移")
                 archived_records[key] = final_record(
@@ -1113,7 +1178,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
         if set(frozen_records) != expected_pairs:
             raise ValueError("pre-DLinear归档缺少182个训练marker记录")
         for record in manifest.get("archived_records", {}).values():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or path.stat().st_size != int(record["size_bytes"])
@@ -1121,7 +1186,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
             ):
                 raise ValueError(f"pre-DLinear训练归档文件漂移: {path}")
         for pair, record in frozen_records.items():
-            path = Path(record["path"])
+            path = resolve_recorded_project_path(record["path"])
             if (
                 not path.is_file()
                 or sha256_file(path) != record["sha256"]
@@ -1188,7 +1253,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
     )
     if (
         not isinstance(previous_archive, dict)
-        or Path(previous_archive.get("path", "")).resolve()
+        or resolve_recorded_project_path(previous_archive.get("path", ""))
         != PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH.resolve()
         or previous_archive.get("sha256")
         != sha256_file(PRE_TIMEMIXER_TRAINING_ARCHIVE_MANIFEST_PATH)
@@ -1235,7 +1300,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
     }
     for pair in sorted(expected_pairs):
         record = task_records[pair]
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or sha256_file(path) != record.get("sha256")
@@ -1281,7 +1346,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
         raise ValueError("TimeMixer不再绑定其冻结训练代码SHA")
 
     for key, record in payload.get("summary_outputs", {}).items():
-        path = Path(record["path"])
+        path = resolve_recorded_project_path(record["path"])
         if (
             not path.is_file()
             or path.stat().st_size != int(record["size_bytes"])
@@ -1299,7 +1364,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
     ).resolve()
 
     def final_record(record: dict[str, Any]) -> dict[str, Any]:
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = resolve_recorded_project_path(record["path"]).resolve().relative_to(staging_root)
         return {**record, "path": str((archive_root / relative).resolve())}
 
     try:
@@ -1321,7 +1386,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
             ),
         }
         for key, record in payload.get("summary_outputs", {}).items():
-            source_path = Path(record["path"])
+            source_path = resolve_recorded_project_path(record["path"])
             archived_records[f"summary_{key}"] = final_record(
                 copy_exact_file(
                     source_path,
@@ -1338,7 +1403,7 @@ def archive_pre_dlinear_training_complete() -> dict[str, Any]:
             source_path = payload.get(f"{key}_path")
             expected_sha = payload.get(f"{key}_sha256")
             if source_path and expected_sha:
-                source_path = Path(source_path)
+                source_path = resolve_recorded_project_path(source_path)
                 if sha256_file(source_path) != expected_sha:
                     raise ValueError(f"pre-DLinear {key}源SHA漂移")
                 archived_records[key] = final_record(
@@ -1411,7 +1476,6 @@ def infer_extension_lineage() -> str:
         except Exception:
             pass
 
-    current_code_sha = sha256_file(__file__)
     observed_hashes = set()
     for model_id in MODERN_TRAINABLE_MODEL_IDS:
         for farm_id in EXPECTED_FARMS:
@@ -1433,7 +1497,9 @@ def infer_extension_lineage() -> str:
                     return STAGED_EXTENSION_LINEAGE
                 if marker.get("training_code_sha256"):
                     observed_hashes.add(str(marker["training_code_sha256"]))
-    if observed_hashes and observed_hashes != {current_code_sha}:
+    if observed_hashes and not observed_hashes.issubset(
+        compatible_unified_modern_training_code_sha256s()
+    ):
         return STAGED_EXTENSION_LINEAGE
     return UNIFIED_MODERN_EXTENSION_LINEAGE
 
@@ -1445,7 +1511,7 @@ def _archive_pointer_valid(
     return bool(
         isinstance(record, dict)
         and manifest_path.is_file()
-        and Path(record.get("path", "")).resolve() == manifest_path.resolve()
+        and resolve_recorded_project_path(record.get("path", "")) == manifest_path.resolve()
         and record.get("sha256") == sha256_file(manifest_path)
         and int(record.get("size_bytes", -1)) == manifest_path.stat().st_size
     )
@@ -1497,7 +1563,7 @@ def extended_training_bundle_valid() -> bool:
         if set(records) != expected:
             return False
         frozen_code_hashes: dict[str, str]
-        modern_code_sha: str | None = None
+        modern_code_shas: set[str] = set()
         if lineage == STAGED_EXTENSION_LINEAGE:
             if not _archive_pointer_valid(
                 payload.get("pre_dlinear_training_complete_archive"),
@@ -1554,14 +1620,29 @@ def extended_training_bundle_valid() -> bool:
                 model_id: BASE10_TRAINING_CODE_SHA256
                 for model_id in LEGACY_MODEL_IDS
             }
-            modern_code_sha = str(
-                payload.get("modern_extension_training_code_sha256", "")
+            declared_modern_code_shas = payload.get(
+                "modern_extension_training_code_sha256s"
             )
-            if not modern_code_sha:
+            if declared_modern_code_shas is None:
+                declared_modern_code_shas = [
+                    payload.get("modern_extension_training_code_sha256", "")
+                ]
+            modern_code_shas = {
+                str(code_sha)
+                for code_sha in declared_modern_code_shas
+                if code_sha
+            }
+            if (
+                not modern_code_shas
+                or not modern_code_shas.issubset(
+                    compatible_unified_modern_training_code_sha256s()
+                )
+            ):
                 return False
 
+        observed_modern_code_shas: set[str] = set()
         for pair, record in records.items():
-            record_path = Path(record["path"])
+            record_path = resolve_recorded_project_path(record["path"])
             if (
                 not record_path.is_file()
                 or sha256_file(record_path) != record.get("sha256")
@@ -1577,7 +1658,7 @@ def extended_training_bundle_valid() -> bool:
                 return False
             if lineage == UNIFIED_MODERN_EXTENSION_LINEAGE:
                 expected_code_sha = (
-                    modern_code_sha
+                    None
                     if pair[0] in MODERN_TRAINABLE_MODEL_IDS
                     else frozen_code_hashes.get(pair[0])
                 )
@@ -1587,6 +1668,13 @@ def extended_training_bundle_valid() -> bool:
                     != UNIFIED_MODERN_EXTENSION_LINEAGE
                 ):
                     return False
+                if pair[0] in MODERN_TRAINABLE_MODEL_IDS:
+                    marker_code_sha = str(
+                        marker.get("training_code_sha256", "")
+                    )
+                    if marker_code_sha not in modern_code_shas:
+                        return False
+                    observed_modern_code_shas.add(marker_code_sha)
             else:
                 expected_code_sha = (
                     dlinear_code_sha
@@ -1599,16 +1687,26 @@ def extended_training_bundle_valid() -> bool:
                     not in (None, STAGED_EXTENSION_LINEAGE)
                 ):
                     return False
-            if marker.get("training_code_sha256") != expected_code_sha:
+            if (
+                expected_code_sha is not None
+                and marker.get("training_code_sha256") != expected_code_sha
+            ):
                 return False
+        if (
+            lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+            and observed_modern_code_shas != modern_code_shas
+        ):
+            return False
         for record in payload.get("summary_outputs", {}).values():
-            record_path = Path(record["path"])
+            record_path = resolve_recorded_project_path(record["path"])
             if (
                 not record_path.is_file()
                 or sha256_file(record_path) != record.get("sha256")
             ):
                 return False
-        policy_path = Path(payload["global_batch_policy_path"])
+        policy_path = resolve_recorded_project_path(
+            payload["global_batch_policy_path"]
+        )
         if (
             not policy_path.is_file()
             or sha256_file(policy_path)
@@ -1645,7 +1743,9 @@ def load_batch_policy(require_valid_sources: bool = True) -> dict[str, Any]:
     gpu_names = policy.get("preflight_gpu_names_by_model", {})
     if any(not gpu_names.get(model_id) for model_id in PREFLIGHT_MODELS):
         raise ValueError("全局batch策略缺少预检GPU设备身份")
-    summary_path = Path(str(policy.get("preflight_summary_path", "")))
+    summary_path = resolve_recorded_project_path(
+        str(policy.get("preflight_summary_path", ""))
+    )
     if (
         not summary_path.is_file()
         or sha256_file(summary_path) != policy.get("preflight_summary_sha256")
@@ -1731,9 +1831,12 @@ def completed_marker_valid(path: Path) -> bool:
         for path_key, hash_key in required_path_hashes:
             value = payload.get(path_key)
             expected = payload.get(hash_key)
-            if not value or not expected or not Path(value).is_file():
+            resolved_path = (
+                resolve_recorded_project_path(value) if value else None
+            )
+            if not resolved_path or not expected or not resolved_path.is_file():
                 return False
-            if sha256_file(value) != expected:
+            if sha256_file(resolved_path) != expected:
                 return False
         if not payload.get("smoke"):
             policy_path = payload.get("global_batch_policy_path")
@@ -1741,8 +1844,9 @@ def completed_marker_valid(path: Path) -> bool:
             if (
                 not policy_path
                 or not policy_hash
-                or not Path(policy_path).is_file()
-                or sha256_file(policy_path) != policy_hash
+                or not resolve_recorded_project_path(policy_path).is_file()
+                or sha256_file(resolve_recorded_project_path(policy_path))
+                != policy_hash
             ):
                 return False
         return True
@@ -5410,6 +5514,10 @@ def finalize_bundle(
     batches_by_model: dict[str, set[int]] = {
         model_id: set() for model_id in MODEL_IDS
     }
+    unified_modern_code_shas: set[str] = set()
+    compatible_unified_code_shas = (
+        compatible_unified_modern_training_code_sha256s()
+    )
     staged_dlinear_code_sha = current_training_code_sha
     if extension_lineage == STAGED_EXTENSION_LINEAGE:
         dlinear_markers = [
@@ -5442,7 +5550,7 @@ def finalize_bundle(
             )
         if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE:
             expected_code_sha = (
-                current_training_code_sha
+                None
                 if model_id in MODERN_TRAINABLE_MODEL_IDS
                 else BASE10_TRAINING_CODE_SHA256
             )
@@ -5454,6 +5562,16 @@ def finalize_bundle(
                 raise ValueError(
                     f"{model_id}/{marker['farm_id']}缺少unified lineage身份"
                 )
+            if model_id in MODERN_TRAINABLE_MODEL_IDS:
+                marker_code_sha = str(
+                    marker.get("training_code_sha256", "")
+                )
+                if marker_code_sha not in compatible_unified_code_shas:
+                    raise ValueError(
+                        f"{model_id}/{marker['farm_id']}训练代码SHA既不是"
+                        "SSH迁移前冻结SHA，也不是当前本机脚本SHA"
+                    )
+                unified_modern_code_shas.add(marker_code_sha)
         else:
             expected_code_sha = (
                 staged_dlinear_code_sha
@@ -5468,7 +5586,10 @@ def finalize_bundle(
                 raise ValueError(
                     f"{model_id}/{marker['farm_id']}staged lineage身份漂移"
                 )
-        if marker.get("training_code_sha256") != expected_code_sha:
+        if (
+            expected_code_sha is not None
+            and marker.get("training_code_sha256") != expected_code_sha
+        ):
             raise ValueError(
                 f"{model_id}/{marker['farm_id']}训练代码SHA不符合追加矩阵身份"
             )
@@ -5726,7 +5847,20 @@ def finalize_bundle(
         ),
         "legacy_training_code_sha256": BASE10_TRAINING_CODE_SHA256,
         "modern_extension_training_code_sha256": (
-            current_training_code_sha
+            next(iter(unified_modern_code_shas))
+            if (
+                extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+                and len(unified_modern_code_shas) == 1
+            )
+            else None
+        ),
+        "modern_extension_training_code_sha256s": (
+            sorted(unified_modern_code_shas)
+            if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
+            else None
+        ),
+        "pre_relocation_modern_training_code_sha256": (
+            PRE_RELOCATION_MODERN_TRAINING_CODE_SHA256
             if extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
             else None
         ),
@@ -5931,10 +6065,10 @@ def run_parent(args: argparse.Namespace) -> int:
                         extension_lineage
                         == UNIFIED_MODERN_EXTENSION_LINEAGE
                         and completed_marker.get("training_code_sha256")
-                        != sha256_file(__file__)
+                        not in compatible_unified_modern_training_code_sha256s()
                     ):
                         raise ValueError(
-                            f"unified resume训练代码SHA漂移: "
+                            f"unified resume训练代码SHA不在精确迁移allowlist: "
                             f"{model_id}/{farm_id}"
                         )
                 print(f"[resume] {model_id}/{farm_id}已完成，跳过")

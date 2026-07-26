@@ -34,8 +34,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-RESULT_ROOT = Path(
-    "./wind_results/part3_new_module_supplement/"
+PROJECT_ROOT = Path(__file__).resolve().parent
+# Round-3 base10 artifacts were produced on the rented SSH host under this
+# checkout.  Their JSON markers are immutable hash evidence, so moving the
+# project back to the workstation must not rewrite those files.  Only this
+# explicitly allow-listed repository root may be rebased; arbitrary absolute
+# paths remain absolute and therefore still fail closed.
+RELOCATABLE_PROJECT_ROOTS = (
+    Path("/root/digitalchina2026").resolve(),
+)
+# SHA-256 of this prediction file in commit 464e50f.  That version and the
+# current version differ only in checkout-path portability logic; they execute
+# the same model graphs, batching, inverse scaling, metrics and plots.  Resume
+# accepts this one explicitly frozen predecessor, never an arbitrary code hash.
+RELOCATION_COMPATIBLE_PREDICTION_CODE_SHA256S = frozenset(
+    {"4fa9ca8726fab1ba4f3280a6146490547473e7972b903d7b6574ac20665cdbfd"}
+)
+# Equivalent pre-relocation training source from the same commit.  The
+# training complete marker may contain tasks produced on both sides of the
+# move, so prediction validates every task against this exact allow-list plus
+# the hashes declared by the final training complete marker.
+RELOCATION_COMPATIBLE_TRAINING_CODE_SHA256S = frozenset(
+    {"380e5855d71507b5aeb8b844c5ea91902b45246fc3a55f78064e0a6c05e7faff"}
+)
+RESULT_ROOT = PROJECT_ROOT / Path(
+    "wind_results/part3_new_module_supplement/"
     "03_external14_leakage_free_strong_baseline_benchmark"
 )
 PREDICTION_DIRNAME = "testdata_predict_output"
@@ -254,6 +277,7 @@ def _test_evaluation_provenance(
 
 
 def _sha256(path):
+    path = _resolve_relocated_path(path)
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -262,7 +286,7 @@ def _sha256(path):
 
 
 def _file_record(path):
-    path = Path(path).resolve()
+    path = _resolve_relocated_path(path)
     if not path.is_file():
         raise FileNotFoundError(path)
     return {
@@ -382,6 +406,7 @@ def _json_safe(value):
 
 
 def _read_json(path):
+    path = _resolve_relocated_path(path)
     with open(path, "r", encoding="utf-8-sig") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
@@ -398,18 +423,97 @@ def _completion_declared(payload):
     )
 
 
+def _resolve_relocated_path(path):
+    """Resolve a marker path after a controlled checkout relocation.
+
+    The relocation changes only the repository prefix.  The path below that
+    prefix remains byte-for-byte the same, and callers still verify recorded
+    sizes and SHA-256 hashes.  This intentionally does not search by basename
+    or accept an arbitrary alternative root.
+    """
+    if path is None:
+        raise ValueError("文件记录缺少path")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve(strict=False)
+        try:
+            candidate.relative_to(PROJECT_ROOT)
+        except ValueError as exc:
+            raise ValueError(
+                f"相对路径逃逸当前项目根目录: {path}"
+            ) from exc
+    candidate = candidate.resolve(strict=False)
+    for old_root in RELOCATABLE_PROJECT_ROOTS:
+        try:
+            relative = candidate.relative_to(old_root)
+        except ValueError:
+            continue
+        relocated = (PROJECT_ROOT / relative).resolve(strict=False)
+        try:
+            relocated.relative_to(PROJECT_ROOT)
+        except ValueError as exc:  # defensive guard against ``..`` traversal
+            raise ValueError(
+                f"迁移路径逃逸当前项目根目录: {path}"
+            ) from exc
+        return relocated
+    return candidate
+
+
+def _same_relocated_path(left, right):
+    """Compare two paths after applying the controlled project-root rebase."""
+    return _resolve_relocated_path(left) == _resolve_relocated_path(right)
+
+
+def _portable_project_path(value):
+    """Return a location-independent identity for an in-project path string."""
+    if not isinstance(value, str):
+        return value
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        return value
+    resolved = _resolve_relocated_path(candidate)
+    try:
+        relative = resolved.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return value
+    return f"$PROJECT_ROOT/{relative.as_posix()}"
+
+
+def _normalize_relocated_payload(value):
+    """Normalize only allow-listed absolute paths in nested snapshot JSON."""
+    if isinstance(value, dict):
+        return {
+            key: _normalize_relocated_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_relocated_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_relocated_payload(item) for item in value)
+    return _portable_project_path(value)
+
+
+def _same_relocated_payload(left, right):
+    return _normalize_relocated_payload(
+        left
+    ) == _normalize_relocated_payload(right)
+
+
 def _forbid_legacy_path(path):
-    resolved = Path(path).resolve()
+    resolved = _resolve_relocated_path(path)
     if "processed_npz" in {part.lower() for part in resolved.parts}:
         raise ValueError(f"Round 3禁止读取旧processed_npz产物: {resolved}")
     return resolved
 
 
 def _resolve_existing(root, candidates):
+    root = _resolve_relocated_path(root)
     for item in candidates:
         path = Path(item)
         if not path.is_absolute():
-            path = Path(root) / path
+            path = root / path
+        else:
+            path = _resolve_relocated_path(path)
         if path.is_file():
             return path.resolve()
     raise FileNotFoundError(f"未找到候选文件: {candidates}")
@@ -555,7 +659,7 @@ def _assert_station_matches_training(station, frozen_tasks, models, farm_id, for
 
 def _validate_record(record, hash_cache=None):
     record = dict(record)
-    path = Path(record["path"]).resolve()
+    path = _resolve_relocated_path(record["path"])
     if not path.is_file():
         raise FileNotFoundError(path)
     expected_size = record.get("size_bytes")
@@ -596,7 +700,7 @@ def _validate_preprocess_complete(root):
 
 def _validate_all_training_frozen(root):
     """在测试数组被读取前冻结并验证完整模型×场站训练矩阵。"""
-    root = Path(root).resolve()
+    root = _resolve_relocated_path(root)
     complete_path = root / "round3_training_bundle_complete.json"
     if not complete_path.is_file():
         raise FileNotFoundError(
@@ -647,13 +751,37 @@ def _validate_all_training_frozen(root):
             != len(LEGACY_MODEL_IDS) * len(EXPECTED_FARMS)
         ):
             raise ValueError("统一现代基线训练归档的base10/140任务身份漂移")
-        modern_training_code_sha = str(
-            complete.get("modern_extension_training_code_sha256", "")
+        declared_training_code_hashes = {
+            str(item)
+            for item in complete.get(
+                "modern_extension_training_code_sha256s", ()
+            )
+            if item
+        }
+        legacy_single_hash = complete.get(
+            "modern_extension_training_code_sha256"
         )
-        if not modern_training_code_sha:
+        if legacy_single_hash:
+            declared_training_code_hashes.add(str(legacy_single_hash))
+        if not declared_training_code_hashes:
             raise ValueError(
                 "统一现代基线训练complete缺少现代四模型训练代码SHA"
             )
+        current_training_code_hash = _sha256(
+            PROJECT_ROOT
+            / "wind_part3_round3_external14_all_models_train.py"
+        )
+        allowed_training_code_hashes = {
+            current_training_code_hash,
+            *RELOCATION_COMPATIBLE_TRAINING_CODE_SHA256S,
+        }
+        if not declared_training_code_hashes.issubset(
+            allowed_training_code_hashes
+        ):
+            raise ValueError(
+                "训练complete声明了非路径迁移等价版本的现代模型训练代码SHA"
+            )
+        modern_training_code_hashes = declared_training_code_hashes
     elif extension_lineage == STAGED_EXTENSION_LINEAGE:
         pre_dlinear_archive = complete.get(
             "pre_dlinear_training_complete_archive"
@@ -678,7 +806,7 @@ def _validate_all_training_frozen(root):
             != len(PRE_DLINEAR_MODEL_IDS) * len(EXPECTED_FARMS)
         ):
             raise ValueError("pre-DLinear训练归档的13模型/182任务身份漂移")
-        modern_training_code_sha = None
+        modern_training_code_hashes = set()
     else:
         raise ValueError(f"未知训练扩展代际: {extension_lineage}")
     for record in complete.get("summary_outputs", {}).values():
@@ -706,7 +834,7 @@ def _validate_all_training_frozen(root):
             if not path.is_file():
                 raise FileNotFoundError(f"正式测试缺少训练task marker: {path}")
             declared_record = task_records[(model_id, farm_id)]
-            if Path(declared_record["path"]).resolve() != path.resolve():
+            if not _same_relocated_path(declared_record["path"], path):
                 raise ValueError(f"训练task marker路径与complete快照不一致: {path}")
             _validate_record(declared_record, hash_cache)
             marker = _read_json(path)
@@ -738,7 +866,7 @@ def _validate_all_training_frozen(root):
                 extension_lineage == UNIFIED_MODERN_EXTENSION_LINEAGE
                 and model_id in MODERN_TRAINABLE_MODEL_IDS
                 and marker.get("training_code_sha256")
-                != modern_training_code_sha
+                not in modern_training_code_hashes
             ):
                 raise ValueError(
                     f"统一现代基线训练task代码SHA漂移: {model_id}/{farm_id}"
@@ -909,9 +1037,15 @@ def _load_station_bundle(root, farm_id, smoke_limit=None):
         str(default_array_path),
     )
     array_path = Path(array_hint)
-    if not array_path.is_absolute():
+    if array_path.is_absolute():
+        array_path = _resolve_relocated_path(array_path)
+    else:
         candidate = Path(root) / array_path
-        array_path = candidate if candidate.is_file() else bundle_path.parent / array_path
+        array_path = (
+            candidate
+            if candidate.is_file()
+            else bundle_path.parent / array_path
+        )
     array_path = _forbid_legacy_path(array_path)
     if not array_path.is_file():
         raise FileNotFoundError(array_path)
@@ -1757,9 +1891,11 @@ def _prediction_marker_valid(
     expected_bundle_hash=None,
     expected_snapshot_hash=None,
     expected_prediction_code_hash=None,
+    compatible_prediction_code_hashes=(),
     expected_batch_size=None,
 ):
-    if not Path(path).is_file():
+    path = _resolve_relocated_path(path)
+    if not path.is_file():
         return None
     try:
         marker = _read_json(path)
@@ -1802,12 +1938,16 @@ def _prediction_marker_valid(
             != expected_snapshot_hash
         ):
             return None
-        if (
-            expected_prediction_code_hash is not None
-            and marker.get("prediction_code_sha256")
-            != expected_prediction_code_hash
-        ):
-            return None
+        if expected_prediction_code_hash is not None:
+            allowed_prediction_code_hashes = {
+                str(expected_prediction_code_hash),
+                *map(str, compatible_prediction_code_hashes),
+            }
+            if (
+                marker.get("prediction_code_sha256")
+                not in allowed_prediction_code_hashes
+            ):
+                return None
         if (
             expected_batch_size is not None
             and int(marker.get("batch_size", -1))
@@ -1867,6 +2007,9 @@ def _persistence_prediction_marker_valid(
         expected_bundle_hash=bundle_hash,
         expected_snapshot_hash=snapshot_hash,
         expected_prediction_code_hash=prediction_code_hash,
+        compatible_prediction_code_hashes=(
+            RELOCATION_COMPATIBLE_PREDICTION_CODE_SHA256S
+        ),
         expected_batch_size=None,
     )
     if marker is None:
@@ -1920,8 +2063,10 @@ def _persistence_prediction_marker_valid(
             != "numpy_cpu_closed_form"
             or marker.get("baseline_spec_sha256")
             != baseline_spec_record["sha256"]
-            or Path(marker.get("baseline_spec_path", "")).resolve()
-            != Path(baseline_spec_record["path"]).resolve()
+            or not _same_relocated_path(
+                marker.get("baseline_spec_path", ""),
+                baseline_spec_record["path"],
+            )
             or marker.get("prediction_batch_affects_model_selection")
             is not False
             or not required_plot_outputs.issubset(
@@ -2812,9 +2957,17 @@ def _save_final_selection(
                 + (
                     (
                         "while prior learned-model predictions remain frozen; "
-                        "DLinear is evaluated only after its 14 from-scratch "
-                        "tasks are frozen, and Persistence uses a frozen "
-                        "training-free last-observation rule."
+                        + (
+                            "iTransformer, TimesNet, TimeMixer and DLinear "
+                            "are evaluated only after all 56 from-scratch "
+                            "tasks are frozen, and Persistence uses a frozen "
+                            "training-free last-observation rule."
+                            if extension_lineage
+                            == UNIFIED_MODERN_EXTENSION_LINEAGE
+                            else "DLinear is evaluated only after its 14 "
+                            "from-scratch tasks are frozen, and Persistence "
+                            "uses a frozen training-free last-observation rule."
+                        )
                         if additive_extension
                         else "while formal Round-3 evaluation starts only "
                         "after all from-scratch tasks are frozen."
@@ -2969,7 +3122,7 @@ def _validate_inventory(output_root, inventory_record):
 
 
 def _copy_exact_artifact(source, destination):
-    source = Path(source).resolve()
+    source = _resolve_relocated_path(source)
     destination = Path(destination).resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
@@ -3108,7 +3261,7 @@ def _validate_old_timesnet_prediction_binding(marker, snapshot_record):
             "旧TimesNet marker缺少prediction_code_sha256: "
             f"{marker.get('model_id')}/{marker.get('farm_id')}"
         )
-    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_path = _resolve_relocated_path(snapshot_record["path"])
     snapshot_payload = _read_json(snapshot_path)
     snapshot_code_record = snapshot_payload.get("prediction_code")
     if not isinstance(snapshot_code_record, dict):
@@ -3123,7 +3276,9 @@ def _validate_old_timesnet_prediction_binding(marker, snapshot_record):
     # snapshot中的源代码路径指向同一预测文件；加入TimeMixer后当前字节必然
     # 改变，不能用_validate_record误判旧TimesNet。快照文件本身及其内部SHA
     # 绑定才是历史来源证明。
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""), snapshot_path
+    ):
         raise ValueError(
             "旧TimesNet marker绑定的快照路径与归档映射不一致: "
             f"{marker.get('farm_id')}"
@@ -3161,7 +3316,7 @@ def _validate_old_timemixer_prediction_binding(marker, snapshot_record):
             "旧TimeMixer marker缺少prediction_code_sha256: "
             f"{marker.get('model_id')}/{marker.get('farm_id')}"
         )
-    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_path = _resolve_relocated_path(snapshot_record["path"])
     snapshot_payload = _read_json(snapshot_path)
     snapshot_code_record = snapshot_payload.get("prediction_code")
     if not isinstance(snapshot_code_record, dict):
@@ -3175,7 +3330,9 @@ def _validate_old_timemixer_prediction_binding(marker, snapshot_record):
         )
     # 加入DLinear后当前预测文件的字节必然变化。这里有意只验证旧marker
     # 与旧快照内部记录的SHA，而不把历史代码路径当作当前文件重新哈希。
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""), snapshot_path
+    ):
         raise ValueError(
             "旧TimeMixer marker绑定的快照路径与归档映射不一致: "
             f"{marker.get('farm_id')}"
@@ -3213,7 +3370,7 @@ def _validate_old_dlinear_prediction_binding(marker, snapshot_record):
             "旧DLinear marker缺少prediction_code_sha256: "
             f"{marker.get('model_id')}/{marker.get('farm_id')}"
         )
-    snapshot_path = Path(snapshot_record["path"]).resolve()
+    snapshot_path = _resolve_relocated_path(snapshot_record["path"])
     snapshot_payload = _read_json(snapshot_path)
     snapshot_code_record = snapshot_payload.get("prediction_code")
     if (
@@ -3224,7 +3381,9 @@ def _validate_old_dlinear_prediction_binding(marker, snapshot_record):
             "旧DLinear marker与其历史快照prediction code SHA不一致: "
             f"{marker.get('farm_id')}"
         )
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != snapshot_path:
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""), snapshot_path
+    ):
         raise ValueError(
             "旧DLinear marker绑定的快照路径与归档映射不一致: "
             f"{marker.get('farm_id')}"
@@ -3252,9 +3411,8 @@ def _validate_pre_timemixer_live_marker(
     if not marker_path.is_file():
         raise FileNotFoundError(f"缺少pre-TimeMixer预测marker: {marker_path}")
     if frozen_marker_record is not None:
-        if (
-            Path(frozen_marker_record["path"]).resolve()
-            != marker_path.resolve()
+        if not _same_relocated_path(
+            frozen_marker_record["path"], marker_path
         ):
             raise ValueError(f"pre-TimeMixer冻结预测marker路径漂移: {pair}")
         if _sha256(marker_path) != frozen_marker_record["sha256"]:
@@ -3269,9 +3427,10 @@ def _validate_pre_timemixer_live_marker(
             f"{model_id}绑定的冻结快照代际错误: "
             f"{snapshot_record['path']}"
         )
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
-        snapshot_record["path"]
-    ).resolve():
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""),
+        snapshot_record["path"],
+    ):
         raise ValueError(f"{model_id}/{farm_id}冻结快照路径漂移")
     valid = _prediction_marker_valid(
         marker_path,
@@ -3316,9 +3475,8 @@ def _validate_pre_dlinear_live_marker(
     if not marker_path.is_file():
         raise FileNotFoundError(f"缺少pre-DLinear预测marker: {marker_path}")
     if frozen_marker_record is not None:
-        if (
-            Path(frozen_marker_record["path"]).resolve()
-            != marker_path.resolve()
+        if not _same_relocated_path(
+            frozen_marker_record["path"], marker_path
         ):
             raise ValueError(f"pre-DLinear冻结预测marker路径漂移: {pair}")
         if _sha256(marker_path) != frozen_marker_record["sha256"]:
@@ -3331,9 +3489,10 @@ def _validate_pre_dlinear_live_marker(
             f"{model_id}绑定的冻结快照代际错误: "
             f"{snapshot_record['path']}"
         )
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
-        snapshot_record["path"]
-    ).resolve():
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""),
+        snapshot_record["path"],
+    ):
         raise ValueError(f"{model_id}/{farm_id}冻结快照路径漂移")
     valid = _prediction_marker_valid(
         marker_path,
@@ -3384,8 +3543,9 @@ def _validate_pre_persistence_live_marker(
         )
     if frozen_marker_record is not None:
         if (
-            Path(frozen_marker_record["path"]).resolve()
-            != marker_path.resolve()
+            not _same_relocated_path(
+                frozen_marker_record["path"], marker_path
+            )
             or _sha256(marker_path) != frozen_marker_record["sha256"]
         ):
             raise ValueError(f"pre-Persistence冻结预测marker漂移: {pair}")
@@ -3453,15 +3613,17 @@ def _validate_base10_live_marker(
         raise FileNotFoundError(f"缺少base10预测marker: {marker_path}")
     if frozen_marker_record is not None:
         if (
-            Path(frozen_marker_record["path"]).resolve()
-            != marker_path.resolve()
+            not _same_relocated_path(
+                frozen_marker_record["path"], marker_path
+            )
             or _sha256(marker_path) != frozen_marker_record["sha256"]
         ):
             raise ValueError(f"base10冻结预测marker漂移: {pair}")
     marker = _read_json(marker_path)
-    if Path(marker.get("frozen_snapshot_path", "")).resolve() != Path(
-        snapshot_record["path"]
-    ).resolve():
+    if not _same_relocated_path(
+        marker.get("frozen_snapshot_path", ""),
+        snapshot_record["path"],
+    ):
         raise ValueError(f"base10预测marker快照路径漂移: {pair}")
     task = frozen["tasks"][pair]
     valid = _prediction_marker_valid(
@@ -3605,7 +3767,9 @@ def _load_or_archive_base10_prediction_state(output_root, frozen):
     ).resolve()
 
     def final_archive_record(record):
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = _resolve_relocated_path(record["path"]).relative_to(
+            staging_root
+        )
         return {
             **record,
             "path": str((archive_root / relative).resolve()),
@@ -3633,7 +3797,7 @@ def _load_or_archive_base10_prediction_state(output_root, frozen):
             ),
         }
         for key, record in complete.get("summary_files", {}).items():
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"summary_{key}"] = final_archive_record(
                 _copy_exact_artifact(
                     source,
@@ -3715,7 +3879,7 @@ def _load_or_archive_pre_timesnet_prediction_state(output_root, frozen):
         if set(frozen_markers) != expected_pairs:
             raise ValueError("pre-TimesNet归档缺少154个预测marker记录")
         for pair, record in frozen_markers.items():
-            path = Path(record["path"])
+            path = _resolve_relocated_path(record["path"])
             if not path.is_file() or _sha256(path) != record["sha256"]:
                 raise ValueError(
                     f"pre-TimesNet冻结预测marker漂移: {pair}"
@@ -3833,7 +3997,9 @@ def _load_or_archive_pre_timesnet_prediction_state(output_root, frozen):
     ).resolve()
 
     def final_archive_record(record):
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = _resolve_relocated_path(record["path"]).relative_to(
+            staging_root
+        )
         return {
             **record,
             "path": str((archive_root / relative).resolve()),
@@ -3857,7 +4023,7 @@ def _load_or_archive_pre_timesnet_prediction_state(output_root, frozen):
             ),
         }
         for key, record in complete.get("summary_files", {}).items():
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"summary_{key}"] = final_archive_record(
                 _copy_exact_artifact(
                     source,
@@ -3871,7 +4037,7 @@ def _load_or_archive_pre_timesnet_prediction_state(output_root, frozen):
             for record in snapshot_by_model.values()
         }
         for index, record in enumerate(unique_snapshots.values(), start=1):
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"frozen_snapshot_{index}"] = (
                 final_archive_record(
                     _copy_exact_artifact(
@@ -4083,7 +4249,9 @@ def _load_or_archive_pre_timemixer_prediction_state(
     ).resolve()
 
     def final_archive_record(record):
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = _resolve_relocated_path(record["path"]).relative_to(
+            staging_root
+        )
         return {
             **record,
             "path": str((archive_root / relative).resolve()),
@@ -4107,7 +4275,7 @@ def _load_or_archive_pre_timemixer_prediction_state(
             ),
         }
         for key, record in complete.get("summary_files", {}).items():
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"summary_{key}"] = final_archive_record(
                 _copy_exact_artifact(
                     source,
@@ -4128,7 +4296,7 @@ def _load_or_archive_pre_timemixer_prediction_state(
         for index, record in enumerate(
             unique_snapshots.values(), start=1
         ):
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"frozen_snapshot_{index}"] = (
                 final_archive_record(
                     _copy_exact_artifact(
@@ -4369,7 +4537,9 @@ def _load_or_archive_pre_dlinear_prediction_state(output_root, frozen):
     ).resolve()
 
     def final_archive_record(record):
-        relative = Path(record["path"]).resolve().relative_to(staging_root)
+        relative = _resolve_relocated_path(record["path"]).relative_to(
+            staging_root
+        )
         return {
             **record,
             "path": str((archive_root / relative).resolve()),
@@ -4393,7 +4563,7 @@ def _load_or_archive_pre_dlinear_prediction_state(output_root, frozen):
             ),
         }
         for key, record in complete.get("summary_files", {}).items():
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"summary_{key}"] = final_archive_record(
                 _copy_exact_artifact(
                     source,
@@ -4405,7 +4575,7 @@ def _load_or_archive_pre_dlinear_prediction_state(output_root, frozen):
         for index, record in enumerate(
             unique_snapshots.values(), start=1
         ):
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"frozen_snapshot_{index}"] = (
                 final_archive_record(
                     _copy_exact_artifact(
@@ -4768,7 +4938,7 @@ def _load_or_archive_pre_persistence_prediction_state(
     ).resolve()
 
     def final_archive_record(record):
-        relative = Path(record["path"]).resolve().relative_to(
+        relative = _resolve_relocated_path(record["path"]).relative_to(
             staging_root
         )
         return {
@@ -4794,7 +4964,7 @@ def _load_or_archive_pre_persistence_prediction_state(
             ),
         }
         for key, record in complete.get("summary_files", {}).items():
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"summary_{key}"] = final_archive_record(
                 _copy_exact_artifact(
                     source,
@@ -4832,7 +5002,7 @@ def _load_or_archive_pre_persistence_prediction_state(
         for index, record in enumerate(
             unique_snapshots.values(), start=1
         ):
-            source = Path(record["path"])
+            source = _resolve_relocated_path(record["path"])
             archived_records[f"frozen_snapshot_{index}"] = (
                 final_archive_record(
                     _copy_exact_artifact(
@@ -4964,7 +5134,22 @@ def _freeze_snapshot(
         comparable_payload = dict(payload)
         comparable_existing.pop("created_at_utc", None)
         comparable_payload.pop("created_at_utc", None)
-        if comparable_existing != comparable_payload:
+        existing_prediction_code = comparable_existing.get(
+            "prediction_code"
+        )
+        if (
+            isinstance(existing_prediction_code, dict)
+            and existing_prediction_code.get("sha256")
+            in RELOCATION_COMPATIBLE_PREDICTION_CODE_SHA256S
+        ):
+            # Preserve the immutable old snapshot.  The allow-listed source
+            # predecessor differs only by this checkout relocation adapter.
+            comparable_payload["prediction_code"] = (
+                existing_prediction_code
+            )
+        if _normalize_relocated_payload(
+            comparable_existing
+        ) != _normalize_relocated_payload(comparable_payload):
             raise ValueError(
                 "已有预测输出的冻结训练快照与当前训练产物不同；"
                 "拒绝在同一目录混合测试结果"
@@ -4978,7 +5163,7 @@ def _revalidate_frozen(frozen):
     if frozen.get("training_complete"):
         _validate_record(frozen["training_complete"])
     for task in frozen["tasks"].values():
-        path = Path(task["path"])
+        path = _resolve_relocated_path(task["path"])
         if _sha256(path) != task["sha256"]:
             raise ValueError(f"预测期间训练task marker发生变化: {path}")
         _validate_record(task["model_record"])
@@ -5005,7 +5190,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     current_prediction_code_sha256 = _sha256(__file__)
-    root = Path(args.result_root).resolve()
+    root = _resolve_relocated_path(args.result_root)
     models = _normalize_requested(args.models, MODEL_IDS, "模型")
     farms = _normalize_requested(args.farms, EXPECTED_FARMS, "场站")
     if args.batch_size <= 0:
@@ -5036,7 +5221,7 @@ def main(argv=None):
     if formal:
         output_root = root / PREDICTION_DIRNAME
     elif args.output_root:
-        output_root = Path(args.output_root).resolve()
+        output_root = _resolve_relocated_path(args.output_root)
         formal_output_root = (root / PREDICTION_DIRNAME).resolve()
         if (
             output_root == formal_output_root
@@ -5387,24 +5572,36 @@ def main(argv=None):
                         )
                     )
                     != 0
-                    or existing.get("training_complete")
-                    != frozen.get("training_complete")
-                    or existing.get("frozen_snapshot")
-                    != snapshot_record
-                    or existing.get(
-                        "persistence_extension_snapshot"
+                    or not _same_relocated_payload(
+                        existing.get("training_complete"),
+                        frozen.get("training_complete"),
                     )
-                    != snapshot_record
-                    or existing.get("persistence_baseline_spec")
-                    != persistence_spec_record
-                    or existing.get("dlinear_extension_snapshot")
-                    != dlinear_extension_snapshot_record
-                    or existing.get(
-                        "unified_modern_extension_snapshot"
+                    or not _same_relocated_payload(
+                        existing.get("frozen_snapshot"),
+                        snapshot_record,
                     )
-                    != unified_modern_extension_snapshot_record
-                    or existing.get("base10_prediction_state_archive")
-                    != prior_base10_archive
+                    or not _same_relocated_payload(
+                        existing.get("persistence_extension_snapshot"),
+                        snapshot_record,
+                    )
+                    or not _same_relocated_payload(
+                        existing.get("persistence_baseline_spec"),
+                        persistence_spec_record,
+                    )
+                    or not _same_relocated_payload(
+                        existing.get("dlinear_extension_snapshot"),
+                        dlinear_extension_snapshot_record,
+                    )
+                    or not _same_relocated_payload(
+                        existing.get(
+                            "unified_modern_extension_snapshot"
+                        ),
+                        unified_modern_extension_snapshot_record,
+                    )
+                    or not _same_relocated_payload(
+                        existing.get("base10_prediction_state_archive"),
+                        prior_base10_archive,
+                    )
                     or existing.get(
                         "base10_original_prediction_complete_sha256"
                     )
@@ -5527,6 +5724,9 @@ def main(argv=None):
                                     if model_id
                                     in MODERN_TRAINABLE_MODEL_IDS
                                     else None
+                                ),
+                                compatible_prediction_code_hashes=(
+                                    RELOCATION_COMPATIBLE_PREDICTION_CODE_SHA256S
                                 ),
                                 expected_batch_size=(
                                     DEFAULT_BATCH_SIZE
@@ -5757,6 +5957,9 @@ def main(argv=None):
                                 if model_id
                                 in MODERN_TRAINABLE_MODEL_IDS
                                 else None
+                            ),
+                            compatible_prediction_code_hashes=(
+                                RELOCATION_COMPATIBLE_PREDICTION_CODE_SHA256S
                             ),
                             expected_batch_size=(
                                 args.batch_size
