@@ -1,11 +1,12 @@
 # FeTS-PatchTST 面向 SCI 一区论文的创新路线、实验方案与结果总览
 
-> 更新日期：2026-07-19
+> 更新日期：2026-07-27
 > 项目根目录：`/mnt/d/Python/myprojects/digitalchina2026`
-> 任务：五场站、15 min 分辨率、历史 96 点预测未来 16 点的超短期风电功率预测
+> 任务：5 个开发场站 + 14 个补充风场、15 min 分辨率、历史 96 点预测未来 16 点的超短期风电功率预测
 > 当前实验种子：`seed=2026`
-> 当前正式测试选型模型：`X0 = D0 = T0 = G0 = F7`
-> 当前证据协议：`legacy_seen_test_selected`，属于探索性选型，不是最终独立盲测
+> 当前正式模型名称：`WindPRISM`，结构映射为 `X0 = D0 = T0 = G0 = F7`
+> 原 5 站协议：`legacy_seen_test_selected`，用于机制开发与消融
+> 补充 14 站协议：严格按时间 70/15/15 划分、train-only 预处理的外部场站补充验证；结果选择仍按保守口径标记为描述性，而非全球最终盲测
 > 背景文档：`docs/WIND_FETS_PATCHTST_MODEL_DEVELOPMENT_CONTEXT.md`
 
 本文将 FeTS-PatchTST 项目迄今的研究讨论、创新充分性判断、实验方案、执行进度、
@@ -24,8 +25,11 @@ PatchTST encoder、四专家 MoE 或 FeTS 模块。
 3. **论文可主张**：结果不仅数值较好，而且有直接消融、合理归因和足够严格的
    泛化证据。
 
-当前 `X0/D0/T0/G0/F7` 是第 2 类意义下的阶段性正式最优，但由于测试集反复参与结构
-选择、只使用单随机种子，它还不能被写成最终独立盲测结论。
+当前 `WindPRISM = X0/D0/T0/G0/F7` 已在原 5 站机制开发、同超参数公平重训以及
+14 个补充风场的 15 模型统一比较中三次保持正式最优。它可以作为手稿的最终方法，
+但证据应分层表述：原 5 站是已见测试集上的开发性证据；14 站采用新的无泄漏
+处理与冻结模型比较，显著增强跨数据证据，但由于这些站点曾在另一条已淘汰的
+teacher-data 工作流中有历史暴露，结果文件按保守原则没有标记为全球最终盲测。
 
 ---
 
@@ -33,7 +37,7 @@ PatchTST encoder、四专家 MoE 或 FeTS 模块。
 
 ### 1.1 当前最终模型
 
-当前测试协议下最终保留的模型为：
+当前最终保留并正式命名为 **WindPRISM** 的模型为：
 
 ~~~text
 96×45 历史多变量输入（24 h）
@@ -54,8 +58,14 @@ non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8�
 关键事实：
 
 - 参数量：20,969；
-- 五场站等权 Macro NRMSE：0.113760989；
-- Macro NMAE：0.077608814；
+- 原 5 个开发场站的阶段选型结果：Macro NRMSE 0.113760989，Macro NMAE
+  0.077608814；
+- 原 5 站按强基线超参数从零公平重训后：Macro NRMSE 0.115067120，
+  Macro NMAE 0.078799410，仍为 NRMSE 第 1；
+- 补充 14 站统一比较：Macro trNRMSE 0.128801222、Macro trNMAE
+  0.082437232、Macro R² 0.769093510，15 个模型中综合第 1；
+- 补充 14 站 Micro trNRMSE 0.132537213、Micro trNMAE 0.081770119、
+  Micro R² 0.834648202，同样为第 1；
 - 当前正式名称映射：`F7`（特征结构）= `G0`（Stage 3 参考）= `T0`
   （Stage 4 参考）= `D0`（Stage 4B 参考）= `X0`（Stage 5 参考）；
 - 不包含原始四专家模型中的 long、mid、short FeTS 专家；
@@ -77,6 +87,9 @@ non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8�
 | Stage 5A，X0/X1-F/M/C/X1 | 轻量 fine/mid/coarse 静态历史表示本身是否改善 corrected candidate | X1-C candidate 数值最低 0.115680；X1-F 位于 0.1% 最优带且更轻 | Stage 5A 形式化选 X1-F；full X1 仅进入后续闭环诊断 | 完成 |
 | X1R 门控闭环 | full X1 候选收益能否经同 candidate 的新校准安全门控转化 | X1-fixed-G0 fused 数值为 0.113691（诊断，不可选）；X1R NRMSE 0.114370，但 NMAE/校准更好 | 精度、逐场、dynamic/ramp 与留一守门失败，正式回退 X0 | 完成 |
 | Stage 5B，X2–X6 | token 级单向/双向跨尺度交互是否应启动 | X1R 没有把 X1 candidate 收益转成稳健 fused 收益 | `stage5b_x2_x3_unlocked=false`，停止 X2–X6 | 未解锁 |
+| Part 3 Round 1，A0–A5 | TimeAlign 风格残差对齐和 regime-QDF 是否能稳定增强 X0 | A1 candidate NRMSE 0.114888，较 A0 改善 1.095%，但只有 3/5 场站 NRMSE 不退化；A2–A5 同样未过守门 | 无新变体通过稳健选型或 Stage B 解锁条件，保留 A0/WindPRISM | 完成，Stage B 不启动 |
+| Part 3 Round 2，公平重训 | WindPRISM 的优势是否只来自训练预算或 batch 差异 | 从零、batch=256、lr=5e-4、80 epochs 后 Macro NRMSE 0.115067，优于历史 HR-MoE 0.116478 和 PatchTST 0.120938 | 排除“仅因 warm-start 或 batch=192 获胜”的主要混淆，WindPRISM 保持正式模型 | 完成 |
+| Part 3 Round 3，外部 14 站 | 在无泄漏处理和 15 模型强基线矩阵下能否保持综合优势 | WindPRISM Macro trNRMSE 0.128801、trNMAE 0.082437、R² 0.769094，14 站中 6 站 NRMSE 第 1 | Macro/Micro 均综合第 1；较 DLinear/PatchTST/HR-MoE 的 Macro trNRMSE 分别改善 1.54%/2.14%/2.88% | 完成 |
 
 ### 1.3 当前最重要的科学结论
 
@@ -94,10 +107,19 @@ non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8�
 6. Stage 5A 证明静态 fine/mid/coarse 表示可小幅改善 corrected candidate，但
    X1R 又证明更好的校准、安全和平均绝对误差可以伴随 NRMSE、dynamic/ramp
    恶化。不能把“candidate 改善”或“门控校准改善”等同于部署模型晋级。
-7. 当前证据可以支撑一条清晰的轻量、工况感知、Persistence 中心方法线，但
-   **尚不足以保证 SCI 一区录用**。主要风险来自测试集参与选型、单 seed、缺少
-   最终独立时间外推/外部数据验证，以及新增安全、时频和多尺度结构没有晋级
-   最终模型。按现有证据，专业型 JCR Q2 是更现实的定位。
+7. Part 3 Round 1 的否定结果进一步说明：把 TimeAlign 式未来残差对齐或二次
+   多步目标直接叠加到现有 candidate，并不能稳定转化为五站 fused 增益，因此
+   不再启动 xCPD/variable×patch Stage B。
+8. Part 3 Round 2 证明 WindPRISM 在与原生 PatchTST/旧强基线对齐训练预算后仍
+   保持 NRMSE 第 1，轻量优势不是由 batch size 或 warm-start 单独造成。
+9. Part 3 Round 3 在 14 个补充风场、15 个模型上确认 WindPRISM 的 Macro 和
+   Micro 综合最优，并在 H3–H16 的逐 horizon NRMSE 上均为最优；最接近的
+   DLinear、PatchTST 和 HR-MoE 差异经 Holm 校正后未达到显著，故论文应写成
+   “综合最优且具有明显参数效率”，不能写成“统计显著击败所有基线”。
+10. 现有证据已从 2026-07-19 时的“专业型 Q2 更现实”提升到
+    **具备冲击专业型 SCI/JCR Q1 的完整方法—消融—外部补充验证链条，但仍属
+    Q1 边缘而非高把握录用**。继续堆叠新模型结构的边际价值低于完成统计后处理、
+    统一硬件效率报告和严谨手稿表述。
 
 ---
 
@@ -109,12 +131,12 @@ non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8�
 | 历史窗口 | 96 点，即过去 24 h |
 | 预测窗口 | 16 点，即未来 4 h |
 | 目标 | 功率 |
-| 场站 | 5 个场站分别训练独立模型 |
+| 场站 | 原 5 个开发场站 + 14 个补充场站，均按场站独立训练 |
 | 未来 NWP | 不使用 |
-| 主选择指标 | 五场站等权 Macro NRMSE |
+| 主选择指标 | 原 5 站为容量归一化 Macro NRMSE；补充 14 站因无可信装机容量，正式使用 train-q99.9 参考值归一化的 Macro trNRMSE |
 | 辅助指标 | NMAE、MAE、RMSE、R²、逐 horizon、逐工况、candidate、门控校准与安全指标 |
-| 当前训练随机性 | 固定 `seed=2026`，未做多 seed |
-| 当前批量 | 正式实验 artifact 使用 `batch_size=192` |
+| 当前训练随机性 | 各轮固定 `seed=2026`；用户已说明同模型多 seed 结论一致，手稿引用前仍需定位并归档对应 artifact |
+| 当前批量 | 主开发实验和外部 14 站为 192；Part 3 Round 2 公平重训为 256；外部 14 站未触发 192→128 OOM 回退 |
 
 五个场站：
 
@@ -131,6 +153,15 @@ non-factorized sample × horizon sigmoid gate（hidden=16，horizon embedding=8�
 ~~~text
 wind_split/wind_train_<farm_id>.csv
 wind_split/wind_test_<farm_id>.csv
+wind_split/supplementary_other_wind_data/JSFD001 ... JSFD014
+~~~
+
+外部 14 站从原始 Excel 独立预处理，明确拒绝使用其它分支生成的
+`processed_npz`。处理后的 bundle、审计、模型与结果统一保存在：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 03_external14_leakage_free_strong_baseline_benchmark/
 ~~~
 
 ### 2.1 公平比较口径
@@ -145,19 +176,42 @@ wind_split/wind_test_<farm_id>.csv
 - 相同 seed；
 - 只改变实验矩阵中被研究的结构、特征或损失。
 
-### 2.2 当前协议限制
+### 2.2 两层证据协议与限制
 
-当前结果应被标记为 `legacy_seen` 或 `legacy_seen_test_selected`，原因是：
+原 5 站结果应被标记为 `legacy_seen` 或 `legacy_seen_test_selected`，原因是：
 
 - 测试标签没有进入训练输入，但研究过程查看测试表现后继续选择了结构；
 - F0–F8、G0–G4、T0–T3、D0–D3、X0–X1 与 X1R 均按用户要求使用当前
   测试集做阶段选型；
 - 当前测试预处理先在整段文件做双向气象插值，严格在线因果性不足；
 - scaler 在完整训练文件上拟合后再切训练/验证窗口，验证段参与归一化统计；
-- 当前只有单 seed=2026，没有多 seed、K-fold 或统计显著性检验。
+- 当前主归档以 seed=2026 为准。
 
-“严格时序评价协议”在既定方案中被明确暂缓，因此本文只记录风险，不把它伪装
-成已完成工作。论文投稿前若仍不补充，应在方法和局限性中如实披露。
+补充 14 站纠正了原协议的核心数据泄漏风险：
+
+- 只读取原始 Excel，按时间顺序 70%/15%/15% 固定训练、验证和测试段；
+- scaler、缺失值重建统计、功率参考值和工况配置均只由训练段确定；
+- 以 `available_at <= decision_time` 约束历史功率和测风信息；
+- 固定 45 通道 `FEATURE_SCHEMA_V1`，预测目标仍为未来 16 步；
+- 无可信装机容量时使用每站训练段功率 q99.9，指标必须称为 trNRMSE/trNMAE；
+- 每个模型都在其首次正式测试预测前冻结并恢复最佳验证 checkpoint；但 15 模型
+  矩阵是“旧 10 模型结果冻结 + 四个现代基线和 Persistence 一次性追加”的扩展，
+  不是 15 模型在任何测试预测前同时冻结。
+
+但补充 14 站也不是严格意义的“从未接触数据集/未见场站零样本迁移”：
+
+- 每站仍是自身前 70% 训练、后 15% 测试的 **within-station chronological
+  holdout**，不是在完全未见场站直接推理；
+- JSFD001–JSFD014 曾在另一条后来淘汰的 teacher-data 工作流中出现，因此最终
+  marker 保守设置为 `test_is_final_blind_evaluation=false`；
+- `test_used_for_selection=true` 表示本轮在测试结果上描述性选出最终模型，但
+  `test_targets_used_for_training_or_validation_selection=false`，且 WindPRISM
+  在增加 iTransformer、TimesNet、TimeMixer、DLinear 和 Persistence 后未改变；
+- 时间戳语义由用户确认无误，不过现有自动审计仍保留
+  `assumed_interval_start/uncertain_alignment` 标签；手稿应以原始元数据或人工
+  核验记录补齐证据，而不能删除该审计边界；
+- 14 站主比较只有 seed=2026；既有多 seed 稳定性若用于论文，必须引用确切文件，
+  不得把其它已淘汰模型的多 seed 结果替代 WindPRISM 证据。
 
 ---
 
@@ -278,8 +332,12 @@ candidate略有改善但 fused 未改善 → 回退 T0
 candidate 小幅改善，形式化选 X1-F；full X1 进入闭环诊断
     ↓ X1R：冻结 full X1，重建 oracle/Q90 并重训非因子化校准安全 gate
 校准/安全改善但 NRMSE、dynamic/ramp 失败 → 回退 X0
-    ↓
-Stage 5B token 级 X2–X6 未解锁
+    ↓ Part 3 Round 1：residual alignment + regime-QDF
+A1 宏平均 candidate 改善但跨站守门失败 → A0，Stage B 不解锁
+    ↓ Part 3 Round 2：五站从零公平训练
+WindPRISM 仍为 NRMSE 第1，排除主要训练预算混淆
+    ↓ Part 3 Round 3：外部14站无泄漏15模型基准
+WindPRISM Macro/Micro 综合第1 → 结构定型并停止新增模型
 ~~~
 
 ---
@@ -297,6 +355,9 @@ Stage 5B token 级 X2–X6 未解锁
 | candidate-specific oracle/Q90 与门控闭环 | Stage 4B、X1R 均严格冻结 candidate、重建 train-only oracle/Q90 并做身份审计 | **实验方法支持，精度闭环失败** | 可作为严谨归因和可靠性评价贡献；不能声称新 gate 提升最终 NRMSE |
 | X1R 非因子化校准安全门控 | 相同 X1 candidate 下 Brier/ECE、regret/harm 和饱和率显著改善，但 NRMSE 比 X0 恶化 0.5353% | **安全/校准支持，部署不晋级** | 必须同时报告 NMAE 改善与 NRMSE/dynamic/ramp 失败，不得选择性汇报 |
 | 真正的 fine/mid/coarse token 级双向跨尺度交互 | X2–X6 未训练且未解锁 | **未完成** | 不得出现在当前模型结构或已完成贡献列表中 |
+| TimeAlign 风格残差对齐与 regime-QDF | Part 3 A1–A5；A1 candidate 宏平均改善但仅 3/5 场站不退化，全部未过 Stage B 守门 | **未支持为最终创新** | 可作为高成功先验的否定消融；不得写入 WindPRISM 推理图 |
+| 从零公平训练下的结构有效性 | Part 3 Round 2：WindPRISM NRMSE 0.115067，第 1；参数 20,969 | **已支持** | 可排除主要 warm-start/batch 混淆；NMAE 仍由 HR-MoE 略优 |
+| 外部 14 站强基线与中长 lead 泛化 | 15 模型 Macro/Micro 综合第 1，H3–H16 NRMSE 第 1，显著优于 11/14 基线 | **已支持，协议边界明确** | 必须称 trNRMSE/trNMAE；不是 globally blind，且最近三基线差异不显著 |
 | 原四专家 FeTS-PatchTST/防塌缩稀疏路由 | Stage 1 未证明复杂专家不可删除；两候选结构不再需要四专家负载均衡 | **不再作为当前主线** | 只能作为历史动机或对照，不能作为最终模型创新 |
 
 当前最稳妥的论文主线是：
@@ -1166,6 +1227,10 @@ complexity、controlled contrasts、Stage 5A candidate evidence、candidate inva
 
 ## 15. 跨阶段数据比较
 
+> 本节全部数值只属于原 5 个开发场站，不得与第 28 节外部 14 站的
+> trNRMSE/trNMAE 直接混排，也不能用 0.113761 与 0.128801 的大小判断模型发生
+> 退化。二者的场站、功率参考值和预处理协议均不同。
+
 ### 15.1 当前统一 seed 主线
 
 | 节点 | 结构 | Macro NRMSE | 参数量 | 相对上一关键节点 | 结论 |
@@ -1217,14 +1282,24 @@ X1-C=0.115680、full X1=0.115705；形式化选择 X1-F，数值最低为 X1-C�
 | Stage 4B D0/D0R/D1–D3 | `wind_time_freq_model_stage4b_train.py` / `_predict.py` | D0 只读，D0R/D1–D3 共 20 个新模型 | 完整，67 张正式图 | 回退 D0 | 完成 |
 | Stage 5A X0/X1-F/M/C/X1 | `wind_multiscale_correc_cand_train.py` / `_predict.py` | X0 只读，四个 adapter 共 20 个新模型 | 完整，96 张正式图 | candidate 形式化选 X1-F；部署不变 | 完成 |
 | X1R 同 candidate 门控闭环 | `wind_multiscale_correc_cand_x1r_train.py` / `_predict.py` | 冻结 full X1，新训五站 gate | 完整，36 张正式图 | 回退 X0，X2/X3 未解锁 | 完成 |
-| 多 seed/K-fold | — | 未做 | — | 本轮明确暂缓 | 暂缓 |
-| 严格时序/新盲测 | — | 未做 | — | 本轮明确暂缓，但仍是论文风险 | 暂缓 |
+| Part 3 Round 1 A0–A5 | `wind_part3_round1_stage_a_timealign_qdf_train.py` / `_predict.py` | A0 只读；A1–A5 五站新训 | 完整 | A1 数值改善但未过跨站守门；回退 A0，Stage B 不解锁 | 完成 |
+| Part 3 Round 2 五站公平重训 | `wind_part3_round2_f7_g0_strong_baseline_train.py` / `wind_dl_model_predict.py` | F7/G0 五站从零训练 | 完整 | NRMSE 第 1，排除 warm-start/batch 混淆 | 完成 |
+| Part 3 Round 3 外部 14 站预处理 | `wind_part3_round3_external14_preprocess.py` | 14 站原始 Excel 独立处理 | 审计与 bundle 完整 | 70/15/15、train-only scaler/q99.9、45 通道 | 完成 |
+| Part 3 Round 3 强基线 | `wind_part3_round3_external14_all_models_train.py` / `_predict.py` | 196/196 可训练任务；Persistence 无需训练 | 210/210 预测、15 模型统一结果 | WindPRISM Macro/Micro 综合第 1 | 完成 |
+| 多 seed/K-fold | 既有多 seed 结果待精确归档；Round 3 为 seed=2026 | 不重复 Round 3 多 seed | — | 用户确认同模型多 seed 结论一致；手稿引用前必须补 artifact 路径 | 证据待归档 |
+| 严格时序/新盲测 | 外部 14 站已完成严格时序处理；全球最终盲测未完成 | 14 站 within-station holdout | 完整审计 | 已修复主要泄漏风险，但 marker 仍非 globally blind | 部分完成 |
 | 静态 fine/mid/coarse 表示 | Stage 5A 代码 | 已完成 | 完整 | candidate 小幅有效，未成为部署结构 | 完成 |
 | X2–X6 token 单/双向跨尺度 | — | 未训练 | — | X1R 守门失败，明确未解锁 | 停止 |
 
 ---
 
 ## 17. 接下来实验的现行决策方案
+
+> **状态更新（2026-07-27）**：本节 17.2 中原先提出的第二条 Q1 方法路线已经按
+> 第 23 节执行了 Part 3 Round 1 A0–A5；没有新变体通过守门。随后完成了五站
+> 公平重训和外部 14 站 15 模型强基准。当前决策已经从“继续开发下一结构”
+> 更新为“停止新增结构训练，进入统计整理和 SCI 手稿写作”。第 25–31 节为
+> 当前权威状态，本节保留用于解释当时为什么设计该补充路线。
 
 ### 17.1 当前不应直接做的事
 
@@ -1252,14 +1327,17 @@ dynamic / ramp 守门
 calibrated-safe gate 会把模型推向大量稳定/低功率样本的 L1 收益，牺牲大变化
 样本的平方误差与 ramp。继续微调 X1R 或直接增加 token 交互，成功先验较低。
 
-现在有两条诚实路线：
+当时有两条诚实路线：
 
-1. **以现有 X0 定稿并按专业型 Q2 投稿。** 补齐强基线、复杂度、统计和协议
+1. **以现有 X0 定稿。** 补齐强基线、复杂度、统计和协议
    证据，突出轻量结构、显式工况和完整负结果；
 2. **仍以 Q1 为目标，开启新的问题驱动方法线。** 不再围绕 X1R 调阈值，而是
    先在设计用训练/验证数据验证 Persistence 残差对齐和工况条件化多步损失；
    只有候选五站一致改善后才进入选择性 variable×patch 交互与收益幅度门控。
-   详见第 23 节 PARQ-Wind 预注册路线。
+   详见第 23 节当时的 PARQ-Wind 预注册路线。
+
+实际执行选择了第 2 条的 Stage A，但 A1–A5 未解锁更复杂的 Stage B；因此最终
+又回到第 1 条，并通过 Round 2/3 把公平重训、现代强基线和外部 14 站证据补齐。
 
 任何 corrected candidate 的新结构都必须遵守：
 
@@ -1300,20 +1378,20 @@ calibrated-safe gate 会把模型推向大量稳定/低功率样本的 L1 收益
 `stage5b_x2_x3_unlocked=false`，所以 X2–X6 全部停止；不得以 X1 candidate
 有效为由绕过 fused 闭环，也不得直接用 X6 替代父子对照。
 
-### 17.5 为冲击一区仍需补强但当前被暂缓的证据
+### 17.5 原补证缺口与截至 2026-07-27 的完成状态
 
-| 证据 | 当前状态 | 投稿风险 |
-| --- | --- | --- |
-| 新的独立时间外推/rolling-origin | 未做 | 最高；当前测试已参与选型 |
-| 严格因果气象插值和 train-only scaler | 未做 | 可能被审稿人质疑协议乐观 |
-| 至少 3 seeds 与置信区间 | 未做 | 不能证明 F7 微小增益稳定 |
-| 新场站迁移或外部公开数据 | 未做 | 五个独立场站模型不等于 unseen-site 泛化 |
-| 同协议近期强基线 | 需论文阶段复核 | 仅旧 PatchTST 和内部消融可能不足 |
-| 统一硬件 latency/FLOPs/throughput/VRAM | 部分缺失 | “轻量部署”证据不完整 |
-| 概率预测/不确定性 | 未开展，非当前必做 | 若将可靠性作为主卖点会被追问 |
+| 证据 | 2026-07-19 状态 | 当前状态 | 剩余边界 |
+| --- | --- | --- | --- |
+| 新的独立时间外推/rolling-origin | 未做 | 14 站完成 within-station chronological holdout | 不是 globally blind 或零样本 unseen-site |
+| 严格因果处理和 train-only scaler | 未做 | 14 站已完成并有 hash/audit | 原 5 站历史协议不追溯重做 |
+| 至少 3 seeds 与置信区间 | 未做 | 用户确认既有多 seed 结论一致；14 站 farm bootstrap 已做 | 多 seed artifact 路径仍需归档，Round 3 仅 seed=2026 |
+| 新场站/外部数据 | 未做 | JSFD001–014 已完成 | 有另一淘汰工作流的历史数据暴露 |
+| 同协议近期强基线 | 不完整 | 15 模型已完成 | 最近三基线差异未达 Holm 显著 |
+| 统一硬件 latency/FLOPs/throughput/VRAM | 部分缺失 | 参数/文件/Pareto 完成 | 混合硬件 latency 仍不能作为公平结论 |
+| 概率预测/不确定性 | 未开展 | 仍未开展，非当前必做 | 若将概率可靠性作为主卖点仍会被追问 |
 
-用户已明确本轮暂不补严格时序、多 seed 和 K-fold；因此这些项目应保留为
-“投稿前风险与后续证据”，不能在进度表中标成完成。
+因此这一节不再支持“外部数据、严格处理、现代强基线全部缺失”的旧结论。当前
+真正优先的是无重训统计后处理、统一硬件推理复测和手稿边界控制。
 
 ---
 
@@ -1335,6 +1413,10 @@ calibrated-safe gate 会把模型推向大量稳定/低功率样本的 L1 收益
 原生 `wind_dl_model_train.py` 默认 batch=256，完整 FeTS 模型曾经 OOM。正式
 Stage 1 的 40 个 artifact 均记录 batch=192，Stage 2–5/X1R 直接以 192 为默认或
 协议校验值。
+
+Part 3 Round 2 为公平对齐旧基线，WindPRISM 使用 batch=256 并成功完成；Round 3
+外部 14 站统一使用 batch=192，代码具备 HR-MoE OOM 时全站一致回退 128 的策略，
+实际 196 个训练任务均未触发回退。
 
 单场站、单 epoch 冒烟测试的作用是验证：
 
@@ -1471,6 +1553,10 @@ FileNotFoundError: 缺少上游complete marker:
 | Stage 4B D | `wind_results/time_freq_model/supplement_round2_stage4b_gate_closure/testdata_predict_output/stage4b_gate_closure_test_final_selection.md` | D0；D0R 仅数值小幅最低 | `wind_results/time_freq_model/supplement_round2_stage4b_gate_closure/testdata_predict_output/stage4b_gate_closure_test_bundle_complete.json` |
 | Stage 5A X | `wind_results/multiscale_correc_cand/testdata_predict_output/multiscale_correc_cand_test_final_selection.md` | candidate 形式化选 X1-F；X1-C 数值最低 | `wind_results/multiscale_correc_cand/testdata_predict_output/multiscale_correc_cand_test_bundle_complete.json` |
 | X1R 闭环 | `wind_results/multiscale_correc_cand/x1r_gate_closure/testdata_predict_output/x1r_gate_closure_test_final_selection.md` | 回退 X0，X2–X6 未解锁 | `wind_results/multiscale_correc_cand/x1r_gate_closure/testdata_predict_output/x1r_gate_closure_test_bundle_complete.json` |
+| Part 3 Round 1 | `wind_results/part3_new_module_supplement/01_stage_a_timealign_residual_alignment_qdf/testdata_predict_output/stage_a_test_final_selection.md` | A0/WindPRISM；A1–A5 不晋级 | `wind_results/part3_new_module_supplement/01_stage_a_timealign_residual_alignment_qdf/stage_a_training_bundle_complete.json` 与测试完成 marker |
+| Part 3 Round 2 | `wind_results/part3_new_module_supplement/02_strong_baseline_f7_g0_fair_training/testdata_predict_output/part3_round2_all_models_test_macro_comparison.csv` | 公平从零训练 F7/G0 为五站 NRMSE 第 1 | `wind_results/part3_new_module_supplement/02_strong_baseline_f7_g0_fair_training/part3_round2_strong_baseline_training_bundle_complete.json` |
+| Part 3 Round 3 预处理 | `wind_results/part3_new_module_supplement/03_external14_leakage_free_strong_baseline_benchmark/data_audit/round3_external14_data_audit.csv` | 14 站预处理全部完成 | `wind_results/part3_new_module_supplement/03_external14_leakage_free_strong_baseline_benchmark/round3_preprocess_bundle_complete.json` |
+| Part 3 Round 3 训练/预测 | `wind_results/part3_new_module_supplement/03_external14_leakage_free_strong_baseline_benchmark/testdata_predict_output/round3_external14_test_final_selection.md` | WindPRISM 在 15 模型中综合第 1 | `round3_training_bundle_complete.json` 与 `testdata_predict_output/round3_external14_prediction_bundle_complete.json` |
 
 读取测试性能时应优先看各阶段 `variant_comparison.csv` 或
 `final_selection.md`，不要只看单个场站预测 CSV，也不要用验证集文件替代用户
@@ -1512,6 +1598,14 @@ FileNotFoundError: 缺少上游complete marker:
   预声明 tie-band 下的形式化选择；
 - X1R 在相同 full-X1 candidate 下校准/安全显著改善、但 NRMSE 与 dynamic/ramp
   失败的 L1—L2—尾部权衡。
+- Part 3 A0–A5 中 QDF、local/global residual alignment 的否定结果及停止
+  variable×patch Stage B 的守门决策；
+- Part 3 Round 2 的从零公平重训，证明 WindPRISM 的 NRMSE/复杂度优势并非仅由
+  warm-start 或 batch 差异造成；
+- 外部 14 站统一 15 模型比较、逐站、逐 horizon、W/T/L、Holm 显著性、
+  参数 Pareto 和数据质量敏感性；
+- WindPRISM 在外部 14 站 Macro/Micro 综合第 1、H3–H16 NRMSE 第 1，同时如实
+  报告 H1–H2 由 DLinear 最优、训练受限子集由 DLinear 更优。
 
 ### 20.3 不能写成已证实的主张
 
@@ -1522,8 +1616,12 @@ FileNotFoundError: 缺少上游complete marker:
 - “最终模型具有通过精度门槛的校准安全保护”；
 - “因果时频增强或静态/Token 级跨尺度交互提升了最终部署预测”；
 - “最终模型采用 X1-F、full X1 或 X1R”；
-- “多 seed 稳定”“严格在线因果”“独立盲测”“未见场站泛化”；
-- “所有指标都优于全部基线”。
+- 在未给出确切 artifact 前写“WindPRISM 已完成充分多 seed 稳定性验证”；
+- 把外部 14 站写成“完全未见场站零样本泛化”“全球最终独立盲测”；
+- “所有 14 站均最优”或“所有 horizon、所有指标都优于全部基线”；
+- “统计显著优于 DLinear、PatchTST 和 HR-MoE”；
+- “WindPRISM 是参数量最小或推理速度最快的模型”；
+- 把混合 4090/3080 Ti 环境的现有 `inference_seconds` 当作同硬件延迟结论。
 
 ### 20.4 对 SCI 一区创新充分性的最终评估
 
@@ -1537,22 +1635,24 @@ FileNotFoundError: 缺少上游complete marker:
 - 有校准和安全诊断；
 - 有失败结构的否定证据。
 
-Stage 4B、Stage 5A 和 X1R 增加了很强的归因与失败分析，但没有改变最终结构：
-部署模型仍是 20,969 参数的 X0/F7。结合 2026 同领域工作，当前结构新颖性约为
-JCR Q2，内部诊断深度接近 Q1 边缘；单 seed 和测试集反复选型又给最终证据带来
-Q3 风险。整体最现实的定位是 **专业型 JCR Q2**，不是稳定 Q1。最大短板不是
-模型名字不够复杂，而是：
+> 本小节原先截至 2026-07-19 的“专业型 Q2”判断，已被 Part 3 Round 1–3 的
+> 实际结果更新。保留早期判断的原因是记录补实验为什么发生；当前投稿判断以
+> 第 30 节为准。
 
-1. 最终 F7 的增量部分较小；
-2. G/T/D/X 新结构都没有晋级最终部署模型；
-3. 测试集被用于选型；
-4. 缺少多 seed、严格时间外推和外部/未见场站证据；
-5. 统一硬件效率和近期强基线仍不完整。
+Stage 4B、Stage 5A 和 X1R 增加了强归因与失败分析，但没有改变最终结构；
+Part 3 Round 1 又否定了残差对齐/QDF 的继续扩展。真正改变证据强度的是：
 
-因此，若严格维持现有模型与评价协议，建议按 Q2 定位；若仍坚持冲击 Q1，应先
-产生一个能在五场站、NRMSE/NMAE、dynamic/ramp 和逐 horizon 上闭环的新增核心
-机制，再补独立时序泛化、统计稳定性、同协议强基线和效率证据。第 23 节给出
-问题驱动的新路线。该判断是创新和证据强度评估，不是对期刊录用的保证。
+1. Round 2 在统一训练预算下从零公平重训 WindPRISM；
+2. Round 3 对 14 个补充场站从原始 Excel 重建严格时序数据；
+3. 统一比较 15 个模型，包括 iTransformer、TimesNet、TimeMixer、DLinear 和
+   Persistence；
+4. 补齐逐站、逐 horizon、W/T/L、Wilcoxon-Holm、bootstrap CI 和复杂度 Pareto。
+
+因此当前不再建议以“只有 Q2 证据”概括项目。更准确的评估是：
+**方法创新具有领域针对性，实验链条可支撑向专业型 Q1 投稿，但最接近三个基线
+差异不显著、14 站并非全球最终盲测、归一化依赖训练段 q99.9，故仍是 Q1 边缘，
+不是高把握 Q1。** 当前应停止为增加结构名称而继续训练，优先完成统计后处理、
+同硬件推理复测和手稿边界控制。
 
 ---
 
@@ -1570,6 +1670,10 @@ Q3 风险。整体最现实的定位是 **专业型 JCR Q2**，不是稳定 Q1�
 | Stage 4B 门控闭环 | `wind_time_freq_model_stage4b_train.py` | `wind_time_freq_model_stage4b_predict.py` |
 | Stage 5A 多尺度 candidate | `wind_multiscale_correc_cand_train.py` | `wind_multiscale_correc_cand_predict.py` |
 | X1R 门控闭环 | `wind_multiscale_correc_cand_x1r_train.py` | `wind_multiscale_correc_cand_x1r_predict.py` |
+| Part 3 Round 1 TimeAlign/QDF | `wind_part3_round1_stage_a_timealign_qdf_train.py` | `wind_part3_round1_stage_a_timealign_qdf_predict.py` |
+| Part 3 Round 2 F7/G0 公平重训 | `wind_part3_round2_f7_g0_strong_baseline_train.py` | `wind_dl_model_predict.py` 中的统一 Round 2 输出 |
+| Part 3 Round 3 外部 14 站预处理 | `wind_part3_round3_external14_preprocess.py` | 同文件生成审计和固定 bundle |
+| Part 3 Round 3 十五模型统一基准 | `wind_part3_round3_external14_all_models_train.py` | `wind_part3_round3_external14_all_models_predict.py` |
 
 ---
 
@@ -1577,10 +1681,12 @@ Q3 风险。整体最现实的定位是 **专业型 JCR Q2**，不是稳定 Q1�
 
 ### 22.1 当前最现实的定位
 
-按截至 2026-07-19 已完成的结构和证据，建议把现有论文定位为专业型 **SCI/JCR
-Q2**：方法线清楚、工程和内部消融完整，但最终部署结构仍是 X0，新增时频、
-静态多尺度与校准安全门控都没有在正式 NRMSE 守门下晋级。若不补新的盲测、
-多 seed、外部数据和同协议强基线，不宜把“冲击 Q1”写成高把握判断。
+截至 2026-07-19，本节曾把论文定位为专业型 Q2；截至 2026-07-27，外部 14 站
+严格时序处理、15 模型统一强基线和跨站统计已经完成，当前可按
+**专业型 SCI/JCR Q1 冲击稿**组织。这里的“可冲击”不等于高录用概率：对
+DLinear、PatchTST、HR-MoE 的优势尚未达到 Holm 校正显著，外部 14 站不是全球
+最终盲测，且部署时延还没有在统一硬件复测。若目标期刊审稿标准更强调通用
+模型结构的新颖性而不是领域机制与系统证据，仍存在被评价为 Q2 增量工作的风险。
 
 期刊分区会随年份、学科类别和机构口径变化；以下排序是研究主题与当前证据的
 **相对匹配度**，不是录用概率承诺，投稿当年必须重新核验 JCR/中科院分区、
@@ -1598,17 +1704,26 @@ Q2**：方法线清楚、工程和内部消融完整，但最终部署结构仍�
 
 1. Introduction：超短期风电非平稳、Persistence 强基线及复杂模型部署问题；
 2. Related Work：Patch/Transformer、物理先验、工况门控、可靠性评价；
-3. Problem and Protocol：96→16、五场站、容量归一化和 `legacy_seen` 边界；
+3. Problem and Protocol：96→16、五站开发证据与 14 站补充验证、容量归一化
+   与 train-reference 归一化、两层协议边界；
 4. Method：轻量 causal residual、P+H+D 显式编码、sample×horizon 融合；
 5. Controlled Development：B/R/F/FP 直接父子消融与 candidate drift；
-6. Main Results：总体、逐场站、逐 horizon、复杂度及强基线；
+6. Main Results：14 站 15 模型总体、逐场站、逐 horizon、显著性和复杂度；
 7. Reliability and Negative Ablations：G/T/D/X、校准、安全、ramp 和闭环失败；
-8. Limitations：单 seed、测试选型、非严格在线插值、无未见场站；
+8. Limitations：测试选型、非 globally blind、q99.9 参考、受限训练子集和
+   混合硬件效率；
 9. Conclusion。
 
 ---
 
-## 23. 继续冲击一区的下一代方法与预注册路线
+## 23. 历史补充方案：PARQ-Wind 预注册路线及其实际结局
+
+> 本节是 2026-07-19 制定的方案原貌，不再代表待执行任务。实际只执行了
+> Stage A 的 A0–A5，结果见第 26 节：A1 虽取得最低 candidate Macro NRMSE，
+> 但跨站一致性和 Stage B 守门失败；因此 Stage B 的 variable×patch 与 Stage C
+> 没有启动，最终模型仍为 WindPRISM。另一个协议偏差是，原计划要求只看训练/
+> 验证集，实际按当时用户要求使用了已见测试集作描述性选型，不能称为确认性
+> 预注册结果。
 
 ### 23.1 为什么不再继续微调 X1R 或直接训练 X2–X6
 
@@ -1623,8 +1738,9 @@ L2、尾部之间移动 Pareto 点。静态 X1 candidate 的收益又只有约 0
 1. corrected residual 是否学到了 Persistence **失效时未来 16 步残差的形态**；
 2. 训练目标是否显式处理 NRMSE/NMAE、跨 horizon 误差相关和 ramp 尾部。
 
-下面的 `PARQ-Wind` 是 2026 顶会时序思想经风电任务改造后的**研究假设**，尚未
-实现，不能写入当前论文已完成贡献，也不能预先保证五个测试集全部提升。
+下面的 `PARQ-Wind` 是当时将 2026 顶会时序思想改造成风电任务的研究假设。
+其中 residual alignment 与 regime-QDF 已通过 A1–A5 实现并得到否定性守门结论；
+选择性 variable×patch 和收益幅度门控仍未实现，不能写入当前论文已完成贡献。
 
 ### 23.2 拟议方法：PARQ-Wind
 
@@ -1705,8 +1821,9 @@ Persistence。目标是避免 X1R 在大量稳定样本上获得漂亮校准，�
 | A4 | X0 + local + global alignment | 两层对齐是否互补 |
 | A5 | A4 + regime-QDF | 推荐的第一版 Q1 candidate |
 
-Stage A 只使用设计用训练/验证数据选择，不再查看五个 legacy-seen test 调参。
-A5 进入 Stage B 前建议同时满足：
+原计划规定 Stage A 只使用设计用训练/验证数据选择，不再查看五个 legacy-seen
+test 调参；实际执行改为按 legacy test 作描述性选型，已固定写入 marker。A5
+进入 Stage B 前原建议同时满足：
 
 - 5/5 场站验证 NRMSE 严格改善；
 - 5/5 场站 NMAE 不退化，理想状态均严格改善；
@@ -1740,17 +1857,20 @@ A5 进入 Stage B 前建议同时满足：
 收益的 50%，五场站 NRMSE/NMAE 不退化，并通过 dynamic/ramp、regret/harm、
 Brier/ECE 和参数守门。
 
-### 23.6 一区确认性证据
+### 23.6 原计划的一期确认性证据与完成状态
 
-当前五个测试集已是 `legacy_seen_test_selected`，不能再承担确认性评价。新路线
-即使验证成功，投稿前仍至少需要：
+原五个测试集已是 `legacy_seen_test_selected`，不能再承担确认性评价。此后
+已经完成的事项包括：14 个补充站的严格时序预处理、PatchTST/iTransformer/
+TimesNet/TimeMixer/DLinear 等 15 模型统一比较、逐站/逐 horizon 结果、
+Wilcoxon-Holm 与参数复杂度。尚未完成或只能部分声称的事项包括：
 
-- 新的未触碰时间 holdout、rolling-origin 或外部公开数据；
-- 至少 3 seeds、均值±标准差、配对 block bootstrap/置信区间；
-- 同协议 PatchTST、iTransformer、TimesNet、TimeMixer 等近期强基线；
-- overall、五场站、逐 horizon、dynamic/ramp/大变化与过估风险；
-- 参数量、FLOPs、延迟、吞吐、峰值显存和 candidate→fused 转化率；
-- 训练期 teacher 与推理期输入的泄漏审计。
+- 外部 14 站是 within-station holdout 且存在历史数据暴露，不是全球最终盲测；
+- Round 3 只有 seed=2026；用户确认的既有同模型多 seed 证据需要精确归档；
+- 当前只有 NRMSE 的配对显著性，NMAE、Friedman/CD 和效应量表仍可后处理；
+- 参数量完整，但 FLOPs、统一硬件延迟、吞吐和峰值显存尚未形成公平主表；
+- A1–A5 的训练期 teacher 已做推理输入隔离，但因未晋级，不属于最终模型；
+- 原五站 dynamic/ramp 机制分析完整，外部 14 站不再追加 post-hoc P/H/D 消融，
+  以免继续消耗其补充验证价值。
 
 ### 23.7 若新路线成功，一区论文大致结构
 
@@ -1776,6 +1896,11 @@ Brier/ECE 和参数守门。
 - [FeTS repository](https://github.com/lllucky111/FeTS)
 - [M2FMoE](https://arxiv.org/abs/2601.08631)
 - [LayerScale/CaiT](https://openaccess.thecvf.com/content/ICCV2021/papers/Touvron_Going_Deeper_With_Image_Transformers_ICCV_2021_paper.pdf)
+- [iTransformer official repository](https://github.com/thuml/iTransformer)
+- [THUML Time-Series-Library（TimesNet 等）](https://github.com/thuml/Time-Series-Library)
+- [TimeMixer official repository](https://github.com/kwuking/TimeMixer)
+- [DLinear reference repository](https://github.com/honeywell21/DLinear)
+- [TimeAlign reference repository](https://github.com/TROUBADOUR000/TimeAlign)
 
 FeTS、M2FMoE 和 LayerScale 只说明设计思想来源；是否对本项目有效必须由本项目
 直接消融决定。当前最终 X0/D0/T0/G0/F7 已不包含完整 FeTS、PatchTST encoder
@@ -1806,5 +1931,1186 @@ FeTS、M2FMoE 和 LayerScale 只说明设计思想来源；是否对本项目有
 - [TimeRecipe](https://iclr.cc/virtual/2026/poster/10010822)
 - [ProtoTS](https://iclr.cc/virtual/2026/poster/10010284)
 
-上述顶会思想只用于提出下一轮研究假设。任何风电化改造必须由 A/B/C 直接父子
-消融和新的确认性评价证明，不能因为引用了顶会模块就自动构成一区创新。
+上述顶会思想最初用于提出补充研究假设。TimeAlign/QDF 的风电化 Stage A 已实际
+执行但未通过晋级守门；其余未执行结构仍只能视为假设。任何风电化改造必须由
+直接父子消融和确认性评价证明，不能因为引用了顶会模块就自动构成一区创新。
+
+---
+
+## 25. Part 3 补充实验总览与证据分层
+
+### 25.1 为什么启动第三部分补充实验
+
+截至 X1R，原 5 站已经形成了完整的结构消融链，但一区投稿仍有三类关键质疑：
+
+1. WindPRISM 的优势是否只来自旧 B2 权重、较小 batch 或训练预算不一致；
+2. 2026 年常见现代强基线是否缺失，导致“只战胜较旧模型”；
+3. 原 5 站测试集参与过多轮选型，是否缺乏新的跨数据证据。
+
+因此第三部分没有继续无条件扩大网络，而是按以下顺序补证：
+
+| 轮次 | 目的 | 核心问题 | 结果 |
+| --- | --- | --- | --- |
+| Part 3 Round 1 | 验证高成功先验模块 | TimeAlign 风格残差对齐与 regime-QDF 能否稳定增强 WindPRISM | A1 数值改善但跨站不稳；A1–A5 全部不晋级 |
+| Part 3 Round 2 | 公平训练控制 | WindPRISM 在与原 PatchTST/旧基线对齐训练预算后是否仍优 | 五站 NRMSE 第 1，排除主要训练混淆 |
+| Part 3 Round 3 | 外部 14 站强基准 | 严格时序处理、15 模型统一比较下是否仍综合最优 | WindPRISM Macro/Micro 综合第 1 |
+
+统一结果根目录：
+
+~~~text
+wind_results/part3_new_module_supplement/
+├─ 01_stage_a_timealign_residual_alignment_qdf/
+├─ 02_strong_baseline_f7_g0_fair_training/
+└─ 03_external14_leakage_free_strong_baseline_benchmark/
+~~~
+
+### 25.2 两层数据证据不能混排
+
+| 维度 | 原 5 个开发场站 | 补充 14 个 JSFD 场站 |
+| --- | --- | --- |
+| 作用 | 结构搜索、直接消融、工况/门控机制分析 | 严格时序预处理后的强基线补充验证 |
+| 测试协议 | `legacy_seen_test_selected` | 冻结模型统一评价，但保守标记非 globally blind |
+| 归一化 | 已有容量口径 NRMSE/NMAE | 训练段功率 q99.9，必须称 trNRMSE/trNMAE |
+| 数据处理 | 历史工程管线，存在整段 scaler/双向插值边界 | 原始 Excel、70/15/15、train-only 全部统计 |
+| 主要价值 | 解释“为什么是 F7/G0” | 解释“面对 15 模型和更多场站是否仍有效” |
+| 不可主张 | 独立盲测 | 完全未见场站零样本泛化、全球最终盲测 |
+
+原 5 站的 0.113761 和外部 14 站的 0.128801 分母、场站与处理协议不同，
+**绝不能直接比较数值大小，也不能据此说外部数据导致模型退化**。
+
+### 25.3 最终名称与结构是否改变
+
+Part 3 没有改变最终模型计算图。论文模型统一命名为 **WindPRISM**，代码和历史
+实验中的别名仍为：
+
+~~~text
+WindPRISM
+= F7 feature-screen winner
+= G0 controlled-gate reference
+= T0 time-frequency reference
+= D0 gate-closure reference
+= X0 multiscale reference
+= A0 Part-3 Stage-A reference
+~~~
+
+当前名称是对最终方法的论文级标签；历史工程标题“FeTS-PatchTST”继续用于追踪
+演进，但 WindPRISM 本身没有 PatchTST encoder、FeTS block 或四专家 MoE。
+
+---
+
+## 26. Part 3 Round 1：TimeAlign 残差对齐与 regime-QDF
+
+### 26.1 研究目的与代码
+
+这一轮对应第 23 节 Stage A，目标是在不直接训练完整 variable×patch 结构前，
+先验证两个高成功先验：
+
+- 将 TimeAlign 的历史—未来分布对齐思想改为
+  **Persistence 未来残差的局部/全局对齐**；
+- 用 P+H+D 工况生成多步相关的 **regime-conditioned quadratic direct
+  forecast（QDF）** 训练目标。
+
+代码：
+
+~~~text
+wind_part3_round1_stage_a_timealign_qdf_train.py
+wind_part3_round1_stage_a_timealign_qdf_predict.py
+~~~
+
+结果根目录：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 01_stage_a_timealign_residual_alignment_qdf/
+~~~
+
+### 26.2 A0–A5 实验矩阵
+
+| 编号 | 结构 | 隔离的问题 |
+| --- | --- | --- |
+| A0 | X0/D0/T0/G0/F7 只读引用 | 当前 WindPRISM 父基线 |
+| A1 | A0 + regime-conditioned QDF | 跨 horizon 二次误差相关目标是否独立有效 |
+| A2 | A0 + local residual alignment | 四个 1 h patch 的局部残差形态对齐是否有效 |
+| A3 | A0 + global residual alignment | 完整 4 h 残差轨迹关系对齐是否有效 |
+| A4 | A0 + local + global alignment | 两层残差对齐是否互补 |
+| A5 | A4 + regime-QDF | 对齐与多步目标是否形成联合收益 |
+
+实现边界：
+
+- A0 只读引用，不训练、不复制，也不重新 forward；
+- A1–A5 从同一个 F7 父快照开始，只微调 B2 residual 的 4 个加权层；
+- Persistence、P+H+D 工况编码器和旧 G0 门控保持冻结；
+- teacher 只在训练期看到 `Y - Persistence`，推理 `.keras` 仍只有历史输入；
+- projector 与 QDF 只属于训练 wrapper，不增加正式推理参数。
+
+### 26.3 训练协议与复杂度
+
+| 项目 | 设置 |
+| --- | --- |
+| seed | 2026 |
+| batch | 192 |
+| 最大 epochs | 60 |
+| validation | 训练文件尾部 15% |
+| optimizer | Adam，lr=1e-4 |
+| early stopping | patience=8 |
+| teacher warm-up | 3 epochs |
+| 正式推理参数 | 所有变体均为 20,969 |
+
+训练 wrapper 的额外参数只服务于训练：
+
+- A1：21,761，较推理模型多 792；
+- A2–A4：38,437，较推理模型多 17,468；
+- A5：39,205，较推理模型多 18,236。
+
+训练宏验证 candidate：
+
+| 变体 | Val candidate NRMSE | Val candidate NMAE | 观察 |
+| --- | ---: | ---: | --- |
+| A1 | **0.107788** | 0.068033 | 验证 NRMSE 最低 |
+| A2 | 0.110571 | 0.068176 | local alignment 无总体优势 |
+| A3 | 0.108077 | 0.069753 | NRMSE 次优但 NMAE 较差 |
+| A4 | 0.109342 | 0.068137 | 两层对齐没有互补 |
+| A5 | 0.108709 | **0.067826** | 验证 NMAE 最低 |
+
+### 26.4 测试集结果与正式选择
+
+测试集正式主口径为 corrected candidate；括号内是套用 frozen G0 的 fused
+诊断，不参与 Stage A 正式选择。
+
+| 变体 | Candidate NRMSE | Candidate NMAE | 相对 A0 NRMSE | Frozen-G0 fused NRMSE | Frozen-G0 fused NMAE | NRMSE 不退化场站 | 正式结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| A0 | 0.116160 | 0.081113 | — | **0.113761** | 0.077609 | 5/5 | **正式保留** |
+| A1 | **0.114888** | 0.077660 | +1.095% | 0.114316 | **0.075995** | 3/5 | 数值最低，但未过稳健门 |
+| A2 | 0.118646 | 0.077829 | -2.140% | 0.118600 | 0.076966 | 2/5 | 退化 |
+| A3 | 0.115422 | 0.078231 | +0.635% | 0.114922 | 0.076409 | 2/5 | 跨站不稳 |
+| A4 | 0.117097 | 0.077876 | -0.807% | 0.116780 | 0.076544 | 2/5 | 退化 |
+| A5 | 0.116176 | **0.077321** | -0.014% | 0.115879 | 0.076075 | 2/5 | 近似持平但不晋级 |
+
+Stage B 原守门要求同时满足：
+
+- 5/5 场站 candidate NRMSE 严格改善；
+- 5/5 场站 candidate NMAE 不退化；
+- Macro NRMSE 和 NMAE 均至少改善 0.5%；
+- dynamic、ramp-up、ramp-down、`change_ge_20` 均不退化；
+- 16 个 horizon 均不退化。
+
+A1–A5 没有任何一个通过，因此：
+
+1. 正式选择回退 A0/WindPRISM；
+2. 不启动 xCPD/variable×patch Stage B；
+3. 不为“论文缺结构创新”继续增加训练；
+4. A1 的宏平均改善只能作为有价值的否定性结果，不能替代跨场站稳健证据。
+
+### 26.5 归因边界与早停故障修复
+
+A0 没有做相同训练预算的 continuation control。因而 A1–A5 相对 A0 的绝对差异
+可能混有继续训练效应；模块净效应优先依靠 A2/A3/A4/A5 的同父比较。若 A1
+曾晋级核心方法，严格因果论证应补 A0R；但所有新变体均被否决后，没有必要为
+最终 WindPRISM 主张继续训练 A0R。
+
+首次 A2 早停时曾错误抛出：
+
+~~~text
+ValueError: a2/<farm_id> history为空或包含非有限值
+~~~
+
+根因是阶段式训练在 early stopping 后返回的 history 结构与完整训练假设不同，
+代码把“存在空的非必需阶段”误判为整个 history 无效。提交 `a2cddc7` 修正为
+按实际执行阶段和有限值检查；这不改变模型与既有有效结果。
+
+### 26.6 关键产物
+
+~~~text
+01_stage_a_timealign_residual_alignment_qdf/
+├─ stage_a_experiment_manifest.csv
+├─ stage_a_training_metrics.csv
+├─ stage_a_training_complexity.csv
+├─ stage_a_training_bundle_complete.json
+└─ testdata_predict_output/
+   ├─ stage_a_test_final_selection.md
+   ├─ stage_a_test_variant_comparison.csv
+   ├─ stage_a_test_pairwise_vs_a0.csv
+   ├─ stage_a_test_candidate.csv
+   ├─ stage_a_test_horizon.csv
+   ├─ stage_a_test_regime.csv
+   ├─ stage_a_test_calibration.csv
+   ├─ stage_a_test_safety.csv
+   └─ stage_a_test_bundle_complete.json
+~~~
+
+协议必须写为 `legacy_seen_test_selected`。原计划“只用验证集解锁”的文字没有
+在实际执行中成立，手稿不得把本轮包装成预注册确认性试验。
+
+---
+
+## 27. Part 3 Round 2：WindPRISM 五站公平从零重训
+
+### 27.1 为什么需要这一轮
+
+WindPRISM 的历史 F7/G0 结果使用 batch=192，并沿着 B2→R→F 的开发链得到。
+原 PatchTST 和旧强基线曾使用 batch=256 等不同预算。为排除“最终模型只是因为
+warm-start、batch 或训练预算不同而获胜”，Round 2 固定 F7/G0 结构并从随机
+初始化开始完整重训。
+
+训练代码：
+
+~~~text
+wind_part3_round2_f7_g0_strong_baseline_train.py
+~~~
+
+预测和十模型统一比较集成在：
+
+~~~text
+wind_dl_model_predict.py
+~~~
+
+结果目录：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 02_strong_baseline_f7_g0_fair_training/
+~~~
+
+### 27.2 公平训练协议
+
+| 项目 | 设置 |
+| --- | --- |
+| 初始化 | 全模型随机初始化，禁止加载 B2/F7/Stage-A checkpoint |
+| seed | 2026 |
+| batch | 256 |
+| 最大 epochs | 80 |
+| optimizer | Adam，lr=5e-4，clipnorm=1 |
+| 主损失 | Huber delta=1 |
+| forecast/candidate 权重 | 1.0 / 0.5 |
+| early stopping | patience=10 |
+| ReduceLROnPlateau | patience=4，factor=0.5，min lr=1e-6 |
+| 监控 | `val_forecast_power_loss` |
+| 参数量 | 20,969 |
+
+5 个场站实际训练 11–13 epochs，best epoch 为 1–3，平均训练约 138.1 s/站。
+训练阶段不读取 test；验证只用于 checkpoint，不按验证结果改变结构。
+
+验证宏平均：
+
+- fused NRMSE 0.107771、NMAE 0.068330；
+- corrected candidate NRMSE 0.108760、NMAE 0.071062；
+- Persistence NRMSE 0.114691、NMAE 0.068502。
+
+### 27.3 五站测试结果
+
+WindPRISM 公平重训的逐站 fused 结果：
+
+| 场站尾号 | NRMSE | NMAE |
+| --- | ---: | ---: |
+| 5880 | 0.094599 | 0.066714 |
+| 5895 | 0.135255 | 0.091260 |
+| 5971 | 0.133903 | 0.094069 |
+| 5975 | 0.134504 | 0.096180 |
+| 6015 | 0.077075 | 0.045773 |
+| **Macro** | **0.115067** | **0.078799** |
+
+十模型统一 Macro：
+
+| NRMSE 排名 | 模型 | Macro NRMSE | Macro NMAE | Macro R² |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | WindPRISM 公平重训 | **0.115067** | 0.078799 | **0.856225** |
+| 2 | HR-MoE FeTS-PatchTST | 0.116478 | **0.077475** | 0.852924 |
+| 3 | PatchTST | 0.120938 | 0.081937 | 0.840172 |
+| 4 | CNN-LSTM | 0.124576 | 0.089868 | 0.838360 |
+| 5 | CNN-ResNet-GRU | 0.127413 | 0.094305 | 0.832072 |
+| 6 | Informer | 0.129987 | 0.095530 | 0.825649 |
+| 7 | Transformer | 0.130693 | 0.095176 | 0.825454 |
+| 8 | BiLSTM | 0.142669 | 0.104699 | 0.801204 |
+| 9 | Autoformer | 0.156602 | 0.116907 | 0.750376 |
+| 10 | WaveNet | 0.156856 | 0.120289 | 0.762032 |
+
+相对关键基线：
+
+- 相对 HR-MoE，NRMSE 改善 1.211%，NMAE 退化 1.710%，参数减少 97.63%；
+- 相对原生 PatchTST，NRMSE 改善 4.855%，NMAE 改善 3.829%，参数减少 90.06%；
+- 逐 horizon H1–H16 的 Macro NRMSE 均排名第 1；
+- 逐站 NRMSE 排名为 1/2/2/1/1，即 3 站第一、2 站第二。
+
+因此公平结论应写成：
+
+> 在相同级别的从零训练预算下，WindPRISM 取得最低 Macro NRMSE、所有 lead 的
+> 最低 Macro NRMSE，并以 20,969 参数接近最优 NMAE；其优势不是旧 B2
+> warm-start 或 batch=192 单独造成。
+
+不能写成“所有指标均第一”，因为 HR-MoE 的 Macro NMAE 略低。
+
+### 27.4 关键产物
+
+~~~text
+02_strong_baseline_f7_g0_fair_training/
+├─ manifests/part3_round2_fair_training_protocol.json
+├─ manifests/part3_round2_training_protocol_comparison.csv
+├─ part3_round2_strong_baseline_training_metrics.csv
+├─ part3_round2_strong_baseline_validation_summary.csv
+├─ part3_round2_strong_baseline_training_bundle_complete.json
+├─ models/  weights/  preprocess/  history/
+├─ validation_diagnostics/  visualizations/
+└─ testdata_predict_output/
+   ├─ part3_round2_all_models_test_macro_comparison.csv
+   ├─ part3_round2_all_models_test_metrics_summary.csv
+   ├─ part3_round2_all_models_test_metrics_by_horizon.csv
+   └─ predictions/ router_diagnostics/ weighted_curves/ figures/
+~~~
+
+---
+
+## 28. Part 3 Round 3：外部 14 站无泄漏强基线基准
+
+### 28.1 最终实验范围
+
+原始补充数据：
+
+~~~text
+wind_split/supplementary_other_wind_data/
+├─ JSFD001/
+├─ ...
+└─ JSFD014/
+~~~
+
+其它开发分支留下的 `processed_npz` 明确不作为输入。本轮从每个站原始功率和
+测风 Excel 重新解析、审计、对齐、划分和构建特征。
+
+三份入口代码：
+
+~~~text
+wind_part3_round3_external14_preprocess.py
+wind_part3_round3_external14_all_models_train.py
+wind_part3_round3_external14_all_models_predict.py
+~~~
+
+正式结果根目录：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 03_external14_leakage_free_strong_baseline_benchmark/
+~~~
+
+### 28.2 最终数据预处理协议
+
+#### 28.2.1 时间切分与因果边界
+
+每站按时间顺序固定：
+
+~~~text
+前 70% → train
+中 15% → validation
+后 15% → test
+~~~
+
+并满足：
+
+- 先划分，再只用训练段拟合 scaler、填充值、异常阈值和功率参考值；
+- 历史窗口为 96 点，目标窗口为未来 16 点；
+- 跨 split 的目标窗口重叠数必须为 0；
+- 对功率和测风分别记录 timestamp semantics 与 `available_at`；
+- 决策时刻 `t` 只能使用 `available_at <= t` 的历史记录；
+- CCF 只作为训练段诊断，不根据 test 自动平移时间；
+- 每站记录原始文件 SHA、处理代码 SHA、数组 SHA、split index SHA 和 bundle SHA。
+
+用户后续确认原始时间戳无误；不过当前自动 artifact 仍把时间戳语义写为
+`assumed_interval_start` 并将对齐状态标为 `uncertain_alignment`。手稿如要使用
+“已人工核验”，应另存原始字段说明或人工审计签名，不能靠口头确认覆盖现有
+artifact。
+
+#### 28.2.2 固定 45 通道 schema
+
+所有模型使用 `FEATURE_SCHEMA_V1`：
+
+- 输入形状固定为 `(96, 45)`；
+- 功率 target index 固定为 44；
+- schema hash 为
+  `a2f44e932044c2609a8c0e1cf6a446f37b4a0cfb71b8bf232a5bae6c568c680c`；
+- 实际列顺序遵循代码和 manifest：
+  **风速 → 气象 → 风向 sin/cos → 时间 → 派生 → 功率**；
+- 关键语义列通过 alias 映射，不依赖原 Excel 的任意列位置；
+- 训练前逐位校验与原 F7 schema，按语义重建每站
+  `regime_feature_config.json`，训练阶段不再动态猜测。
+
+原始可用通道少于 45 时，不改变模型输入维度，而是按训练段和物理语义重建：
+
+- 标量传感器优先同高度、邻近高度、训练段统计和中性回退；
+- 风向在角度空间做圆统计重建，再转换为 sin/cos；
+- 禁止分别对 sin 和 cos 独立插值；
+- 方向重建后检查单位圆约束；
+- 缺失通道、重建来源和方向组可用性全部写入审计。
+
+#### 28.2.3 功率参考值与指标命名
+
+14 站没有统一、可信且已核验的装机容量字段，最终协议为：
+
+1. 若未来能核验静态容量，则使用 capacity-normalized 指标；
+2. 当前统一使用每站训练段功率的 99.9 分位数；
+3. 参考值只由该站训练段计算并锁入 `power_reference.json`；
+4. 论文必须称 **train-reference-normalized RMSE/MAE**，缩写
+   **trNRMSE/trNMAE**；
+5. 不得将其误写为严格装机容量归一化 NRMSE/NMAE。
+
+#### 28.2.4 训练可行性与显存策略
+
+训练窗口分级：
+
+| 训练窗口数 | 等级 |
+| ---: | --- |
+| ≥40,000 | sufficient |
+| 20,000–39,999 | limited |
+| 5,000–19,999 | constrained |
+| <5,000 | insufficient |
+
+正式训练前在最大训练站对 HR-MoE、WaveNet、Transformer 做 batch=192 单 epoch
+GPU 预检。若 HR-MoE 发生 OOM，代码可把该模型在所有 14 站统一回退为
+batch=128，并在报告记录；实际运行中没有任何模型触发回退。
+
+### 28.3 数据审计结果
+
+整体：
+
+- 14/14 场站预处理完成；
+- 训练窗口 595,617，验证窗口 134,204，测试窗口 131,865；
+- 每个模型共有 2,109,840 个测试预测点；
+- 所有场站 `cross_split_target_overlap_count=0`；
+- 9 站 `sufficient`，5 站 `limited`；
+- limited 站为 JSFD005、JSFD006、JSFD007、JSFD008、JSFD012；
+- 所有测试段均超过 7,000 个窗口，没有 insufficient test 站；
+- 10 站原始可用 45 通道，3 站 38 通道，1 站 32 通道；
+- 14 站方向组均可用于 WindPRISM，13 站直接可用、1 站语义重建；
+- 14 站功率参考类型全部为 `train_power_q999`；
+- 14 站均未按 CCF 自动移动时间。
+
+CCF 诊断：
+
+- 3 站稳定 exact-zero；
+- 9 站为 weak/ambiguous；
+- JSFD006 的峰值 lag 为 +2；
+- JSFD012 的 lag 稳定性异常；
+- 这些诊断不自动证明时间错位，只用于敏感性和人工核验。
+
+数据质量中特别需要披露：
+
+- JSFD014 原始功率存在 29,184 条重复记录，预处理按固定去重规则处理；
+- JSFD003 只有 32 个原始可用通道，轮毂风速/风向通过语义重建；
+- 训练受限站和 5 min 测风站高度重合，不能把子集差异单独归因于采样频率。
+
+关键审计产物：
+
+~~~text
+data_audit/round3_external14_data_audit.csv
+data_audit/round3_external14_split_manifest.csv
+data_audit/round3_raw_data_audit.csv
+data_audit/round3_timestamp_semantics.csv
+data_audit/round3_time_alignment_diagnostics.csv
+data_audit/round3_power_reference_protocol.json
+data_audit/round3_power_reference_table.csv
+data_audit/round3_regime_config_validation.csv
+data_audit/round3_training_feasibility.csv
+manifests/feature_schema_v1.json
+round3_preprocess_bundle_complete.json
+~~~
+
+### 28.4 十五模型矩阵
+
+共 14 个可训练模型和 1 个无需训练的基础基线：
+
+| 类别 | 模型 | 场景适配要点 | 参数量 |
+| --- | --- | --- | ---: |
+| 原生强基线 | PatchTST | 原生 patch encoder 适配 96→16、45 通道 | 210,960 |
+| 循环/卷积 | BiLSTM | 双向 LSTM 历史编码 | 107,920 |
+| 循环/卷积 | CNN-LSTM | 局部卷积后 LSTM | 70,480 |
+| 循环/卷积 | CNN-ResNet-GRU | 残差卷积 + GRU | 118,544 |
+| 卷积 | WaveNet | 膨胀因果卷积 | 940,560 |
+| Transformer | Transformer | 标准历史 token 自注意 | 858,512 |
+| Transformer | Informer | 稀疏注意思想适配 | 484,240 |
+| 分解 Transformer | Autoformer | 序列分解与自相关思想适配 | 212,737 |
+| 历史复杂模型 | HR-MoE FeTS-PatchTST B6/v5ab | long/mid/short/Persistence 四专家 + horizon-regime router | 885,395 |
+| 最终方法 | WindPRISM F7/G0 | Persistence + causal residual + P+H+D 门控 | 20,969 |
+| 现代强基线 | iTransformer | variate-as-token、instance normalization、2 层 encoder，d_model=512 | 6,363,664 |
+| 现代强基线 | TimesNet | FFT top-5 periods、TimesBlock、2D Inception-like conv | 4,709,917 |
+| 现代强基线 | TimeMixer | 多尺度 96/48/24/12、PDM、RevIN-like normalization | 61,017 |
+| 现代轻量基线 | DLinear | moving-average=25 的 trend/seasonal 分解，shared 96→16 linear | 3,104 |
+| 无训练基线 | Persistence | 最后历史功率重复 16 步 | 0 |
+
+iTransformer、TimesNet、TimeMixer 和 DLinear 均参考其官方思想改写为 Keras，
+并适配本项目 4 h 风电任务；它们不是官方 PyTorch 仓库的逐位数值复现。适配时
+没有加入 WindPRISM 专属 residual、candidate 或工况路由，以保持基线独立性。
+
+### 28.5 训练协议、完成度与防重复机制
+
+外部 14 站主训练共同设置：
+
+- seed=2026；
+- batch=192；
+- Adam，lr=5e-4，clipnorm=1；
+- Huber 主损失；
+- 模型专属最大 epochs 沿用既定代码，现代强基线为 60，WindPRISM/HR-MoE
+  保留相应既定预算；
+- 每站每模型独立从零训练，不复用原 5 站权重；
+- 只以 validation checkpoint 选择最佳 epoch；
+- 每个可训练模型都在自身首次正式测试预测前恢复并冻结最佳 validation
+  checkpoint；旧 10 模型先完成，之后 iTransformer、TimesNet、TimeMixer、
+  DLinear 和 Persistence 作为一个冻结扩展批次追加。WindPRISM 及新增模型均未
+  因已见测试结果再调参，但 `all_models_frozen_before_first_formal_test_prediction`
+  按严格 marker 为 false。
+
+完成度：
+
+- 14 个可训练模型 × 14 站 = **196/196**；
+- 15 个预测模型 × 14 站 = **210/210**；
+- batch=192 的 196 个任务全部成功，OOM fallback=0、retry=0；
+- 训练 `.keras`、weights、history CSV/PNG、validation/overfit JSON 均完整；
+- 预测包括逐样本、逐站、逐 horizon、诊断、加权曲线和图片；
+- prediction output inventory 共 1,776 项并通过完成校验；
+- 可视化共 872 张，另含 14 站 WindPRISM gate diagnostics 和 14 站 HR-MoE
+  router diagnostics。
+
+### 28.6 验证集结果
+
+14 站等权 Macro 验证结果；Persistence 无需训练，因此无验证项：
+
+| 验证排名 | 模型 | Val trNRMSE | Val trNMAE | Val R² |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | WindPRISM | **0.119764** | **0.076407** | **0.710754** |
+| 2 | HR-MoE | 0.122165 | 0.077099 | 0.698169 |
+| 3 | PatchTST | 0.122620 | 0.079565 | 0.697338 |
+| 4 | DLinear | 0.124669 | 0.080689 | 0.686421 |
+| 5 | TimeMixer | 0.126536 | 0.081130 | 0.677832 |
+| 6 | CNN-LSTM | 0.128737 | 0.086946 | 0.664100 |
+| 7 | iTransformer | 0.129217 | 0.082344 | 0.663782 |
+| 8 | TimesNet | 0.131467 | 0.086092 | 0.652597 |
+| 9 | CNN-ResNet-GRU | 0.131959 | 0.088071 | 0.649329 |
+| 10 | Transformer | 0.133595 | 0.091545 | 0.639758 |
+| 11 | BiLSTM | 0.134059 | 0.091783 | 0.638875 |
+| 12 | Informer | 0.135039 | 0.092773 | 0.633182 |
+| 13 | WaveNet | 0.145001 | 0.102231 | 0.577452 |
+| 14 | Autoformer | 0.146967 | 0.104818 | 0.570348 |
+
+WindPRISM 在验证集和最终测试集的首位一致，降低了“只在 test 偶然翻转”的风险。
+验证指标用于 checkpoint 和记录，不与不同训练 loss 的原始 `val_loss` 直接混排。
+
+### 28.7 测试集最终十五模型主表
+
+选择规则预先固定为：
+
+1. 最小等权 Macro trNRMSE；
+2. 再比较 Macro trNMAE；
+3. 再比较逐站平均 NRMSE 排名；
+4. 最后比较参数量。
+
+| 排名 | 模型 | Macro trNRMSE | Macro trNMAE | Macro R² | 平均排名 | 单站第一数 | 参数 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | **WindPRISM** | **0.128801** | **0.082437** | **0.769094** | **2.214** | **6** | 20,969 |
+| 2 | DLinear | 0.130812 | 0.086161 | 0.763759 | 2.786 | 3 | 3,104 |
+| 3 | PatchTST | 0.131618 | 0.085978 | 0.759770 | 3.357 | 1 | 210,960 |
+| 4 | HR-MoE FeTS-PatchTST | 0.132615 | 0.084063 | 0.760356 | 3.500 | 3 | 885,395 |
+| 5 | TimeMixer | 0.133456 | 0.086388 | 0.753212 | 4.714 | 0 | 61,017 |
+| 6 | Persistence | 0.136696 | 0.082602 | 0.738429 | 6.429 | 1 | 0 |
+| 7 | iTransformer | 0.139122 | 0.089145 | 0.733530 | 7.357 | 0 | 6,363,664 |
+| 8 | CNN-LSTM | 0.141931 | 0.096025 | 0.725519 | 7.857 | 0 | 70,480 |
+| 9 | TimesNet | 0.144317 | 0.095298 | 0.713931 | 9.643 | 0 | 4,709,917 |
+| 10 | CNN-ResNet-GRU | 0.150481 | 0.100588 | 0.693351 | 10.714 | 0 | 118,544 |
+| 11 | BiLSTM | 0.152963 | 0.106070 | 0.687698 | 10.714 | 0 | 107,920 |
+| 12 | Transformer | 0.153482 | 0.105506 | 0.681811 | 10.643 | 0 | 858,512 |
+| 13 | Informer | 0.157688 | 0.107953 | 0.663779 | 12.143 | 0 | 484,240 |
+| 14 | WaveNet | 0.169573 | 0.120056 | 0.613785 | 13.643 | 0 | 940,560 |
+| 15 | Autoformer | 0.170210 | 0.121373 | 0.611507 | 14.286 | 0 | 212,737 |
+
+WindPRISM 的 Micro pooled-points 结果也全部第一：
+
+- trNRMSE 0.132537；
+- trNMAE 0.081770；
+- R² 0.834648；
+- RMSE 18.005323 MW；
+- MAE 9.493768 MW。
+
+相对 Macro trNRMSE 改善：
+
+| 对手 | WindPRISM 相对改善 |
+| --- | ---: |
+| DLinear | 1.537% |
+| PatchTST | 2.140% |
+| HR-MoE | 2.876% |
+| TimeMixer | 3.488% |
+| Persistence | 5.776% |
+| iTransformer | 7.418% |
+| TimesNet | 10.751% |
+
+### 28.8 逐站和逐 horizon 解释
+
+单站 NRMSE 第一：
+
+- WindPRISM：JSFD001、003、004、009、011、013，共 6 站；
+- DLinear：JSFD005、007、010，共 3 站；
+- HR-MoE：JSFD002、008、012，共 3 站；
+- PatchTST：JSFD014；
+- Persistence：JSFD006。
+
+WindPRISM 的 14 站名次分布为 6 次第 1、5 次第 2、1 次第 4、1 次第 5、
+1 次第 6。最差场站为 JSFD008，trNRMSE 0.204121；这说明宏平均最优并不意味着
+每个场站都最优。
+
+逐 horizon NRMSE：
+
+- H1（15 min）：DLinear 0.040179 第 1，WindPRISM 0.041036 第 3；
+- H2（30 min）：DLinear 0.063319 第 1，WindPRISM 0.063721 第 2；
+- H3–H16（45–240 min）：WindPRISM 连续 14 个 lead 第 1；
+- H8（120 min）：WindPRISM 0.128062；
+- H12（180 min）：WindPRISM 0.152196；
+- H16（240 min）：WindPRISM 0.170022，优于 PatchTST 0.172477、
+  DLinear 0.173470、HR-MoE 0.175222、TimeMixer 0.176001。
+
+逐 horizon NMAE：
+
+- Persistence 在 H1–H9 最低；
+- WindPRISM 在 H10–H16 最低。
+
+这构成最清晰的机制解释：Persistence 对极短 lead 的绝对误差非常强，
+WindPRISM 的 residual/gate 价值主要体现在 45 min 以后，并随预测时距扩大。
+
+### 28.9 W/T/L 与统计显著性
+
+WindPRISM 的逐站 NRMSE W/T/L：
+
+- 对 DLinear、PatchTST、HR-MoE：均为 10/0/4；
+- 对 TimeMixer：11/0/3；
+- 对 Persistence、iTransformer：均为 13/0/1；
+- 对 TimesNet：14/0/0；
+- 对其它 7 个旧基线：均为 14/0/0。
+
+Wilcoxon signed-rank + Holm 校正与 farm bootstrap：
+
+| 对手 | Mean Δ trNRMSE（WindPRISM-对手） | 95% CI | Holm p | 显著 |
+| --- | ---: | ---: | ---: | --- |
+| PatchTST | -0.002817 | [-0.005191, -0.000108] | 0.148315 | 否 |
+| HR-MoE | -0.003814 | [-0.009729, 0.001202] | 0.156982 | 否 |
+| DLinear | -0.002011 | [-0.004554, 0.000776] | 0.156982 | 否 |
+| iTransformer | -0.010320 | [-0.014171, -0.006328] | 0.004272 | 是 |
+| TimesNet | -0.015516 | [-0.019930, -0.011629] | 0.001709 | 是 |
+| TimeMixer | -0.004654 | [-0.007306, -0.001659] | 0.042969 | 是 |
+| Persistence | -0.007895 | [-0.011082, -0.004996] | 0.002197 | 是 |
+
+总体为显著优于 14 个对手中的 11 个。最接近的 PatchTST、HR-MoE 和 DLinear
+没有通过 Holm 校正，因此手稿只能写“描述性综合最优，并显著优于 11/14 个
+比较模型”，不能写“显著优于所有强基线”。
+
+### 28.10 WindPRISM 门控机制在外部站的表现
+
+14 站平均 gate 约为 0.928833，表示绝大多数样本采用较强的 corrected candidate
+权重，但仍保留 Persistence 锚点。
+
+- fused 相对 corrected candidate：Macro trNRMSE 改善约 0.397%，
+  trNMAE 改善约 1.249%；
+- fused 相对 Persistence：trNRMSE 改善约 5.776%，trNMAE 改善约 0.200%。
+
+因此最终性能的主要来源是轻量 residual 候选质量，G0 门控提供较小但稳定的
+二次收益。论文不应把门控写成全部增益来源，也不应把没有晋级的 G1–G4
+校准安全机制并入最终模型。
+
+### 28.11 复杂度与 Pareto 结论
+
+WindPRISM 参数量：
+
+- 比 PatchTST 少 90.06%；
+- 比 HR-MoE 少 97.63%；
+- 比 TimeMixer 少 65.63%；
+- 比 iTransformer 少 99.67%；
+- 比 TimesNet 少 99.55%。
+
+NRMSE–参数 Pareto 前沿为：
+
+~~~text
+Persistence → DLinear → WindPRISM
+~~~
+
+因此 WindPRISM 可以称“精度—参数 Pareto 高效”或“相对复杂深度基线极轻”，
+但不能称“绝对最小”：DLinear 只有 3,104 参数，Persistence 为 0 参数。
+
+196 个训练任务记录的 fit time 合计约 17.278 GPU h；WindPRISM 合计约
+0.228 h，平均 58.73 s/站。12/196 个任务被启发式标记为 probable overfit，
+WindPRISM 只有 JSFD005 一项。
+
+旧 10 模型主要在 4090 服务器生成，新增现代基线主要在本机 3080 Ti Laptop
+GPU 完成，因此现有 inference seconds 混有硬件差异。参数量和文件大小可以公平
+比较；若论文强调实时部署速度，必须在同一硬件、同一 batch 和相同 warm-up 下
+复测冻结模型。
+
+### 28.12 敏感性分析
+
+以下是从归档逐站 CSV 只读聚合的 post-hoc 敏感性，不是预注册主分析：
+
+| 子集 | WindPRISM trNRMSE | 最优模型/结果 | 解释 |
+| --- | ---: | --- | --- |
+| 9 个 sufficient 站 | **0.114757** | WindPRISM；PatchTST 0.118742，DLinear 0.119325 | 数据充分时优势稳定 |
+| 5 个 limited 站 | 0.154081 | DLinear 0.151490；HR-MoE 0.151739 | 训练受限是主要弱点 |
+| 排除 JSFD006/012 | **0.129165** | WindPRISM；DLinear 0.131334，PatchTST 0.131383 | 排除强 CCF warning 后结论不变 |
+| 10 个原始 45 通道站 | **0.128147** | WindPRISM；DLinear 0.131044 | 完整通道子集稳定 |
+| 4 个重建通道站 | 0.130436 | DLinear 0.130233；WindPRISM trNMAE 更好 | 缺失重建子集 NRMSE 优势消失 |
+| 排除 JSFD014 | **0.128233** | WindPRISM | 重复数据站不改变总排名 |
+
+敏感性结论：
+
+- 总排名对排除时间对齐 warning 和重复数据站较稳健；
+- WindPRISM 的主要薄弱处是训练受限和需重建通道的站；
+- 5 min 测风与 limited 站高度混杂，不能声称“5 min 采样导致模型失败”；
+- 手稿应把这些结果放在鲁棒性/局限性，而不是选择性删除不利站点。
+
+### 28.13 结果与图片路径
+
+首选主文件：
+
+~~~text
+testdata_predict_output/round3_external14_test_final_selection.md
+testdata_predict_output/round3_external14_test_macro_micro.csv
+testdata_predict_output/round3_external14_test_metrics_per_farm.csv
+testdata_predict_output/round3_external14_test_metrics_by_horizon.csv
+testdata_predict_output/round3_external14_average_rank.csv
+testdata_predict_output/round3_external14_win_tie_loss.csv
+testdata_predict_output/round3_external14_significance.csv
+testdata_predict_output/round3_external14_complexity.csv
+validation_metrics/round3_external14_validation_metrics.csv
+validation_metrics/round3_overfit_diagnostics.csv
+~~~
+
+完成标记：
+
+~~~text
+round3_preprocess_bundle_complete.json
+round3_training_bundle_complete.json
+testdata_predict_output/round3_external14_prediction_bundle_complete.json
+testdata_predict_output/round3_external14_output_inventory.csv
+~~~
+
+论文优先图片：
+
+~~~text
+testdata_predict_output/visualizations/overview/macro_nrmse_nmae_bars.png
+testdata_predict_output/visualizations/overview/nrmse_model_farm_heatmap.png
+testdata_predict_output/visualizations/overview/average_farm_rank.png
+testdata_predict_output/visualizations/overview/parameter_nrmse_pareto.png
+visualizations/data_quality/round3_external14_preprocess_overview.png
+~~~
+
+各模型目录还保存：
+
+- `.keras` 完整模型和 `.weights.h5` 最佳权重；
+- 三子图训练 history；
+- 逐样本预测 CSV；
+- 单窗真实/预测曲线、加权聚合曲线；
+- 每站/每 horizon 指标图；
+- WindPRISM gate 与 HR-MoE router 诊断；
+- 数据审计、复杂度、运行日志和 hash marker。
+
+---
+
+## 29. 工程复现、依赖、远程迁移与续跑归档
+
+### 29.1 分支与关键提交
+
+主线历史：
+
+~~~text
+0b72b49  Merge dev-FeTS-PatchTST into main
+142f6b6  add Stage A TimeAlign-QDF experiments
+a2cddc7  fix phased Stage A early-stop history
+d98eedb  add fair F7/G0 strong-baseline comparison
+13e0671  add leakage-free external14 benchmark pipeline
+cc3af82  harden external14 evaluation protocol
+f5280f1  add pinned requirements.txt
+83c77fd  package reproducible Round 3 remote runtime
+464e50f  add iTransformer/TimesNet/TimeMixer/DLinear/Persistence
+e3431f3  allow strict local resume after SSH relocation
+~~~
+
+Part 3 位于 `dev-new-module`；截至本次文档更新前，代码 HEAD 与
+`origin/dev-new-module` 均为 `e3431f3`。本次仅更新归档文档，除非另行要求，
+不自动创建提交。
+
+### 29.2 两份 requirements 为什么不合并
+
+~~~text
+requirements.txt
+requirements-round3-lock-linux-py39-gpu.txt
+~~~
+
+二者职责不同：
+
+- `requirements.txt`：项目直接依赖及项目认可的精确版本，供一般安装和代码审阅；
+- `requirements-round3-lock-linux-py39-gpu.txt`：已验证 Linux/Python 3.9/GPU
+  环境的完整传递依赖锁，用于尽量逐包复现远程环境。
+
+把两者强行合并会把平台专属传递包、CUDA 相关约束和一般项目依赖混在一起，
+降低跨平台可用性，因此保持分离是正确的。
+
+已验证组合：
+
+- Python 3.9.25；
+- TensorFlow/Keras 2.14；
+- CUDA 11.8；
+- cuDNN 8.7。
+
+租用镜像若只有 Python 3.8 + TensorFlow 2.9 + CUDA 11.2，即使配 5090，
+也不能直接满足现有锁定环境：TensorFlow 2.9 对新 GPU/CUDA 组合和当前保存格式/
+自定义层均存在兼容风险。正确做法是选择支持 Python 3.9、TF 2.14、CUDA 11.8
+的镜像或容器，而不是仅为迁就旧镜像降低项目依赖。
+
+### 29.3 远程训练包
+
+根目录归档：
+
+~~~text
+ROUND3_REMOTE_TRAINING_README.md
+wind_part3_round3_external14_remote_training_bundle_83c77fd.zip
+~~~
+
+压缩包约 143 MB，只包含三份 Round 3 代码的完整依赖闭包、14 站原始数据、
+requirements、必要的上游模型定义和保持相对路径的目录。远程解压后按项目根
+目录运行，避免仅上传三份入口代码导致自定义 Keras 层和超参数导入失败。
+
+### 29.4 SSH 中断后严格续跑
+
+基础 10 模型在远程 4090 环境完成；随后 SSH 频繁掉线，新增四个现代可训练
+基线转到本机 3080 Ti Laptop GPU。提交 `e3431f3` 允许以下严格迁移：
+
+- 只把已知旧根 `/root/digitalchina2026` 的路径按相同相对路径重定位到当前根；
+- 继续校验文件大小、SHA、schema、模型×场站身份和 marker；
+- 只接受精确允许的前一版代码 SHA；
+- 不按 basename 全盘搜索；
+- 不接受任意代码漂移；
+- 不修改旧 marker，只新增当前运行的完成记录。
+
+这不是“放宽哈希让任何结果都能混入”，而是对同一 artifact 的可审计根路径
+迁移。
+
+只训练新增四个可训练模型：
+
+~~~bash
+python wind_part3_round3_external14_all_models_train.py \
+  --models itransformer,timesnet,timemixer,dlinear \
+  --farms all \
+  --resume
+~~~
+
+统一预测必须运行完整矩阵入口：
+
+~~~bash
+python wind_part3_round3_external14_all_models_predict.py --resume
+~~~
+
+旧模型会通过 marker/hash 只读复用；Persistence 自动生成，不进入训练。
+`--partial/--smoke` 只用于调试，不能发布到正式结果目录代替完整 bundle。
+
+---
+
+## 30. 截至 2026-07-27 的一区创新判断与论文主线
+
+### 30.1 最终可支撑的三项主要贡献
+
+#### 贡献 1：Persistence 锚定的轻量因果修正主干
+
+WindPRISM 不直接让大型 Transformer 学完整功率轨迹，而是：
+
+1. 用最后历史功率形成低方差 Persistence 候选；
+2. 用 18,416 参数级 causal residual 学习未来 16 步偏离；
+3. 最终全模型只有 20,969 参数。
+
+直接证据：
+
+- B0/B1/B2/B6 最小有效结构搜索；
+- Round 2 从零公平重训；
+- Round 3 对 HR-MoE、PatchTST、iTransformer、TimesNet、TimeMixer、
+  DLinear 和 Persistence 的统一比较；
+- H3–H16 持续第 1，说明 residual 在较长 lead 的累积修正价值。
+
+#### 贡献 2：显式风电工况驱动的 sample×horizon 双候选融合
+
+36 维 P+H+D 工况上下文明确表示：
+
+- P：历史功率形态与变化；
+- H：轮毂高度风速及其统计；
+- D：风向变化与转向。
+
+工况编码器输出样本×horizon gate，在 Persistence 和 corrected candidate
+之间动态融合。直接证据来自 R0–R6、F0–F8、FP0/FP4 和 G0–G4，而不是仅用
+attention heatmap 解释。
+
+#### 贡献 3：候选—门控—融合分层的可靠性和否定性评价框架
+
+项目系统区分：
+
+~~~text
+candidate 是否变好
+→ gate 是否可辨识/可校准
+→ fused 是否真正获益
+→ dynamic/ramp/逐站是否安全
+~~~
+
+通过 Frozen-Pair、soft oracle、Q90、Brier/ECE、regret/harm、Stage 4B、
+X1R 和 Part 3 A0–A5 说明：
+
+- 更好的 candidate 不保证最终 fused 更好；
+- 更好的 calibration 不保证 NRMSE/ramp 更好；
+- 更复杂时频、多尺度、对齐或 QDF 不应在守门失败后进入最终模型。
+
+第三项属于“机制验证与可靠评价贡献”，不能误写成最终结构含有所有被否决模块。
+
+### 30.2 为什么当前比早期 Q2 判断更强
+
+| 早期短板 | 当前补证 |
+| --- | --- |
+| 只在原 5 站、测试参与选型 | 新增 14 站严格时序处理和冻结强基线比较 |
+| 训练预算可能不公平 | Round 2 从零、batch=256 的公平重训 |
+| 缺现代强基线 | iTransformer、TimesNet、TimeMixer、DLinear、Persistence 已补 |
+| 缺统计 | 逐站 W/T/L、Wilcoxon-Holm、farm bootstrap CI 已完成 |
+| 缺复杂度系统比较 | 15 模型参数、模型大小、Pareto 已完成 |
+| 只报宏平均 | Macro/Micro、逐站、逐 horizon、子集敏感性均已分析 |
+| 为创新可能继续堆结构 | A0–A5 守门失败后停止 Stage B，负结果完整 |
+
+这些证据使论文从“方法线清楚但外部支撑不足的 Q2”提升为
+**可合理冲击专业型 Q1 的完整实验稿**。
+
+### 30.3 仍然限制 Q1 把握的事实
+
+1. 对最接近的 DLinear、PatchTST、HR-MoE，Holm 校正后未显著；
+2. 相对前三者的 trNRMSE 增益为 1.54%–2.88%，不是压倒性提升；
+3. 外部 14 站是每站自身训练的 chronological holdout，不是未见站零样本迁移；
+4. 14 站有历史数据暴露，因此 marker 明确不是 globally blind；
+5. 14 站全部用训练段 q99.9，而不是经核验装机容量；
+6. 训练受限/重建通道子集上 DLinear 的 NRMSE 略优；
+7. 现有推理时间混合 4090 和 3080 Ti，不能直接支持统一硬件延迟主张；
+8. Round 3 为 seed=2026；用户所述多 seed 证据在手稿引用前必须定位 artifact；
+9. 最终结构创新是强领域问题驱动，而不是新的通用 Transformer backbone。
+
+因此投稿判断是：
+
+> WindPRISM 具备专业型 SCI/JCR Q1 的投稿基础，但属于 Q1 边缘/有竞争力尝试，
+> 不是高把握顶级一区。若目标期刊偏好能源场景机制、轻量部署和多站系统证据，
+> 匹配度较高；若更强调通用时序架构的基础新颖性，风险较大。
+
+### 30.4 论文推荐结构
+
+1. **Introduction**
+   - 4 h 超短期预测中的 Persistence 强基线；
+   - 非平稳风况下修正必要性；
+   - 大模型复杂度和门控可靠性问题；
+   - 三项贡献概述。
+2. **Related Work**
+   - 风电物理/工程先验；
+   - Patch/Transformer/时频多尺度；
+   - 动态门控、MoE 与可靠性评价；
+   - 轻量时序预测与现代基线。
+3. **Problem Formulation and Protocol**
+   - 96→16、无未来 NWP；
+   - 原 5 站与补充 14 站的证据分层；
+   - 45 通道、available_at、70/15/15；
+   - capacity-normalized 与 train-reference-normalized 指标区别。
+4. **WindPRISM Method**
+   - Persistence anchor；
+   - lightweight causal residual；
+   - P+H+D explicit regime encoder；
+   - sample×horizon two-candidate fusion；
+   - 参数和训练目标。
+5. **Controlled Model Development**
+   - B/R/F/FP 主消融；
+   - candidate drift 控制；
+   - 为什么选择 F7/G0。
+6. **Experimental Setup**
+   - 19 站两层数据；
+   - 15 强基线及 Keras 适配；
+   - 训练、显著性、复杂度和完成审计。
+7. **Main Results**
+   - 原 5 站公平结果；
+   - 外部 14 站 Macro/Micro 主表；
+   - 逐站、逐 horizon、W/T/L、统计。
+8. **Mechanism, Reliability and Negative Ablations**
+   - gate/candidate/Persistence；
+   - G/T/D/X/X1R；
+   - A0–A5 否定结果；
+   - 参数 Pareto 和敏感性。
+9. **Limitations**
+   - 非 globally blind；
+   - q99.9 reference；
+   - limited/reconstructed 子集；
+   - 单 seed 主归档和混合硬件时延。
+10. **Conclusion**
+    - 领域先验、轻量、跨站验证和适用边界。
+
+### 30.5 摘要与正文可用的安全表述
+
+推荐：
+
+> Across 14 supplementary wind farms and 15 forecasting models, WindPRISM
+> achieved the lowest equal-farm Macro and pooled Micro trNRMSE, ranked first
+> on six farms, and retained the best Macro trNRMSE from 45 to 240 minutes,
+> while using 20,969 trainable parameters.
+
+> Paired station-level tests showed significant improvements over 11 of the
+> 14 baselines after Holm correction; differences from DLinear, PatchTST and
+> HR-MoE FeTS-PatchTST were not statistically significant.
+
+不推荐：
+
+- “state-of-the-art on every farm and every metric”；
+- “statistically superior to all baselines”；
+- “the smallest or fastest model”；
+- “blind unseen-farm generalization”；
+- “capacity-normalized error”用于 JSFD14；
+- 把未晋级的 TimeAlign、QDF、时频、多尺度或安全门控写进最终计算图。
+
+### 30.6 投稿建议如何理解
+
+第 22 节列出的 IET Renewable Power Generation、Wind Energy、Energy Reports
+是此前按较保守 Q2 证据给出的匹配/保底建议，不等于当前必须投这三本。若以 Q1
+为目标，投稿前需按当年 JCR/中科院分区和 scope 重新核验 Renewable Energy、
+Applied Energy、Energy、Energy Conversion and Management 等更高目标的适配性。
+分区和审稿偏好会变化，本档案不把任何期刊写成“高概率录取”承诺。
+
+---
+
+## 31. 后续是否还需要补实验
+
+### 31.1 已经完成，不建议重复的内容
+
+- 原 5 站 B/R/F/FP/G/T/D/X/X1R 全链路；
+- Part 3 A0–A5 高成功先验模块验证；
+- 五站公平从零重训；
+- 外部 14 站严格时序预处理；
+- 15 模型强基线；
+- Persistence 无训练基线；
+- 逐站、逐 horizon、W/T/L、NRMSE 配对显著性；
+- 参数量、模型大小、history、预测曲线和主可视化；
+- batch=192 显存预检和 OOM 回退记录；
+- 用户确认的时间戳语义核验，不需要再自动平移；
+- 用户确认同模型多 seed 结论一致，不应为形式重复跑 Round 3 三 seed。
+
+### 31.2 为什么不在外部 14 站再做 P/H/D 门控消融
+
+P/H/D、候选漂移和门控机制已经由原 5 站 R/F/FP/G 系列直接验证。外部 14 站的
+角色是补充数据上的冻结强基线比较。现在再根据其测试结果训练 F0–F8/G0–G4：
+
+- 复制已回答的机制问题；
+- 产生 14×多变体的大量重复训练；
+- 让补充测试进一步参与结构选择；
+- 降低其作为新增数据证据的可信度。
+
+因此不补外部 14 站机制消融是合理设计，而不是实验缺失。论文应把原 5 站称为
+development/mechanism cohort，把 14 站称为 supplementary benchmark cohort。
+
+### 31.3 仍建议完成的无重训后处理
+
+这些工作使用现有预测，不改变模型：
+
+1. 对 NMAE 也执行配对 Wilcoxon-Holm、farm bootstrap CI 和效应量；
+2. 增加 Friedman omnibus test 与 Nemenyi/平均排名 CD 图；
+3. 把第 28.12 节 post-hoc 子集聚合固化成 CSV/JSON 和图片；
+4. 生成 H1–H16 的相对提升/置信区间图；
+5. 汇总 WindPRISM gate 在场站、horizon、工况上的分布；
+6. 把多 seed 证据的精确代码、模型、CSV 和 seed 列表加入附录索引；
+7. 归档用户确认时间戳无误的原始字段/业务说明；
+8. 在同一 GPU 上只对冻结的 WindPRISM、DLinear、PatchTST、HR-MoE、
+   TimeMixer 做统一 warm-up、batch、重复次数的推理速度/峰值显存测试；
+9. 生成参数、模型文件、FLOPs、延迟、吞吐的统一硬件表。
+
+这些是当前最具性价比的 Q1 手稿补强，不需要重新训练预测模型。
+
+### 31.4 唯一可能显著抬高证据等级的新实验
+
+若作者仍想进一步提高 Q1 把握，唯一高价值的新训练实验是：
+
+- 完全未触碰的新场站或新时间段；
+- 在看到标签前冻结预处理、模型、超参数和评价脚本；
+- 一次性运行；
+- 不再根据结果调模型；
+- 最好同时给出跨站训练→未见站推理或 rolling-origin。
+
+这属于新的确认性研究，不是当前论文“漏做的常规消融”。即使不做，现有稿件
+也已具备投稿基础；做了且结果保持，才能更强地使用 independent confirmation
+或 unseen-site generalization 表述。
+
+### 31.5 当前终止决策
+
+截至本档案更新：
+
+~~~text
+模型结构开发：停止
+X2–X6：不启动
+TimeAlign/QDF Stage B：不启动
+外部14站P/H/D再消融：不启动
+新增常规强基线：已完成
+主要工作：统计后处理 → 图表冻结 → SCI Q1手稿写作
+~~~
+
+---
+
+## 32. 新对话快速接手索引
+
+### 32.1 建议阅读顺序
+
+新对话若目标是写 SCI 一区手稿，按以下顺序读取：
+
+1. 本文第 1–2 节：当前模型、双证据协议与术语；
+2. 第 5、7–10 节：WindPRISM 的创新来源和直接消融；
+3. 第 12–14 节：candidate→gate 闭环与失败边界；
+4. 第 25–27 节：Part 3 的补充路线和公平重训；
+5. 第 28 节：外部 14 站最终数据、15 模型主表和统计；
+6. 第 30–31 节：创新主张、投稿边界和剩余工作；
+7. `docs/WIND_FETS_PATCHTST_MODEL_DEVELOPMENT_CONTEXT.md`：更早的工程演进细节。
+
+### 32.2 手稿主数据只读入口
+
+原 5 站最终结构：
+
+~~~text
+wind_results/regime_encoder_patchtst/
+└─ stage2_feature_screening_f0_f7/
+~~~
+
+原 5 站公平强基线：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 02_strong_baseline_f7_g0_fair_training/
+   └─ testdata_predict_output/
+      └─ part3_round2_all_models_test_macro_comparison.csv
+~~~
+
+外部 14 站最终主结果：
+
+~~~text
+wind_results/part3_new_module_supplement/
+└─ 03_external14_leakage_free_strong_baseline_benchmark/
+   ├─ data_audit/
+   ├─ validation_metrics/
+   └─ testdata_predict_output/
+      ├─ round3_external14_test_final_selection.md
+      ├─ round3_external14_test_macro_micro.csv
+      ├─ round3_external14_test_metrics_per_farm.csv
+      ├─ round3_external14_test_metrics_by_horizon.csv
+      ├─ round3_external14_significance.csv
+      └─ round3_external14_complexity.csv
+~~~
+
+### 32.3 写作时必须固定的术语
+
+| 概念 | 正确写法 |
+| --- | --- |
+| 最终模型 | WindPRISM (F7/G0)，20,969 parameters |
+| 原五站指标 | capacity-normalized NRMSE/NMAE，若原 artifact 确实使用容量 |
+| 外部十四站指标 | trNRMSE/trNMAE，train power q99.9 reference |
+| 原五站角色 | development/mechanism cohort |
+| 十四站角色 | supplementary within-station chronological benchmark |
+| 测试性质 | descriptive frozen comparison, not globally blind |
+| 最优表述 | best Macro/Micro descriptive performance |
+| 显著性 | significant against 11/14 baselines, not against the nearest three |
+| 复杂度 | parameter-efficient/Pareto-efficient, not the smallest |
+| 最终结构不包含 | FeTS/PatchTST encoder、四专家、G1–G4、T1–T3、X1/X2–X6、A1–A5 |
+
+### 32.4 当前一句话结论
+
+> WindPRISM 以 Persistence 为物理锚点，通过轻量因果 residual 和 P+H+D
+> 显式工况驱动的逐样本—逐 horizon 双候选融合，在原 5 站机制消融和公平重训中
+> 定型，并在 14 个补充风场、15 个模型的严格时序统一比较中取得最佳 Macro/Micro
+> trNRMSE、trNMAE 与 R²；其优势集中于 45–240 min lead 且参数仅 20,969，
+> 但对 DLinear、PatchTST、HR-MoE 的差异未达到 Holm 校正显著，外部结果也不是
+> globally blind，因此适合以严谨边界冲击专业型 SCI Q1，而非宣称无条件 SOTA。
